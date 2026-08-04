@@ -1,0 +1,30 @@
+# Build artifacts
+build/
+managed_components/
+dependencies.lock
+
+# ESP-IDF generated
+sdkconfig
+!sdkconfig.defaults
+!sdkconfig.defaults.esp32s3
+
+# Serial logs
+esp32_log.txt
+serial.log
+monitor_*.txt
+flash_*.txt
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Zip files (reference projects already tracked)
+*.zip
