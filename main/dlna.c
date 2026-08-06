@@ -94,6 +94,8 @@ static char         *s_next_uri          = NULL;
 static char         *s_next_metadata     = NULL;
 /* 用户主动停止标志 */
 static int           s_user_stopped      = 0;
+/* 歌词 UI 清除请求（新歌切歌时，UI 任务处理） */
+static volatile bool s_lyrics_ui_clear_pending = false;
 /* 位置追踪：纯软件方案（参考 miair-next） */
 static int64_t        s_play_start_us     = 0;   /* 播放开始时间（esp_timer us），0=未在播放 */
 static int            s_accumulated_ms    = 0;   /* 累计已播放 ms（暂停/停止时冻结） */
@@ -376,6 +378,7 @@ static void cb_set_uri(const char *uri)
     s_cur_title[0] = '\0';
     s_cur_artist[0] = '\0';
     lyrics_clear();
+    s_lyrics_ui_clear_pending = true;  /* 通知 UI 任务清除歌词标签 */
     /* 状态转换：设置 URI 后从 NO_MEDIA → STOPPED */
     if (s_state == PS_NO_MEDIA && s_track_uri) {
         s_state = PS_STOPPED;
@@ -638,10 +641,13 @@ static void cb_set_metadata(const char *metadata)
     parse_duration_from_metadata(metadata);
 
     char title[256] = "", artist[256] = "", album_art[256] = "";
+    char music_id_str[32] = "";
     extract_tag(title, sizeof(title), metadata, "dc:title");
     extract_tag(artist, sizeof(artist), metadata, "upnp:artist");
     extract_tag(album_art, sizeof(album_art), metadata, "upnp:albumArtURI");
-    ESP_LOGI(TAG, "Extracted: title='%s' artist='%s' album_art='%s'", title, artist, album_art);
+    extract_tag(music_id_str, sizeof(music_id_str), metadata, "netease:musicId");
+    int music_id = music_id_str[0] ? atoi(music_id_str) : 0;
+    ESP_LOGI(TAG, "Extracted: title='%s' artist='%s' musicId=%d", title, artist, music_id);
 
     if (album_art[0]) {
         /* 没有参数时追加 ?param=200y200 让 CDN 返回小图，节省内存 */
@@ -660,7 +666,8 @@ static void cb_set_metadata(const char *metadata)
         lvgl_port_ui_set_title(s_cur_title);
         lvgl_port_ui_set_artist(s_cur_artist);
         lvgl_port_unlock();
-        lyrics_fetch_async(s_cur_title, s_cur_artist);
+        ESP_LOGI(TAG, "Calling lyrics_fetch_async for: %s - %s (songId=%d)", s_cur_title, s_cur_artist, music_id);
+        lyrics_fetch_async(s_cur_title, s_cur_artist, music_id);
     }
 }
 
@@ -1127,6 +1134,33 @@ static void _enc_on_rotate(void *arg, int direction)
     ESP_LOGI(TAG, "Volume -> %d", new_vol);
 }
 
+/* IO13 歌词切换按键（软件消抖 300ms） */
+static volatile bool s_lyrics_toggle_pending = false;
+static volatile int64_t s_last_lyrics_btn_us = 0;
+
+static void IRAM_ATTR btn_lyrics_isr(void *arg)
+{
+    (void)arg;
+    int64_t now = esp_timer_get_time();
+    if (now - s_last_lyrics_btn_us < 300000) return;  /* 300ms 消抖 */
+    s_last_lyrics_btn_us = now;
+    s_lyrics_toggle_pending = true;
+}
+
+static void lyrics_btn_setup(void)
+{
+    gpio_config_t io = {
+        .pin_bit_mask = (1ULL << 13),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .intr_type = GPIO_INTR_NEGEDGE,
+    };
+    gpio_config(&io);
+    gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
+    gpio_isr_handler_add(13, btn_lyrics_isr, NULL);
+    ESP_LOGI(TAG, "Lyrics button ready (IO13)");
+}
+
 static void rotary_encoder_setup(void)
 {
     esp_err_t ret = gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
@@ -1194,15 +1228,51 @@ static int get_position_ms(void)
     return s_accumulated_ms;
 }
 
+/* ── UTF-8 字符数 → 字节偏移 ── */
+static int utf8_byte_offset(const char *s, int char_idx)
+{
+    int count = 0, offset = 0;
+    while (s[offset] && count < char_idx) {
+        if ((s[offset] & 0xC0) != 0x80) count++;
+        offset++;
+    }
+    return offset;
+}
+
+static int utf8_char_count(const char *s)
+{
+    int count = 0;
+    while (*s) {
+        if ((*s & 0xC0) != 0x80) count++;
+        s++;
+    }
+    return count;
+}
+
 static void ui_update_task(void *arg)
 {
     (void)arg;
     int tick = 0;
+    int last_cur_line = -1;
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(500));
+        vTaskDelay(pdMS_TO_TICKS(100));
 
         lvgl_port_lock();
-        int pos_sec = get_position_ms() / 1000;
+
+        /* 检查 IO13 歌词切换请求 */
+        if (s_lyrics_toggle_pending) {
+            s_lyrics_toggle_pending = false;
+            lvgl_port_ui_toggle_lyrics();
+        }
+        /* 清除歌词标签（新歌/切歌时） */
+        if (s_lyrics_ui_clear_pending) {
+            s_lyrics_ui_clear_pending = false;
+            lvgl_port_ui_lyrics_clear();
+            last_cur_line = -1;
+        }
+
+        int pos_ms = get_position_ms();
+        int pos_sec = pos_ms / 1000;
         ESP_LOGI(TAG, "UI: pos=%d dur=%d state=%d", pos_sec, s_dur_cache_sec, (int)get_state());
         lvgl_port_ui_set_progress(pos_sec, s_dur_cache_sec);
         lvgl_port_ui_set_state((int)get_state());
@@ -1210,26 +1280,53 @@ static void ui_update_task(void *arg)
 
         const lyric_data_t *lyr = lyrics_get_data();
         if (lyr && lyr->loaded && lyr->count > 0) {
-            int pos_ms = get_position_ms();
             int cur = lyrics_get_current_line(pos_ms);
-            int start = cur - 2;
-            if (start < 0) start = 0;
-            if (start + 5 > lyr->count) start = lyr->count - 5;
-            if (start < 0) start = 0;
-            int act = cur - start;
-            if (act < 0 || act >= 5) act = -1;
-            for (int i = 0; i < 5; i++) {
-                int src = start + i;
-                lvgl_port_ui_set_lyric_line(i, (src < lyr->count) ? lyr->lines[src].text : "");
+            const char *prev = (cur > 0) ? lyr->lines[cur - 1].text : "";
+            const char *curr = lyr->lines[cur].text;
+            const char *next = (cur + 1 < lyr->count) ? lyr->lines[cur + 1].text : "";
+
+            /* 行切换时才更新歌词文本（避免复位滚动位置） */
+            if (cur != last_cur_line) {
+                last_cur_line = cur;
+                lvgl_port_ui_lyrics_update(cur, prev, curr, next);
+                /* 滚动速率与这句歌词时长相绑定 */
+                int line_start = lyr->lines[cur].time_ms;
+                int line_end = (cur + 1 < lyr->count)
+                    ? lyr->lines[cur + 1].time_ms
+                    : s_dur_cache_sec * 1000;
+                if (line_end <= line_start) line_end = line_start + 5000;
+                lvgl_port_ui_lyrics_scroll_to_end(line_end - line_start);
             }
-            lvgl_port_ui_set_lyric_current(act);
+
+            /* 每 tick 更新逐字高亮（karaoke） */
+            if (cur >= 0 && cur < lyr->count && curr[0]) {
+                int line_start = lyr->lines[cur].time_ms;
+                int line_end = (cur + 1 < lyr->count)
+                    ? lyr->lines[cur + 1].time_ms
+                    : s_dur_cache_sec * 1000;
+                if (line_end <= line_start) line_end = line_start + 5000;
+                int line_dur = line_end - line_start;
+                /* 按字数估算演唱时长：每字 250ms + 1.5s 缓冲，避免伴奏停顿拖慢高亮 */
+                int total_chars = utf8_char_count(curr);
+                int est_sing = total_chars * 250 + 1500;
+                if (est_sing < line_dur) line_dur = est_sing;
+                int progress = (pos_ms - line_start) * 100 / line_dur;
+                if (progress < 0) progress = 0;
+                if (progress > 100) progress = 100;
+                int char_idx = total_chars * progress / 100;
+                int byte_idx = utf8_byte_offset(curr, char_idx);
+                lvgl_port_ui_lyrics_karaoke(byte_idx);
+            }
         } else {
-            for (int i = 0; i < 5; i++) lvgl_port_ui_set_lyric_line(i, "");
-            lvgl_port_ui_set_lyric_current(-1);
+            last_cur_line = -1;
         }
+
+        /* 每 tick 缓慢左移当前行 */
+        lvgl_port_ui_lyrics_tick_scroll();
+
         lvgl_port_unlock();
 
-        if ((++tick % 20) == 0) ESP_LOGI(TAG, "UI tick alive");
+        if ((++tick % 50) == 0) ESP_LOGI(TAG, "UI tick alive");
     }
 }
 
@@ -1311,6 +1408,7 @@ void app_main(void)
 
     /* ── 旋钮（UI）── */
     rotary_encoder_setup();
+    lyrics_btn_setup();
 
     /* ── TFT 显示 + LVGL ── */
     tft_init();

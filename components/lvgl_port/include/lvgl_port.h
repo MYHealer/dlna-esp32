@@ -39,9 +39,15 @@ void lvgl_port_ui_set_artist(const char *artist);
 void lvgl_port_ui_set_progress(int position_sec, int duration_sec);
 void lvgl_port_ui_set_state(int state);  /* 0=停止 1=播放 2=暂停 */
 void lvgl_port_ui_set_volume(int vol);
-void lvgl_port_ui_set_lyric_line(int index, const char *text);
-void lvgl_port_ui_set_lyric_current(int line_index);
+void lvgl_port_ui_lyrics_update(int current_idx, const char *prev, const char *curr, const char *next);
+void lvgl_port_ui_lyrics_karaoke(int byte_idx);
+void lvgl_port_ui_lyrics_scroll_to_end(int line_duration_ms);
+void lvgl_port_ui_lyrics_tick_scroll(void);
 void lvgl_port_ui_set_cover(const uint16_t *pixels, int w, int h);
+void lvgl_port_ui_lyrics_create(void);
+void lvgl_port_ui_toggle_lyrics(void);
+bool lvgl_port_ui_lyrics_is_visible(void);
+void lvgl_port_ui_lyrics_clear(void);
 
 #ifdef __cplusplus
 }

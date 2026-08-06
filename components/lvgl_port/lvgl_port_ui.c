@@ -30,13 +30,27 @@ static lv_img_dsc_t *s_cover_prev = NULL; /* 前一个动态封面，用于释�
 static uint16_t s_cover_buf[COVER_BUF_SIZE]; /* 静态封面缓冲区（内部RAM，无缓存问题） */
 static lv_obj_t *s_label_title;
 static lv_obj_t *s_label_artist;
-static lv_obj_t *s_label_lyric;
 static lv_obj_t *s_bar_progress;
 static lv_obj_t *s_label_time1;
 static lv_obj_t *s_label_time2;
 static lv_obj_t *s_btn_play;
 static lv_obj_t *s_btn_next;
 static lv_obj_t *s_btn_prev;
+
+/* 主屏幕引用（用于切换回主界面） */
+static lv_obj_t *s_main_scr = NULL;
+
+/* 歌词界面 */
+static lv_obj_t *s_lyrics_scr = NULL;
+static lv_obj_t *s_lyrics_placeholder = NULL;
+static lv_obj_t *s_lyrics_prev = NULL;    /* 上一句 */
+static lv_obj_t *s_lyrics_curr = NULL;    /* 当前句 */
+static lv_obj_t *s_lyrics_next = NULL;    /* 下一句 */
+static int s_lyrics_current = -1;
+static int s_lyrics_prev_line = -1;        /* 上一次的行号，用于检测切换动画 */
+static bool s_lyrics_visible = false;
+
+/* 当前句滚动状态（LV_LABEL_LONG_SCROLL 内部管理） */
 
 /* 配色 */
 #define C_TOP_BAR  lv_color_hex(0x021F33)
@@ -103,16 +117,6 @@ void lvgl_port_ui_create(void)
     lv_obj_set_style_anim_speed(s_label_artist, 30, 0);
     lv_obj_set_style_text_align(s_label_artist, LV_TEXT_ALIGN_CENTER, 0);
 
-    /* ====== 歌词 ====== */
-    s_label_lyric = lv_label_create(scr);
-    lv_obj_set_pos(s_label_lyric, 0, 106);
-    lv_obj_set_size(s_label_lyric, 128, 10);
-    lv_label_set_text(s_label_lyric, "");
-    lv_obj_set_style_text_color(s_label_lyric, C_WHITE, 0);
-    lv_obj_set_style_text_font(s_label_lyric, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_align(s_label_lyric, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_long_mode(s_label_lyric, LV_LABEL_LONG_SCROLL_CIRCULAR);
-
     /* ====== 进度条 + 时间 ====== */
     s_bar_progress = lv_bar_create(scr);
     lv_obj_set_pos(s_bar_progress, 14, 116);
@@ -155,7 +159,76 @@ void lvgl_port_ui_create(void)
     lv_obj_set_pos(s_btn_next, 80, 129);
     lv_obj_set_size(s_btn_next, 31, 31);
 
+    lvgl_port_ui_lyrics_create();
+    s_main_scr = scr;  /* 保存主屏幕引用 */
     ESP_LOGI(TAG, "UI created");
+}
+
+/* ====== 歌词界面（3行：上一句/当前句/下一句） ====== */
+void lvgl_port_ui_lyrics_create(void)
+{
+    s_lyrics_scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(s_lyrics_scr, C_BG_TOP, 0);
+    lv_obj_clear_flag(s_lyrics_scr, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* 暂无歌词占位（居中） */
+    s_lyrics_placeholder = lv_label_create(s_lyrics_scr);
+    lv_obj_set_width(s_lyrics_placeholder, 128);
+    lv_obj_set_pos(s_lyrics_placeholder, 0, 72);
+    lv_label_set_text(s_lyrics_placeholder, "暂无歌词");
+    lv_obj_set_style_text_font(s_lyrics_placeholder, &lv_font_simsun_16_cjk, 0);
+    lv_obj_set_style_text_color(s_lyrics_placeholder, C_DIM, 0);
+    lv_obj_set_style_text_align(s_lyrics_placeholder, LV_TEXT_ALIGN_CENTER, 0);
+
+    /* 上一句（Y=49，暗淡） */
+    s_lyrics_prev = lv_label_create(s_lyrics_scr);
+    lv_obj_set_pos(s_lyrics_prev, 0, 49);
+    lv_obj_set_width(s_lyrics_prev, 128);
+    lv_label_set_text(s_lyrics_prev, "");
+    lv_obj_set_style_text_font(s_lyrics_prev, &lv_font_simsun_16_cjk, 0);
+    lv_obj_set_style_text_color(s_lyrics_prev, C_DIM, 0);
+    lv_obj_set_style_text_align(s_lyrics_prev, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_lyrics_prev, LV_LABEL_LONG_CLIP);
+
+    /* 当前句（Y=73，灰色+选中高亮，左对齐，缓慢左移） */
+    s_lyrics_curr = lv_label_create(s_lyrics_scr);
+    lv_obj_set_pos(s_lyrics_curr, 0, 73);
+    lv_obj_set_width(s_lyrics_curr, 128);
+    lv_label_set_text(s_lyrics_curr, "");
+    lv_obj_set_style_text_font(s_lyrics_curr, &lv_font_simsun_16_cjk, 0);
+    lv_obj_set_style_text_color(s_lyrics_curr, C_DIM, 0);
+    lv_obj_set_style_text_color(s_lyrics_curr, C_ACCENT, LV_PART_SELECTED);
+    lv_obj_set_style_bg_color(s_lyrics_curr, C_BG_TOP, LV_PART_SELECTED);
+    lv_obj_set_style_bg_opa(s_lyrics_curr, LV_OPA_COVER, LV_PART_SELECTED);
+    lv_obj_set_style_text_align(s_lyrics_curr, LV_TEXT_ALIGN_LEFT, 0);
+    lv_label_set_long_mode(s_lyrics_curr, LV_LABEL_LONG_CLIP);
+
+    /* 下一句（Y=97，暗淡） */
+    s_lyrics_next = lv_label_create(s_lyrics_scr);
+    lv_obj_set_pos(s_lyrics_next, 0, 97);
+    lv_obj_set_width(s_lyrics_next, 128);
+    lv_label_set_text(s_lyrics_next, "");
+    lv_obj_set_style_text_font(s_lyrics_next, &lv_font_simsun_16_cjk, 0);
+    lv_obj_set_style_text_color(s_lyrics_next, C_DIM, 0);
+    lv_obj_set_style_text_align(s_lyrics_next, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_lyrics_next, LV_LABEL_LONG_CLIP);
+
+    ESP_LOGI(TAG, "Lyrics screen created (3-line)");
+}
+
+void lvgl_port_ui_toggle_lyrics(void)
+{
+    s_lyrics_visible = !s_lyrics_visible;
+    if (s_lyrics_visible) {
+        lv_scr_load(s_lyrics_scr);
+    } else {
+        if (s_main_scr) lv_scr_load(s_main_scr);
+    }
+}
+
+bool lvgl_port_ui_lyrics_is_visible(void)
+{
+    return s_lyrics_visible;
 }
 
 /* ====== UI 更新 ====== */
@@ -188,10 +261,156 @@ void lvgl_port_ui_set_state(int state) {
     }
 }
 void lvgl_port_ui_set_volume(int vol) { (void)vol; }
-void lvgl_port_ui_set_lyric_line(int index, const char *text) {
-    if (index == 2) lv_label_set_text(s_label_lyric, text && text[0] ? text : "");
+static void _opa_anim_cb(void *obj, int32_t v)
+{
+    lv_obj_set_style_opa((lv_obj_t *)obj, (lv_opa_t)v, 0);
 }
-void lvgl_port_ui_set_lyric_current(int idx) { (void)idx; }
+
+void lvgl_port_ui_lyrics_update(int current_idx, const char *prev, const char *curr, const char *next)
+{
+    /* 检测行号切换，触发向上滚动动画 */
+    if (current_idx != s_lyrics_prev_line && s_lyrics_prev_line >= 0) {
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, s_lyrics_prev);
+        lv_anim_set_exec_cb(&a, _opa_anim_cb);
+        lv_anim_set_values(&a, LV_OPA_COVER, LV_OPA_TRANSP);
+        lv_anim_set_time(&a, 200);
+        lv_anim_start(&a);
+
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, s_lyrics_curr);
+        lv_anim_set_exec_cb(&a, _opa_anim_cb);
+        lv_anim_set_values(&a, LV_OPA_TRANSP, LV_OPA_COVER);
+        lv_anim_set_time(&a, 300);
+        lv_anim_start(&a);
+    }
+
+    s_lyrics_current = current_idx;
+    s_lyrics_prev_line = current_idx;
+
+    lv_label_set_text(s_lyrics_prev, prev ? prev : "");
+    lv_label_set_text(s_lyrics_curr, curr ? curr : "");
+    lv_label_set_text(s_lyrics_next, next ? next : "");
+
+    /* 上下行：超宽则左对齐，否则居中 */
+    int16_t w_prev = lv_txt_get_width(prev ? prev : "", prev ? strlen(prev) : 0,
+        lv_obj_get_style_text_font(s_lyrics_prev, 0), 0, LV_TEXT_FLAG_NONE);
+    lv_obj_set_style_text_align(s_lyrics_prev, w_prev > 128 ? LV_TEXT_ALIGN_LEFT : LV_TEXT_ALIGN_CENTER, 0);
+
+    int16_t w_next = lv_txt_get_width(next ? next : "", next ? strlen(next) : 0,
+        lv_obj_get_style_text_font(s_lyrics_next, 0), 0, LV_TEXT_FLAG_NONE);
+    lv_obj_set_style_text_align(s_lyrics_next, w_next > 128 ? LV_TEXT_ALIGN_LEFT : LV_TEXT_ALIGN_CENTER, 0);
+
+    /* 当前行动态对齐：居中（放得下）或左对齐（超宽） */
+    lv_font_t *font_curr = lv_obj_get_style_text_font(s_lyrics_curr, 0);
+    int16_t w_curr = lv_txt_get_width(curr ? curr : "", curr ? strlen(curr) : 0,
+        font_curr, 0, LV_TEXT_FLAG_NONE);
+    bool curr_overflow = w_curr > 128;
+    lv_obj_set_style_text_align(s_lyrics_curr,
+        curr_overflow ? LV_TEXT_ALIGN_LEFT : LV_TEXT_ALIGN_CENTER, 0);
+
+    /* 重置高亮及位置 */
+    lv_label_set_text_sel_start(s_lyrics_curr, 0);
+    lv_label_set_text_sel_end(s_lyrics_curr, 0);
+    ((lv_label_t *)s_lyrics_curr)->offset.x = 0;
+
+    /* 有歌词→隐藏占位 */
+    if (curr && curr[0]) {
+        if (s_lyrics_placeholder) lv_obj_add_flag(s_lyrics_placeholder, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+/* ── 逐字高亮（karaoke）+ 逐字左移 ── */
+static int s_scroll_total = 0;   /* 总滚动距离（正数） */
+static int s_text_bytes = 0;     /* 总字节数 */
+
+void lvgl_port_ui_lyrics_karaoke(int byte_idx)
+{
+    const char *text = lv_label_get_text(s_lyrics_curr);
+    if (!text || !text[0]) return;
+
+    if (byte_idx <= 0) {
+        lv_label_set_text_sel_start(s_lyrics_curr, 0);
+        lv_label_set_text_sel_end(s_lyrics_curr, 0);
+        ((lv_label_t *)s_lyrics_curr)->offset.x = 0;
+        return;
+    }
+
+    lv_label_set_text_sel_start(s_lyrics_curr, 0);
+    lv_label_set_text_sel_end(s_lyrics_curr, byte_idx);
+
+    /* 仅当文本超长时才左移，否则只高亮不移动 */
+    if (s_scroll_total > 0) {
+        /* 当前字保持在屏幕 1/4 位置 */
+        int16_t w = lv_txt_get_width(text, byte_idx,
+            lv_obj_get_style_text_font(s_lyrics_curr, 0), 0, LV_TEXT_FLAG_NONE);
+        int label_w = lv_obj_get_width(s_lyrics_curr);
+        int anchor = label_w / 4;
+        if (w > anchor) {
+            ((lv_label_t *)s_lyrics_curr)->offset.x = anchor - w;
+        } else {
+            ((lv_label_t *)s_lyrics_curr)->offset.x = 0;
+        }
+    }
+}
+
+void lvgl_port_ui_lyrics_set_scroll_dist(int dist)
+{
+    s_scroll_total = dist;
+}
+
+/* ── 当前句滚动状态 ── */
+static int s_scroll_dist = 0;  /* 需滚动的像素（正数），0=不滚动 */
+
+void lvgl_port_ui_lyrics_scroll_to_end(int line_duration_ms)
+{
+    (void)line_duration_ms;
+    const char *text = lv_label_get_text(s_lyrics_curr);
+    if (!text || !text[0]) { s_scroll_total = 0; s_text_bytes = 0; return; }
+
+    /* 用 lv_txt_get_width 取实际像素宽度（不受 max_width 约束换行） */
+    lv_font_t *font = lv_obj_get_style_text_font(s_lyrics_curr, 0);
+    int16_t text_w = lv_txt_get_width(text, strlen(text), font, 0, LV_TEXT_FLAG_NONE);
+    int label_w = lv_obj_get_width(s_lyrics_curr);
+    if (text_w <= label_w) { s_scroll_total = 0; s_text_bytes = 0; return; }
+
+    s_scroll_total = (int)text_w - label_w;
+    s_text_bytes = strlen(text);
+    ((lv_label_t *)s_lyrics_curr)->offset.x = 0;
+    ESP_LOGI(TAG, "scroll_dist: total=%d bytes=%d (text_w=%d label_w=%d)", s_scroll_total, s_text_bytes, text_w, label_w);
+}
+
+void lvgl_port_ui_lyrics_set_scroll_progress(int pct)
+{
+    if (s_scroll_dist <= 0) return;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    int x = -s_scroll_dist * pct / 100;
+    ((lv_label_t *)s_lyrics_curr)->offset.x = x;
+    lv_obj_invalidate(s_lyrics_curr);
+    if (pct % 25 == 0) ESP_LOGI(TAG, "scroll_x=%d (dist=%d pct=%d)", x, s_scroll_dist, pct);
+}
+
+void lvgl_port_ui_lyrics_tick_scroll(void)
+{
+    /* LV_LABEL_LONG_SCROLL 内部处理 */
+}
+
+void lvgl_port_ui_lyrics_clear(void)
+{
+    s_lyrics_current = -1;
+    s_lyrics_prev_line = -1;
+    lv_label_set_text(s_lyrics_prev, "");
+    lv_label_set_text(s_lyrics_curr, "");
+    lv_label_set_text(s_lyrics_next, "");
+    lv_label_set_text_sel_start(s_lyrics_curr, 0);
+    lv_label_set_text_sel_end(s_lyrics_curr, 0);
+    s_scroll_total = 0;
+    s_text_bytes = 0;
+    if (s_lyrics_placeholder) lv_obj_clear_flag(s_lyrics_placeholder, LV_OBJ_FLAG_HIDDEN);
+    ESP_LOGI(TAG, "Lyrics UI cleared");
+}
 void lvgl_port_ui_set_cover(const uint16_t *pixels, int w, int h) {
     if (!pixels || w <= 0 || h <= 0) return;
     size_t px_size = w * h * sizeof(uint16_t);

@@ -9,6 +9,7 @@
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_tls.h"
+#include "esp_heap_caps.h"
 #include "jsmn.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -24,9 +25,14 @@ static lyric_data_t     s_lyric_data;
 static SemaphoreHandle_t s_mutex;
 static TaskHandle_t      s_fetch_task;
 
+/* 任务栈静态缓冲区（PSRAM），避免内部 RAM 分配失败 */
+#define LYRIC_TASK_STACK_SIZE  8192
+static StackType_t *s_task_stack;
+static StaticTask_t s_task_tcb;
+
 /* ── HTTP 响应缓冲 ── */
 #define HTTP_SEARCH_BUF   2048
-#define HTTP_LYRIC_BUF    4096
+#define HTTP_LYRIC_BUF    8192
 
 typedef struct {
     char    *buf;
@@ -87,7 +93,7 @@ static char *http_request(const char *url, const char *post_data,
         .url = url,
         .event_handler = http_event_handler,
         .user_data = &ctx,
-        .timeout_ms = 8000,
+        .timeout_ms = 10000,
         .buffer_size = 1024,
         .buffer_size_tx = 512,
     };
@@ -193,51 +199,114 @@ static int search_song(const char *title, const char *artist)
     snprintf(post_data, sizeof(post_data),
              "s=%s&type=1&limit=1&offset=0", encoded);
 
-    char *resp = http_request("https://music.163.com/api/search/get",
+    char *resp = http_request("http://music.163.com/api/search/get",
                               post_data, "application/x-www-form-urlencoded",
                               HTTP_SEARCH_BUF);
-    if (!resp) return 0;
+    if (!resp) {
+        ESP_LOGW(TAG, "search_song: HTTP request failed");
+        return 0;
+    }
+    ESP_LOGI(TAG, "search resp (%d bytes)", (int)strlen(resp));
 
     /* 解析 JSON */
     jsmn_parser parser;
-    jsmntok_t tokens[128];
+    jsmntok_t tokens[512];
     jsmn_init(&parser);
-    int num = jsmn_parse(&parser, resp, strlen(resp), tokens, 128);
+    int num = jsmn_parse(&parser, resp, strlen(resp), tokens, 512);
     if (num < 0) {
         ESP_LOGE(TAG, "JSON parse error: %d", num);
         free(resp);
         return 0;
     }
 
-    /* result.songs[0].id */
-    int result_idx = json_find_key(resp, tokens, num, 0, "result");
-    if (result_idx < 0) { free(resp); return 0; }
-
-    int songs_idx = json_find_key(resp, tokens, num, result_idx, "songs");
-    if (songs_idx < 0) { free(resp); return 0; }
-
-    /* songs 是数组，跳到第一个元素 */
-    if (tokens[songs_idx].type != JSMN_ARRAY || tokens[songs_idx].size < 1) {
-        free(resp);
-        return 0;
+    /* result.songs[] */
+    int ri = json_find_key(resp, tokens, num, 0, "result");
+    if (ri < 0) { free(resp); return 0; }
+    int si = json_find_key(resp, tokens, num, ri, "songs");
+    if (si < 0) { free(resp); return 0; }
+    if (tokens[si].type != JSMN_ARRAY || tokens[si].size < 1) {
+        free(resp); return 0;
     }
-    int song_obj = songs_idx + 1;  /* 数组第一个元素 */
 
-    int id_idx = json_find_key(resp, tokens, num, song_obj, "id");
-    if (id_idx < 0) { free(resp); return 0; }
+    /*
+     * 遍历 songs 数组，对每个元素找顶层 "id" 和 "name"
+     * 关键：跳过嵌套 object/array，避免匹配到 artist.id 等内部字段
+     */
+    int song_count = tokens[si].size;
+    int pos = si + 1;  /* songs 数组第一个元素 */
+    int best_id = 0;
+    char best_name[64] = "";
 
-    int song_id = json_get_int(resp, &tokens[id_idx]);
+    for (int s = 0; s < song_count && pos < num; s++) {
+        if (tokens[pos].type != JSMN_OBJECT) { pos++; continue; }
+        int obj_end = pos;
+        /* 计算这个 object 的结束位置 */
+        {
+            int depth = 1;
+            int j = pos + 1;
+            while (j < num && depth > 0) {
+                if (tokens[j].type == JSMN_OBJECT || tokens[j].type == JSMN_ARRAY) depth += tokens[j].size;
+                j++;
+                depth--;
+            }
+            obj_end = j;  /* object 结束后的下一个位置 */
+        }
 
-    /* 顺便打印歌名确认 */
-    int name_idx = json_find_key(resp, tokens, num, song_obj, "name");
-    if (name_idx > 0) {
-        char name[64];
-        json_get_string(resp, &tokens[name_idx], name, sizeof(name));
-        ESP_LOGI(TAG, "Found: [%d] %s", song_id, name);
+        /* 在这个 object 内找顶层 "id" 和 "name"（只看直接子 key） */
+        int song_id = 0;
+        char song_name[64] = "";
+        int scan = pos + 1;
+        while (scan < obj_end && scan < num) {
+            if (tokens[scan].type == JSMN_STRING) {
+                int klen = tokens[scan].end - tokens[scan].start;
+                /* 顶层 "id" key */
+                if (klen == 2 && memcmp(resp + tokens[scan].start, "id", 2) == 0
+                    && scan + 1 < num) {
+                    song_id = json_get_int(resp, &tokens[scan + 1]);
+                }
+                /* 顶层 "name" key */
+                if (klen == 4 && memcmp(resp + tokens[scan].start, "name", 4) == 0
+                    && scan + 1 < num && tokens[scan + 1].type == JSMN_PRIMITIVE) {
+                    /* 跳过（可能是嵌套 object 的 name） */
+                }
+                if (klen == 4 && memcmp(resp + tokens[scan].start, "name", 4) == 0
+                    && scan + 1 < num && tokens[scan + 1].type == JSMN_STRING) {
+                    json_get_string(resp, &tokens[scan + 1], song_name, sizeof(song_name));
+                }
+                /* 跳过 value */
+                scan += 2;
+                /* 如果 value 是 object/array，跳过子树 */
+                if (scan - 1 < num && (tokens[scan - 1].type == JSMN_OBJECT || tokens[scan - 1].type == JSMN_ARRAY)) {
+                    int skip_depth = tokens[scan - 1].size;
+                    while (scan < num && skip_depth > 0) {
+                        if (tokens[scan].type == JSMN_OBJECT || tokens[scan].type == JSMN_ARRAY)
+                            skip_depth += tokens[scan].size;
+                        scan++;
+                        skip_depth--;
+                    }
+                }
+            } else {
+                scan++;
+            }
+        }
+
+        ESP_LOGI(TAG, "song[%d]: id=%d name='%s'", s, song_id, song_name);
+        if (song_id > 0 && best_id == 0) {
+            best_id = song_id;
+            strncpy(best_name, song_name, sizeof(best_name) - 1);
+        }
+
+        pos = obj_end;
+    }
+
+    if (best_id > 0) {
+        ESP_LOGI(TAG, "Found: [%d] %s", best_id, best_name);
+    } else {
+        ESP_LOGW(TAG, "Song not found");
     }
 
     free(resp);
-    return song_id;
+    return best_id;
 }
 
 /* ── 获取 LRC 歌词文本（调用方 free）── */
@@ -245,7 +314,7 @@ static char *fetch_lrc(int song_id)
 {
     char url[128];
     snprintf(url, sizeof(url),
-             "https://music.163.com/api/song/lyric?id=%d&lv=1", song_id);
+             "http://music.163.com/api/song/lyric?id=%d&lv=1", song_id);
 
     char *resp = http_request(url, NULL, NULL, HTTP_LYRIC_BUF);
     if (!resp) {
@@ -257,9 +326,9 @@ static char *fetch_lrc(int song_id)
 
     /* 解析 JSON: lrc.lyric（响应含 lrc/tlyric/romalrc，需要更多 tokens） */
     jsmn_parser parser;
-    jsmntok_t tokens[186];
+    jsmntok_t tokens[256];
     jsmn_init(&parser);
-    int num = jsmn_parse(&parser, resp, strlen(resp), tokens, 186);
+    int num = jsmn_parse(&parser, resp, strlen(resp), tokens, 256);
     if (num < 0) {
         ESP_LOGE(TAG, "Lyric JSON parse error: %d", num);
         free(resp);
@@ -284,6 +353,24 @@ static char *fetch_lrc(int song_id)
     if (!lrc) { free(resp); return NULL; }
     memcpy(lrc, resp + tokens[lyric_idx].start, len);
     lrc[len] = '\0';
+
+    ESP_LOGI(TAG, "LRC extracted: %d bytes, first 80: '%.80s'", len, lrc);
+
+    /* jsmn 不解码 JSON 转义，需要手动处理 \n → 换行 */
+    int j = 0;
+    for (int i = 0; i < len; i++) {
+        if (lrc[i] == '\\' && i + 1 < len && lrc[i + 1] == 'n') {
+            lrc[j++] = '\n';
+            i++;  /* 跳过 'n' */
+        } else if (lrc[i] == '\\' && i + 1 < len && lrc[i + 1] == 'r') {
+            lrc[j++] = '\r';
+            i++;
+        } else {
+            lrc[j++] = lrc[i];
+        }
+    }
+    lrc[j] = '\0';
+    ESP_LOGI(TAG, "LRC after unescape: %d bytes, first 80: '%.80s'", j, lrc);
 
     free(resp);
     return lrc;
@@ -327,9 +414,23 @@ static void parse_lrc(const char *lrc_text, lyric_data_t *data)
 
                 /* 跳过空歌词行（纯音乐标记等） */
                 if (ti > 0) {
-                    data->lines[data->count].time_ms = time_ms;
-                    strncpy(data->lines[data->count].text, text, LYRIC_TEXT_LEN);
-                    data->count++;
+                    /* 过滤元数据行（作词/作曲/编曲/制作人等） */
+                    static const char *meta_keys[] = {
+                        "作词", "作曲", "编曲", "制作人", "监制",
+                        "录音", "混音", "母带", "吉他", "Bass",
+                        "架子鼓", "大提琴", "小提琴", "管弦", "工程师",
+                        "出品", "发行", "公司", "solo", "Studio",
+                        NULL
+                    };
+                    bool is_meta = false;
+                    for (int k = 0; meta_keys[k]; k++) {
+                        if (strstr(text, meta_keys[k])) { is_meta = true; break; }
+                    }
+                    if (!is_meta) {
+                        data->lines[data->count].time_ms = time_ms;
+                        strncpy(data->lines[data->count].text, text, LYRIC_TEXT_LEN);
+                        data->count++;
+                    }
                 }
 
                 /* 跳到下一行 */
@@ -355,19 +456,25 @@ static void fetch_task(void *arg)
 {
     lyric_data_t *data = &s_lyric_data;
     char title[64], artist[64];
+    int known_id;
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     strncpy(title, data->song_name, sizeof(title) - 1);
     strncpy(artist, data->artist, sizeof(artist) - 1);
+    known_id = data->known_song_id;
     xSemaphoreGive(s_mutex);
 
-    ESP_LOGI(TAG, "Fetching lyrics: %s - %s", title, artist);
+    int song_id = known_id;
 
-    /* 步骤1：搜索歌曲 */
-    int song_id = search_song(title, artist);
-    if (song_id == 0) {
-        ESP_LOGW(TAG, "Song not found");
-        goto done;
+    if (song_id > 0) {
+        ESP_LOGI(TAG, "Using known songId=%d for: %s - %s", song_id, title, artist);
+    } else {
+        ESP_LOGI(TAG, "Searching lyrics: %s - %s", title, artist);
+        song_id = search_song(title, artist);
+        if (song_id == 0) {
+            ESP_LOGW(TAG, "Song not found");
+            goto done;
+        }
     }
 
     /* 步骤2：获取 LRC */
@@ -401,8 +508,9 @@ esp_err_t lyrics_init(void)
     return ESP_OK;
 }
 
-void lyrics_fetch_async(const char *title, const char *artist)
+void lyrics_fetch_async(const char *title, const char *artist, int song_id)
 {
+    ESP_LOGI(TAG, "lyrics_fetch_async called: '%s' - '%s' songId=%d", title, artist, song_id);
     if (!s_mutex) lyrics_init();
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
@@ -420,6 +528,7 @@ void lyrics_fetch_async(const char *title, const char *artist)
     memset(&s_lyric_data, 0, sizeof(s_lyric_data));
     strncpy(s_lyric_data.song_name, title, sizeof(s_lyric_data.song_name) - 1);
     strncpy(s_lyric_data.artist, artist, sizeof(s_lyric_data.artist) - 1);
+    s_lyric_data.known_song_id = song_id;
     xSemaphoreGive(s_mutex);
 
     /* 如果已有任务在跑，不重复创建 */
@@ -428,8 +537,21 @@ void lyrics_fetch_async(const char *title, const char *artist)
         return;
     }
 
-    xTaskCreatePinnedToCore(fetch_task, "lyric_fetch", 12288, NULL, 3,
-                            &s_fetch_task, 0);
+    /* 从 PSRAM 分配任务栈，避免内部 RAM 不足 */
+    if (!s_task_stack) {
+        s_task_stack = (StackType_t *)heap_caps_malloc(LYRIC_TASK_STACK_SIZE,
+                                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_task_stack) {
+            ESP_LOGE(TAG, "Failed to allocate task stack from PSRAM");
+            return;
+        }
+        ESP_LOGI(TAG, "Task stack allocated from PSRAM: %u bytes", (unsigned)LYRIC_TASK_STACK_SIZE);
+    }
+
+    s_fetch_task = xTaskCreateStaticPinnedToCore(
+        fetch_task, "lyric_fetch", LYRIC_TASK_STACK_SIZE,
+        NULL, 3, s_task_stack, &s_task_tcb, 1);
+    ESP_LOGI(TAG, "Fetch task created (static, core 1)");
 }
 
 int lyrics_get_current_line(int position_ms)
@@ -471,6 +593,7 @@ void lyrics_clear(void)
     if (!s_mutex) return;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     memset(&s_lyric_data, 0, sizeof(s_lyric_data));
+    s_fetch_task = NULL;  /* 重置任务句柄，允许下次获取 */
     xSemaphoreGive(s_mutex);
     ESP_LOGI(TAG, "Lyrics cleared");
 }

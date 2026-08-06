@@ -26,6 +26,7 @@ typedef struct {
     bool loaded;                       /* 是否已加载 */
     char song_name[64];                /* 当前歌曲名（缓存 key） */
     char artist[64];                   /* 当前歌手（缓存 key） */
+    int  known_song_id;                /* 已知 songId（>0 跳过搜索） */
 } lyric_data_t;
 
 /**
@@ -35,13 +36,11 @@ esp_err_t lyrics_init(void);
 
 /**
  * @brief 异步获取歌词（会创建后台任务）
- * @param title  歌曲名
- * @param artist 歌手名
- *
- * 如果歌名+歌手与缓存相同，不会重复请求。
- * 请求完成后 s_lyric_data 自动更新。
+ * @param title    歌曲名
+ * @param artist   歌手名
+ * @param song_id  网易云 songId（>0 时跳过搜索，直接获取歌词）
  */
-void lyrics_fetch_async(const char *title, const char *artist);
+void lyrics_fetch_async(const char *title, const char *artist, int song_id);
 
 /**
  * @brief 根据播放位置获取当前歌词行索引
