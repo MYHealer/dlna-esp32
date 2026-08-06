@@ -71,7 +71,7 @@ static void soap_ok_stub(httpd_req_t *req, const char *service, const char *acti
 #define SUB_TIMEOUT_SEC 1800
 typedef struct {
     char url[256];
-    char sid[64];
+    char sid[96];
     int64_t expiry_time;  /* esp_timer_get_time() + timeout */
     int seq;
     esp_http_client_handle_t client;  /* 持久 HTTP 连接，复用 TCP */
@@ -619,7 +619,7 @@ static void handle_avt_control(httpd_req_t *req)
     if (strcmp(action, "SetAVTransportURI") == 0) {
         char uri[2048] = {0};
         if (xml_get(body, "CurrentURI", uri, sizeof(uri)) >= 0 && uri[0]) {
-            strncpy(s_uri, uri, sizeof(s_uri) - 1);
+            snprintf(s_uri, sizeof(s_uri), "%s", uri);
             /* 保存元数据（歌词/封面依赖此数据） */
             xml_get(body, "CurrentURIMetaData", s_metadata, sizeof(s_metadata));
             ESP_LOGI(TAG, "SetAVTransportURI meta len=%d: %.200s",
@@ -881,7 +881,7 @@ static esp_err_t event_handler(httpd_req_t *req)
                     httpd_resp_send(req, "", 0);
                     return ESP_OK;
                 }
-                strncpy(s_subs[slot].sid, fixed_sid, sizeof(s_subs[slot].sid) - 1);
+                snprintf(s_subs[slot].sid, sizeof(s_subs[slot].sid), "%s", fixed_sid);
                 s_subs[slot].expiry_time = esp_timer_get_time() / 1000000 + SUB_TIMEOUT_SEC;
                 s_subs[slot].seq = 0;
                 /* 保留旧 URL 如果存在（清理时可能还在） */
@@ -947,7 +947,7 @@ static esp_err_t event_handler(httpd_req_t *req)
             const char *dev_uuid = (s_cfg && s_cfg->uuid) ? s_cfg->uuid : "8db0797a-f01a-4949-8f59-51188b18180b";
             snprintf(s_subs[slot].sid, sizeof(s_subs[slot].sid),
                      "uuid:%s", dev_uuid);
-            strncpy(s_subs[slot].url, url, sizeof(s_subs[slot].url) - 1);
+            snprintf(s_subs[slot].url, sizeof(s_subs[slot].url), "%s", url);
             s_subs[slot].expiry_time = esp_timer_get_time() / 1000000 + SUB_TIMEOUT_SEC;
             s_subs[slot].seq = 0;
 

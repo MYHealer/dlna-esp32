@@ -32,6 +32,17 @@
 #include "freertos/semphr.h"
 #include "driver/gpio.h"
 #include "rotary_encoder.h"
+#include "tft_display.h"
+#include "lvgl_port.h"
+#include "lyrics_fetch.h"
+#include "esp_http_client.h"
+#include "esp_jpeg_dec.h"
+#include "audio_forge.h"
+#include "lwip/sockets.h"
+#include "lwip/netdb.h"
+#define lodepng_malloc(s) heap_caps_malloc(s, MALLOC_CAP_SPIRAM)
+#define lodepng_free(p)  heap_caps_free(p)
+#include "extra/libs/png/lodepng.h"
 
 #if (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 1, 0))
 #include "esp_netif.h"
@@ -40,6 +51,17 @@
 #endif
 
 static const char *TAG = "DLNA_APP";
+
+/* ── Wrap audio_forge_init: 增大默认栈 4KB→8KB ── */
+extern audio_element_handle_t __real_audio_forge_init(audio_forge_cfg_t *config);
+audio_element_handle_t __wrap_audio_forge_init(audio_forge_cfg_t *config)
+{
+    if (config && config->task_stack < 8192) {
+        ESP_LOGI(TAG, "Audio_forge: stack %d -> 8192", config->task_stack);
+        config->task_stack = 8192;
+    }
+    return __real_audio_forge_init(config);
+}
 
 #define DLNA_DEVICE_UUID "8db0797a-f01a-4949-8f59-51188b18180b"
 
@@ -185,10 +207,70 @@ static int cb_get_position_ms(void)
 
 static int s_dur_cache_sec = 0;  /* 最近一次有效时长（秒） */
 
-/* ── 从 DIDL-Lite metadata 解析歌曲时长 ──
- * 网易云 metadata 格式（HTML 转义）：
- *   &lt;res ... duration=&quot;00:03:45&quot; ...&gt;URI&lt;/res&gt;
- * esp_audio_duration_get 返回的是解码累计时间（微秒），不是歌曲总时长！ */
+/* ── 当前歌曲信息（从 DIDL-Lite metadata 解析）── */
+static char s_cur_title[128]  = "";
+static char s_cur_artist[128] = "";
+
+/* ── HTML 转义还原（DIDL-Lite 经过 HTML 编码）── */
+static void html_unescape(char *dst, int dst_size, const char *src, int src_len)
+{
+    int di = 0;
+    for (int i = 0; i < src_len && di < dst_size - 1; i++) {
+        if (src[i] == '&') {
+            if (strncmp(&src[i], "&amp;", 5) == 0)      { dst[di++] = '&';  i += 4; }
+            else if (strncmp(&src[i], "&lt;", 4) == 0)   { dst[di++] = '<';  i += 3; }
+            else if (strncmp(&src[i], "&gt;", 4) == 0)   { dst[di++] = '>';  i += 3; }
+            else if (strncmp(&src[i], "&quot;", 6) == 0)  { dst[di++] = '"';  i += 5; }
+            else if (strncmp(&src[i], "&apos;", 6) == 0)  { dst[di++] = '\''; i += 5; }
+            else { dst[di++] = src[i]; }
+        } else {
+            dst[di++] = src[i];
+        }
+    }
+    dst[di] = '\0';
+}
+
+/* 从 DIDL-Lite XML 中提取标签内容（HTML 转义版本） */
+static int extract_tag(char *out, int out_size, const char *xml, const char *tag)
+{
+    /* 搜索 &lt;tagname...&gt; 或 &lt;tagname/&gt;（支持标签带属性） */
+    char open_pat[48], close[48];
+    snprintf(open_pat, sizeof(open_pat), "&lt;%s", tag);
+    snprintf(close, sizeof(close), "&lt;/%s&gt;", tag);
+
+    const char *p = strstr(xml, open_pat);
+    if (!p) {
+        /* 未转义形式 <tagname...> */
+        char open2[32], close2[32];
+        snprintf(open2, sizeof(open2), "<%s", tag);
+        snprintf(close2, sizeof(close2), "</%s>", tag);
+        p = strstr(xml, open2);
+        if (!p) return -1;
+        p += strlen(open2);
+        while (*p && *p != '>' && !(*p == '/' && *(p+1) == '>')) p++;
+        if (*p == '>') p++;
+        else if (*p == '/') p += 2;
+        if (!*p) return -1;
+        const char *end = strstr(p, close2);
+        if (!end) return -1;
+        html_unescape(out, out_size, p, end - p);
+        return 0;
+    }
+    /* 跳过 &lt;tagname，找到下一个 &gt; 或 > */
+    p += strlen(open_pat);
+    while (*p) {
+        if (strncmp(p, "&gt;", 4) == 0) { p += 4; break; }
+        if (*p == '>') { p++; break; }
+        if (*p == '/' && *(p+1) == '>') { p += 2; break; }
+        p++;
+    }
+    if (!*p) return -1;
+    const char *end = strstr(p, close);
+    if (!end) return -1;
+    html_unescape(out, out_size, p, end - p);
+    return 0;
+}
+
 static void parse_duration_from_metadata(const char *meta)
 {
     if (!meta) return;
@@ -289,8 +371,11 @@ static void cb_set_uri(const char *uri)
     }
     free(s_track_uri);
     s_track_uri = uri ? strdup(uri) : NULL;
-    /* 新 URI → 重置时长缓存，避免沿用上一首的时长 */
+    /* 新 URI → 重置时长缓存 + 歌词 */
     s_dur_cache_sec = 0;
+    s_cur_title[0] = '\0';
+    s_cur_artist[0] = '\0';
+    lyrics_clear();
     /* 状态转换：设置 URI 后从 NO_MEDIA → STOPPED */
     if (s_state == PS_NO_MEDIA && s_track_uri) {
         s_state = PS_STOPPED;
@@ -508,11 +593,386 @@ static void cb_set_next_uri(const char *uri, const char *metadata)
     s_next_metadata = metadata ? strdup(metadata) : NULL;
 }
 
+static void fetch_album_art_async(const char *url);
+
+/* 简易 HTML 实体解码：将 &#xxxxx; 转为 UTF-8 */
+static void decode_html_entities(char *dst, size_t dst_size, const char *src)
+{
+    size_t pos = 0;
+    while (*src && pos + 6 < dst_size) {
+        if (*src == '&' && *(src + 1) == '#') {
+            src += 2; /* 跳过 &# */
+            unsigned long codepoint = 0;
+            while (*src >= '0' && *src <= '9') {
+                codepoint = codepoint * 10 + (*src - '0');
+                src++;
+            }
+            if (*src == ';') src++; /* 跳过 ; */
+            /* 将 Unicode code point 编码为 UTF-8 */
+            if (codepoint < 0x80) {
+                dst[pos++] = codepoint;
+            } else if (codepoint < 0x800) {
+                dst[pos++] = 0xC0 | (codepoint >> 6);
+                dst[pos++] = 0x80 | (codepoint & 0x3F);
+            } else if (codepoint < 0x10000) {
+                dst[pos++] = 0xE0 | (codepoint >> 12);
+                dst[pos++] = 0x80 | ((codepoint >> 6) & 0x3F);
+                dst[pos++] = 0x80 | (codepoint & 0x3F);
+            } else {
+                dst[pos++] = 0xF0 | (codepoint >> 18);
+                dst[pos++] = 0x80 | ((codepoint >> 12) & 0x3F);
+                dst[pos++] = 0x80 | ((codepoint >> 6) & 0x3F);
+                dst[pos++] = 0x80 | (codepoint & 0x3F);
+            }
+        } else {
+            dst[pos++] = *src;
+            src++;
+        }
+    }
+    dst[pos] = '\0';
+}
+
 static void cb_set_metadata(const char *metadata)
 {
-    ESP_LOGD(TAG, "Metadata: %s", metadata);
-    /* 从 DIDL-Lite metadata 解析歌曲时长 */
+    ESP_LOGI(TAG, "Metadata: %s", metadata);
     parse_duration_from_metadata(metadata);
+
+    char title[256] = "", artist[256] = "", album_art[256] = "";
+    extract_tag(title, sizeof(title), metadata, "dc:title");
+    extract_tag(artist, sizeof(artist), metadata, "upnp:artist");
+    extract_tag(album_art, sizeof(album_art), metadata, "upnp:albumArtURI");
+    ESP_LOGI(TAG, "Extracted: title='%s' artist='%s' album_art='%s'", title, artist, album_art);
+
+    if (album_art[0]) {
+        /* 没有参数时追加 ?param=200y200 让 CDN 返回小图，节省内存 */
+        if (!strchr(album_art, '?')) {
+            strncat(album_art, "?param=300y300", sizeof(album_art) - strlen(album_art) - 1);
+        }
+        ESP_LOGI(TAG, "AlbumArt URL: %s", album_art);
+        fetch_album_art_async(album_art);
+    }
+
+    if (title[0] && (strcmp(title, s_cur_title) != 0 || strcmp(artist, s_cur_artist) != 0)) {
+        decode_html_entities(s_cur_title, sizeof(s_cur_title), title);
+        decode_html_entities(s_cur_artist, sizeof(s_cur_artist), artist);
+        ESP_LOGI(TAG, "Song: %s - %s", s_cur_title, s_cur_artist);
+        lvgl_port_lock();
+        lvgl_port_ui_set_title(s_cur_title);
+        lvgl_port_ui_set_artist(s_cur_artist);
+        lvgl_port_unlock();
+        lyrics_fetch_async(s_cur_title, s_cur_artist);
+    }
+}
+
+/* ─────────────────────── 专辑封面下载与解码 ─────────────────────── */
+
+/* ── 用原始 socket 下载封面，全部走 PSRAM，避免 esp_http_client 争抢内部 RAM ── */
+static int simple_http_get(const char *url, uint8_t **out_data, int *out_len)
+{
+    /* 解析 URL: http://host[:port]/path */
+    const char *p = url;
+    if (strncmp(p, "http://", 7) == 0) p += 7;
+    else { ESP_LOGW(TAG, "Only http supported"); return -1; }
+
+    char host[128] = "";
+    int port = 80;
+    const char *path = "/";
+    /* 提取 host */
+    int i = 0;
+    while (*p && *p != '/' && *p != ':' && i < 127) host[i++] = *p++;
+    host[i] = '\0';
+    if (*p == ':') { p++; port = atoi(p); while (*p && *p != '/') p++; }
+    if (*p == '/') path = p;
+
+    /* DNS 解析 */
+    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
+    struct addrinfo *res = NULL;
+    char port_str[8];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+    if (getaddrinfo(host, port_str, &hints, &res) != 0 || !res) {
+        ESP_LOGW(TAG, "DNS failed: %s", host);
+        return -1;
+    }
+
+    /* 创建 socket */
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) { freeaddrinfo(res); return -1; }
+
+    /* 设置超时 */
+    struct timeval tv = { .tv_sec = 10 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
+        close(sock); freeaddrinfo(res);
+        ESP_LOGW(TAG, "TCP connect failed: %s:%d", host, port);
+        return -1;
+    }
+    freeaddrinfo(res);
+
+    /* 发送 HTTP GET */
+    char req[512];
+    int req_len = snprintf(req, sizeof(req),
+        "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n", path, host);
+    send(sock, req, req_len, 0);
+
+    /* 读取响应到 PSRAM 缓冲区（动态扩容，确保完整下载） */
+    int cap = 256 * 1024;  /* 初始 256KB，足够大图 */
+    uint8_t *buf = heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
+    if (!buf) { close(sock); return -1; }
+
+    int total = 0, hdr_end = 0;
+    for (;;) {
+        int r = recv(sock, buf + total, cap - total - 1, 0);
+        if (r <= 0) break;  /* 0=对端关闭, <0=错误 */
+        total += r;
+        /* 查找 HTTP 头结束标记 */
+        if (!hdr_end) {
+            for (int j = 0; j < total - 3; j++) {
+                if (buf[j] == '\r' && buf[j+1] == '\n' && buf[j+2] == '\r' && buf[j+3] == '\n') {
+                    hdr_end = j + 4;
+                    break;
+                }
+            }
+        }
+        /* 缓冲区将满时扩容（PSRAM 有足够空间） */
+        if (total > cap - 4096) {
+            int new_cap = cap + 128 * 1024;
+            uint8_t *new_buf = heap_caps_realloc(buf, new_cap, MALLOC_CAP_SPIRAM);
+            if (!new_buf) break;  /* 扩容失败，用已有数据 */
+            buf = new_buf;
+            cap = new_cap;
+        }
+    }
+    close(sock);
+
+    if (!hdr_end || total - hdr_end < 4) {
+        ESP_LOGW(TAG, "HTTP response too small: %d (hdr_end=%d)", total, hdr_end);
+        heap_caps_free(buf);
+        return -1;
+    }
+
+    int body_len = total - hdr_end;
+    ESP_LOGI(TAG, "HTTP response: total=%d, headers=%d, body=%d", total, hdr_end, body_len);
+    /* 分配干净的 body 缓冲区（PSRAM） */
+    uint8_t *body = heap_caps_malloc(body_len, MALLOC_CAP_SPIRAM);
+    if (!body) { heap_caps_free(buf); return -1; }
+    memcpy(body, buf + hdr_end, body_len);
+    heap_caps_free(buf);
+
+    *out_data = body;
+    *out_len = body_len;
+    ESP_LOGI(TAG, "Cover downloaded: %d bytes", body_len);
+    return 0;
+}
+
+static void album_art_task(void *arg)
+{
+    const char *url = (const char *)arg;
+    if (!url) { free(arg); vTaskDelete(NULL); return; }
+
+    /* 等音频管线稳定 */
+    vTaskDelay(pdMS_TO_TICKS(3000));
+
+    uint8_t *img_data = NULL;
+    int img_len = 0;
+    if (simple_http_get(url, &img_data, &img_len) != 0) {
+        ESP_LOGW(TAG, "Cover download failed");
+        free(arg);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /* 检测图片格式并解码 */
+    ESP_LOGI(TAG, "Image data: len=%d, first4=%02X %02X %02X %02X",
+             img_len, img_data[0], img_data[1], img_data[2], img_data[3]);
+    int out_w = 0, out_h = 0;
+    uint16_t *out_buf = NULL;
+    bool jpeg_aligned = false;  /* JPEG 用 jpeg_calloc_align 分配 */
+
+    if (img_data[0] == 0xFF && img_data[1] == 0xD8) {
+        /* ====== JPEG 解码（esp_new_jpeg，支持 progressive） ====== */
+        jpeg_dec_config_t dec_cfg = DEFAULT_JPEG_DEC_CONFIG();
+        dec_cfg.output_type = JPEG_PIXEL_FORMAT_RGB565_LE;  /* 小端序，CPU 直接读 */
+        jpeg_dec_handle_t jpeg_dec = NULL;
+        jpeg_error_t jerr = jpeg_dec_open(&dec_cfg, &jpeg_dec);
+        if (jerr != JPEG_ERR_OK) {
+            ESP_LOGW(TAG, "JPEG open failed: %d", jerr);
+            heap_caps_free(img_data); free(arg); vTaskDelete(NULL); return;
+        }
+
+        /* 直接解码全尺寸（DEFAULT_JPEG_DEC_CONFIG 已禁用 scale） */
+
+        jpeg_dec_io_t io = { .inbuf = img_data, .inbuf_len = img_len };
+        jpeg_dec_header_info_t info;
+        jerr = jpeg_dec_parse_header(jpeg_dec, &io, &info);
+        if (jerr != JPEG_ERR_OK) {
+            ESP_LOGW(TAG, "JPEG header parse failed: %d", jerr);
+            jpeg_dec_close(jpeg_dec);
+            heap_caps_free(img_data); free(arg); vTaskDelete(NULL); return;
+        }
+        out_w = info.width;
+        out_h = info.height;
+
+        int outbuf_len = 0;
+        jpeg_dec_get_outbuf_len(jpeg_dec, &outbuf_len);
+        uint8_t *raw_buf = (uint8_t *)jpeg_calloc_align(outbuf_len, 16);
+        if (!raw_buf) {
+            ESP_LOGW(TAG, "JPEG outbuf alloc failed (%d)", outbuf_len);
+            jpeg_dec_close(jpeg_dec);
+            heap_caps_free(img_data); free(arg); vTaskDelete(NULL); return;
+        }
+
+        /* 关键：parse_header 已消费头部字节，inbuf_remain 是剩余未用字节。
+           必须把 inbuf 指针前移到 SOS 段位置再交给 process 解码 */
+        int consumed = io.inbuf_len - io.inbuf_remain;
+        io.outbuf = raw_buf;
+        io.out_size = outbuf_len;
+        io.inbuf = img_data + consumed;
+        io.inbuf_len = io.inbuf_remain;
+        jerr = jpeg_dec_process(jpeg_dec, &io);
+        jpeg_dec_close(jpeg_dec);
+        if (jerr != JPEG_ERR_OK) {
+            ESP_LOGW(TAG, "JPEG decode failed: %d", jerr);
+            jpeg_free_align(raw_buf);
+            heap_caps_free(img_data); free(arg); vTaskDelete(NULL); return;
+        }
+
+        /* BGR565_BE + 中心裁剪 + 双线性缩放到 48x48 */
+        int min_dim = out_w < out_h ? out_w : out_h;
+        int crop_sz = min_dim;
+        int crop_x = (out_w - crop_sz) / 2;
+        int crop_y = (out_h - crop_sz) / 2;
+        #define JPEG_MAX_COVER 48
+        int sw = JPEG_MAX_COVER, sh = JPEG_MAX_COVER;
+        uint16_t *resized = (uint16_t *)heap_caps_malloc(sw * sh * 2, MALLOC_CAP_SPIRAM);
+        if (!resized) {
+            ESP_LOGW(TAG, "JPEG resize alloc failed");
+            jpeg_free_align(raw_buf);
+            heap_caps_free(img_data); free(arg); vTaskDelete(NULL); return;
+        }
+        uint16_t *src = (uint16_t *)raw_buf;
+        for (int y = 0; y < sh; y++) {
+            float fy = crop_y + (float)y / sh * crop_sz;
+            for (int x = 0; x < sw; x++) {
+                float fx = crop_x + (float)x / sw * crop_sz;
+                int ix = (int)fx, iy = (int)fy;
+                if (ix >= out_w - 1) ix = out_w - 2;
+                if (iy >= out_h - 1) iy = out_h - 2;
+                float dx = fx - ix, dy = fy - iy;
+                /* 四个邻近像素（RGB565_BE，已含 BGR 交换前的原始数据） */
+                uint16_t p00 = src[iy * out_w + ix];
+                uint16_t p01 = src[iy * out_w + ix + 1];
+                uint16_t p10 = src[(iy + 1) * out_w + ix];
+                uint16_t p11 = src[(iy + 1) * out_w + ix + 1];
+                /* 分通道双线性插值（RGB565: R=5bit, G=6bit, B=5bit） */
+                int r = (int)((((p00>>11)&0x1F)*(1-dx) + ((p01>>11)&0x1F)*dx)*(1-dy) +
+                              (((p10>>11)&0x1F)*(1-dx) + ((p11>>11)&0x1F)*dx)*dy);
+                int g = (int)((((p00>>5)&0x3F)*(1-dx) + ((p01>>5)&0x3F)*dx)*(1-dy) +
+                              (((p10>>5)&0x3F)*(1-dx) + ((p11>>5)&0x3F)*dx)*dy);
+                int b = (int)(((p00&0x1F)*(1-dx) + (p01&0x1F)*dx)*(1-dy) +
+                              ((p10&0x1F)*(1-dx) + (p11&0x1F)*dx)*dy);
+                /* BGR565 大端序（ST7735 MADCTL_BGR） */
+                uint16_t c = ((b & 0x1F) << 11) | ((g & 0x3F) << 5) | (r & 0x1F);
+                resized[y * sw + x] = (c >> 8) | (c << 8);
+            }
+        }
+        jpeg_free_align(raw_buf);
+        out_buf = resized;
+        jpeg_aligned = false;  /* resized 用 heap_caps_malloc，不用 jpeg_free_align */
+        out_w = sw; out_h = sh;
+        ESP_LOGI(TAG, "JPEG decoded: %dx%d -> crop %d -> %dx%d", info.width, info.height, crop_sz, sw, sh);
+
+    } else if (img_data[0] == 0x89 && img_data[1] == 0x50) {
+        /* ====== PNG 解码（lodepng） ====== */
+        unsigned png_w = 0, png_h = 0;
+        uint8_t *png_rgb = NULL;
+        /* 用 RGB（3 字节/像素）而非 RGBA，省 25% 内存 */
+        unsigned err = lodepng_decode24(&png_rgb, &png_w, &png_h, img_data, img_len);
+        if (err) {
+            ESP_LOGW(TAG, "PNG decode failed: %u (%s), w=%u h=%u", err, lodepng_error_text(err), png_w, png_h);
+            heap_caps_free(img_data);
+            free(arg);
+            vTaskDelete(NULL);
+            return;
+        }
+        /* 下载缓冲区已无用，立即释放 */
+        heap_caps_free(img_data);
+        img_data = NULL;
+
+        /* 中心裁剪 + 缩放到 48x48 */
+        int min_dim = png_w < png_h ? png_w : png_h;
+        int crop_sz = min_dim;
+        int crop_x = (png_w - crop_sz) / 2;
+        int crop_y = (png_h - crop_sz) / 2;
+        #define MAX_COVER 48
+        int sw = MAX_COVER, sh = MAX_COVER;
+
+        size_t out_buf_size = sw * sh * 2;
+        out_buf = (uint16_t *)heap_caps_malloc(out_buf_size, MALLOC_CAP_SPIRAM);
+        if (!out_buf) {
+            ESP_LOGW(TAG, "PNG out_buf alloc failed (%zu)", out_buf_size);
+            free(png_rgb);
+            free(arg);
+            vTaskDelete(NULL);
+            return;
+        }
+        /* 双线性缩放 + RGB888→BGR565 */
+        for (int y = 0; y < sh; y++) {
+            float fy = crop_y + (float)y / sh * crop_sz;
+            for (int x = 0; x < sw; x++) {
+                float fx = crop_x + (float)x / sw * crop_sz;
+                int ix = (int)fx, iy = (int)fy;
+                if (ix >= png_w - 1) ix = png_w - 2;
+                if (iy >= png_h - 1) iy = png_h - 2;
+                float dx = fx - ix, dy = fy - iy;
+                int base = iy * png_w + ix;
+                int r = (int)((png_rgb[base*3]*(1-dx) + png_rgb[(base+1)*3]*dx)*(1-dy) +
+                              (png_rgb[(base+png_w)*3]*(1-dx) + png_rgb[(base+png_w+1)*3]*dx)*dy);
+                int g = (int)((png_rgb[base*3+1]*(1-dx) + png_rgb[(base+1)*3+1]*dx)*(1-dy) +
+                              (png_rgb[(base+png_w)*3+1]*(1-dx) + png_rgb[(base+png_w+1)*3+1]*dx)*dy);
+                int b = (int)((png_rgb[base*3+2]*(1-dx) + png_rgb[(base+1)*3+2]*dx)*(1-dy) +
+                              (png_rgb[(base+png_w)*3+2]*(1-dx) + png_rgb[(base+png_w+1)*3+2]*dx)*dy);
+                uint16_t c = ((b >> 3) << 11) | ((g >> 2) << 5) | (r >> 3);
+                out_buf[y * sw + x] = (c >> 8) | (c << 8);
+            }
+        }
+        free(png_rgb);
+        out_w = sw; out_h = sh;
+        ESP_LOGI(TAG, "PNG decoded: %ux%u -> %dx%d (crop=%d)", png_w, png_h, out_w, out_h, crop_sz);
+
+    } else {
+        ESP_LOGW(TAG, "Unknown format: %02X %02X %02X %02X",
+                 img_data[0], img_data[1], img_data[2], img_data[3]);
+        heap_caps_free(img_data);
+        free(arg);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /* 显示封面（数据通过 memcpy 到内部 RAM 静态缓冲区，无缓存问题） */
+    lvgl_port_lock();
+    lvgl_port_ui_set_cover(out_buf, out_w, out_h);
+    lvgl_port_unlock();
+
+    /* 清理 */
+    if (jpeg_aligned) jpeg_free_align(out_buf);
+    else heap_caps_free(out_buf);
+    heap_caps_free(img_data);
+    free(arg);
+    vTaskDelete(NULL);
+}
+
+static void fetch_album_art_async(const char *url)
+{
+    char *url_copy = strdup(url);
+    if (!url_copy) return;
+    /* Core 1: 与 WiFi (Core 0) 完全隔离，避免争抢内部 RAM */
+    BaseType_t ret = xTaskCreatePinnedToCore(album_art_task, "album_art",
+        8 * 1024, url_copy, 1, NULL, 1);  /* 最低优先级，避免与音频管线争抢 CPU */
+    if (ret != pdPASS) {
+        ESP_LOGW(TAG, "album_art task create failed: %d", ret);
+        free(url_copy);
+    }
 }
 
 /* ─────────────────────── HTTP stream event ─────────────────────── */
@@ -722,11 +1182,62 @@ static void start_dlna(void)
     ESP_LOGI(TAG, "Custom DLNA started (host=ESP32-S3-DLNA)");
 }
 
+/* ─────────────────────── LVGL UI 更新任务 ── */
+
+/* 获取当前播放位置（毫秒） */
+static int get_position_ms(void)
+{
+    if (s_play_start_us > 0) {
+        return s_accumulated_ms +
+               (int)((esp_timer_get_time() - s_play_start_us) / 1000LL);
+    }
+    return s_accumulated_ms;
+}
+
+static void ui_update_task(void *arg)
+{
+    (void)arg;
+    int tick = 0;
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+
+        lvgl_port_lock();
+        int pos_sec = get_position_ms() / 1000;
+        ESP_LOGI(TAG, "UI: pos=%d dur=%d state=%d", pos_sec, s_dur_cache_sec, (int)get_state());
+        lvgl_port_ui_set_progress(pos_sec, s_dur_cache_sec);
+        lvgl_port_ui_set_state((int)get_state());
+        lvgl_port_ui_set_volume(s_vol);
+
+        const lyric_data_t *lyr = lyrics_get_data();
+        if (lyr && lyr->loaded && lyr->count > 0) {
+            int pos_ms = get_position_ms();
+            int cur = lyrics_get_current_line(pos_ms);
+            int start = cur - 2;
+            if (start < 0) start = 0;
+            if (start + 5 > lyr->count) start = lyr->count - 5;
+            if (start < 0) start = 0;
+            int act = cur - start;
+            if (act < 0 || act >= 5) act = -1;
+            for (int i = 0; i < 5; i++) {
+                int src = start + i;
+                lvgl_port_ui_set_lyric_line(i, (src < lyr->count) ? lyr->lines[src].text : "");
+            }
+            lvgl_port_ui_set_lyric_current(act);
+        } else {
+            for (int i = 0; i < 5; i++) lvgl_port_ui_set_lyric_line(i, "");
+            lvgl_port_ui_set_lyric_current(-1);
+        }
+        lvgl_port_unlock();
+
+        if ((++tick % 20) == 0) ESP_LOGI(TAG, "UI tick alive");
+    }
+}
+
 /* ─────────────────────── Entry point ─────────────────────── */
 void app_main(void)
 {
     esp_log_level_set("*", ESP_LOG_INFO);
-    esp_log_level_set(TAG, ESP_LOG_INFO);
+    esp_log_level_set(TAG, ESP_LOG_DEBUG);
     esp_log_level_set("AUDIO_ELEMENT", ESP_LOG_WARN);
     esp_log_level_set("AUDIO_PIPELINE", ESP_LOG_ERROR);
     esp_log_level_set("ESP_AUDIO_CTRL", ESP_LOG_WARN);
@@ -735,6 +1246,7 @@ void app_main(void)
     esp_log_level_set("ESP_AUDIO_TASK", ESP_LOG_DEBUG);
     esp_log_level_set("esp_http_client", ESP_LOG_DEBUG);
     esp_log_level_set("esp_netif_lwip", ESP_LOG_WARN);
+    esp_log_level_set("LYRIC", ESP_LOG_DEBUG);
     media_lib_add_default_adapter();
 
     esp_err_t ret = nvs_flash_init();
@@ -764,15 +1276,16 @@ void app_main(void)
             .wifi_config.sta.ssid = CONFIG_WIFI_SSID,
             .wifi_config.sta.password = CONFIG_WIFI_PASSWORD,
             .wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK,
-            .wifi_config.sta.pmf_cfg.capable = true,
+            .wifi_config.sta.pmf_cfg.capable = false,
             .wifi_config.sta.pmf_cfg.required = false,
             .wifi_config.sta.listen_interval = 1,
-            .reconnect_timeout_ms = 3000,
+            .reconnect_timeout_ms = 5000,
             .disable_auto_reconnect = false,
         };
         esp_periph_handle_t wifi_handle = periph_wifi_init(&wifi_cfg);
         esp_periph_start(set, wifi_handle);
-        periph_wifi_wait_for_connected(wifi_handle, portMAX_DELAY);
+        periph_wifi_wait_for_connected(wifi_handle, pdMS_TO_TICKS(15000));
+        ESP_LOGI(TAG, "WiFi %s", periph_wifi_is_connected(wifi_handle) ? "connected" : "timeout, continuing...");
     }
 
     /* ── 主机名 + WiFi 协议/功耗
@@ -798,4 +1311,10 @@ void app_main(void)
 
     /* ── 旋钮（UI）── */
     rotary_encoder_setup();
+
+    /* ── TFT 显示 + LVGL ── */
+    tft_init();
+    lvgl_port_init(5);
+    lyrics_init();
+    xTaskCreatePinnedToCore(ui_update_task, "ui_update", 4096, NULL, 3, NULL, 0);
 }

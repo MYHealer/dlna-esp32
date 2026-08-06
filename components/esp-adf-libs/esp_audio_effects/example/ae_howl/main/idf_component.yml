@@ -1,0 +1,7 @@
+description: Audio Effects Example
+
+dependencies:
+  espressif/esp_board_manager:
+    version: "~0.5.9"
+  espressif/esp_audio_effects:
+    override_path: ../../../../esp_audio_effects

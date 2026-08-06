@@ -1,0 +1,9 @@
+description: Audio Effects Test
+
+dependencies:
+  esp_audio_effects:
+    path: ../../../esp_audio_effects
+  espressif/esp-dsp:
+    version: "*"
+  tempotian/wifi_fs:
+    version: "^0.6.0"

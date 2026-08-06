@@ -3,6 +3,8 @@
  *
  * Uses PCNT (Pulse Counter) hardware peripheral for reliable
  * quadrature decoding with built-in filter and edge counting.
+ *
+ * Uses IDF 5.x/6.x handle-based PCNT API.
  */
 
 #include <stdint.h>
@@ -10,7 +12,7 @@
 #include "esp_log.h"
 #include "esp_err.h"
 #include "driver/gpio.h"
-#include "driver/pcnt.h"
+#include "driver/pulse_cnt.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -19,15 +21,13 @@
 
 static const char *TAG = "ROTARY_ENC";
 
-#define PCNT_UNIT  PCNT_UNIT_0
-#define PCNT_CH    PCNT_CHANNEL_0
-
 #define BTN_DEBOUNCE_MS     20
 
 /* Encoder and button state */
 static struct {
     const rotary_encoder_config_t *cfg;
     QueueHandle_t evt_queue;
+    pcnt_unit_handle_t pcnt_unit;
 } enc;
 
 typedef enum {
@@ -51,18 +51,18 @@ static int16_t s_last_count = 0;
 static void pcnt_task(void *arg)
 {
     (void)arg;
-    int16_t count = 0;
+    int count = 0;
     int accumulated = 0;
     bool rotating = false;
     int64_t last_change_time = 0;
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(20));
-        pcnt_get_counter_value(PCNT_UNIT, &count);
+        pcnt_unit_get_count(enc.pcnt_unit, &count);
 
-        int16_t delta = count - s_last_count;
+        int16_t delta = (int16_t)count - s_last_count;
         if (delta != 0) {
-            s_last_count = count;
+            s_last_count = (int16_t)count;
             accumulated += delta;
             last_change_time = esp_timer_get_time() / 1000;
             rotating = true;
@@ -140,33 +140,45 @@ esp_err_t rotary_encoder_init(const rotary_encoder_config_t *config)
         return ESP_ERR_NO_MEM;
     }
 
-    /* ── Configure PCNT for quadrature decoding ── */
-    pcnt_config_t pcnt_cfg = {
-        .pulse_gpio_num = config->clk_gpio,
-        .ctrl_gpio_num  = config->dt_gpio,
-        .channel        = PCNT_CHANNEL_0,
-        .unit           = PCNT_UNIT,
-        .pos_mode       = PCNT_COUNT_INC,   /* rising edge of CLK → count up */
-        .neg_mode       = PCNT_COUNT_DEC,   /* falling edge of CLK → count down */
-        .lctrl_mode     = PCNT_MODE_REVERSE, /* DT high reverses count direction */
-        .hctrl_mode     = PCNT_MODE_KEEP,    /* DT low keeps direction */
-        .counter_h_lim  = 32767,
-        .counter_l_lim  = -32768,
+    /* ── Create PCNT unit ── */
+    pcnt_unit_config_t unit_cfg = {
+        .high_limit = 32767,
+        .low_limit  = -32768,
     };
-    esp_err_t ret = pcnt_unit_config(&pcnt_cfg);
+    esp_err_t ret = pcnt_new_unit(&unit_cfg, &enc.pcnt_unit);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "pcnt_unit_config failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "pcnt_new_unit failed: %s", esp_err_to_name(ret));
         return ret;
     }
 
-    /* ── Hardware filter: 1000 APB clock cycles ≈ 12.5µs debounce ── */
-    pcnt_set_filter_value(PCNT_UNIT, 1000);
-    pcnt_filter_enable(PCNT_UNIT);
+    /* ── Configure channel for quadrature decoding ── */
+    pcnt_chan_config_t chan_cfg = {
+        .edge_gpio_num  = config->clk_gpio,
+        .level_gpio_num = config->dt_gpio,
+    };
+    pcnt_channel_handle_t pcnt_chan = NULL;
+    ret = pcnt_new_channel(enc.pcnt_unit, &chan_cfg, &pcnt_chan);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "pcnt_new_channel failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    pcnt_channel_set_edge_action(pcnt_chan,
+        PCNT_CHANNEL_EDGE_ACTION_INCREASE,
+        PCNT_CHANNEL_EDGE_ACTION_DECREASE);
+    pcnt_channel_set_level_action(pcnt_chan,
+        PCNT_CHANNEL_LEVEL_ACTION_KEEP,
+        PCNT_CHANNEL_LEVEL_ACTION_INVERSE);
+
+    /* ── Hardware filter: ~12.5µs debounce ── */
+    pcnt_glitch_filter_config_t filter_cfg = {
+        .max_glitch_ns = 1000,
+    };
+    pcnt_unit_set_glitch_filter(enc.pcnt_unit, &filter_cfg);
 
     /* ── Clear and start counter ── */
-    pcnt_counter_pause(PCNT_UNIT);
-    pcnt_counter_clear(PCNT_UNIT);
-    pcnt_counter_resume(PCNT_UNIT);
+    pcnt_unit_clear_count(enc.pcnt_unit);
+    pcnt_unit_start(enc.pcnt_unit);
 
     /* ── Button GPIO ── */
     gpio_config_t btn_conf = {

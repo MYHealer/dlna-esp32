@@ -26,5 +26,20 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# Zip files (reference projects already tracked)
+# Reference projects (not part of the project)
+参考项目/
+
+# Node modules (font converter)
+node_modules/
+
+# Temporary test files
+cover_test.*
+font_chars.txt
+
+# Font source files (generated .c file is tracked)
+*.ttf
+*.ttc
+*.otf
+
+# Zip files
 *.zip

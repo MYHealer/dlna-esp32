@@ -1,0 +1,90 @@
+# Changelog
+
+## v1.4.1
+
+### Features
+
+- Added two library variants for `ESP32-S31`: one with PIE assembly optimization and one without
+- Added menuconfig option `ESP_AUDIO_EFFECTS_S31_USE_ASM` to select whether to use assembly optimized library on `ESP32-S31`
+
+## v1.4.0
+
+### Break Change
+
+- Requires `ESP32-P4` chip version >= 3.0 for assembly optimization support
+
+### Features
+
+- Added `reverb` (room reverb) effect to simulate natural sound reflections in an enclosed space
+- Added `delay` (echo) effect to produce delayed copies of the input signal with configurable feedback decay
+- Added assembly optimizations for `sonic` on `esp32s31` and `esp32p4`, improving performance by 50%
+- Added assembly optimizations for `rate_cvt` on `esp32s31` and `esp32p4`, improving performance by 4×
+- Added `esp_ae_alc_set_transit_time` API for `ALC`
+
+## v1.3.0~1
+
+### Bug Fixes
+
+- Fixed link errors caused by missing `gmf_fft` linkage (undefined references to `esp_gmf_fft_init`, etc.)
+
+## v1.3.0
+
+### Features
+
+- Added `howl` (howling suppression) effect to detect and suppress acoustic-feedback howling
+- Supported `esp-audio-effects` for `esp32s31`
+- Replaced server-based test data read/write with `wifi_fs` I/O to host PC folder over Wi-Fi
+
+## v1.2.1
+
+### Features
+
+- Removed the range limitation of `Mixer` weight
+
+### Bug Fixes
+
+- Fixed rate convert reset have crash when input and output samplerate is same
+
+## v1.2.0
+
+### Features
+
+- Added audio effects module for `DRC`, `MBC`
+- Added `esp_ae_xx_reset` function for all effect modules
+- Added per-stream enable/disable control for `Mixer`
+- Added esp_audio_effects demo
+- Optimized effects implementation to reduce binary size
+- Added refine code and license for test app
+
+### Bug Fixes
+
+- Fixed an issue where `ALC` failed to operate correctly when the input level was too low
+- Fixed `FADE` module reset not taking effect
+- Fixed a bit-depth conversion error when converting 8-bit to 24-bit
+
+## v1.1.0
+
+### Features
+
+- Supported `esp-audio-effects` for `esp32-h4`
+- Supported mixer outbuf is one of inbuf
+
+## v1.0.2
+
+### Bug Fixes
+
+- Compile libraries using the -o2 compilation option
+
+## v1.0.1
+
+### Bug Fixes
+
+- Fix `test_sonic` test code error
+- Remove `sdkconfig.default` have some configuration strings that cannot be detected by the latest IDF
+
+## v1.0.0
+
+### Features
+
+- Initial version of `esp-audio-effects`
+- Add audio effects module for `ALC`, `BIT_CVT`, `CH_CVT`, `RATE_CVT`, `EQ`, `FADE`, `DATA_WEAVER`, `MIXER`, `SONIC`

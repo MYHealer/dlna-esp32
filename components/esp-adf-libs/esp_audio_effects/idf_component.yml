@@ -1,0 +1,29 @@
+description: Espressif audio effects
+issues: https://github.com/espressif/esp-adf/issues
+repository: https://github.com/espressif/esp-adf-libs.git
+url: https://github.com/espressif/esp-adf-libs/tree/master/esp_audio_effects
+version: 1.4.1
+
+dependencies:
+  espressif/gmf_fft:
+    require: public
+    version: "~1.0"
+
+tags:
+   - "multimedia"
+   - "audio_effects"
+   - "rate_conversion"
+   - "mixer"
+   - "equalizer"
+   - "fade"
+   - "sonic"
+   - "drc"
+   - "mbc"
+   - "alc"
+   - "data_weaver"
+   - "resample"
+   - "channel_conversion"
+   - "bit_conversion"
+   - "howl"
+   - "reverb"
+   - "delay"

@@ -1,0 +1,28 @@
+menu "ESP Audio Effects UT Configuration"
+
+config EXAMPLE_WIFI_SSID
+    string "WiFi SSID"
+    default "xxxx"
+    help
+        WiFi SSID used by the rate converter test app.
+
+config EXAMPLE_WIFI_PASSWORD
+    string "WiFi Password"
+    default "xxxx"
+    help
+        WiFi password used by the rate converter test app.
+
+config WIFI_FS_SERVER_IP
+    string "WiFi FS server IP"
+    default "111.111.111.111"
+    help
+        File server IP address used by the WiFi file system.
+
+config WIFI_FS_SERVER_PORT
+    int "WiFi FS server port"
+    range 1 65535
+    default 3333
+    help
+        File server port used by the WiFi file system.
+
+endmenu

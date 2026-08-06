@@ -1,0 +1,8 @@
+stages:
+  - trigger
+  - deploy
+
+include:
+  - '.gitlab/ci/rules.yml'
+  - '.gitlab/ci/trigger.yml'
+  - '.gitlab/ci/deploy.yml'
