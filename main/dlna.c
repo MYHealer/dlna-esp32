@@ -99,6 +99,7 @@ static volatile bool s_lyrics_ui_clear_pending = false;
 /* 位置追踪：纯软件方案（参考 miair-next） */
 static int64_t        s_play_start_us     = 0;   /* 播放开始时间（esp_timer us），0=未在播放 */
 static int            s_accumulated_ms    = 0;   /* 累计已播放 ms（暂停/停止时冻结） */
+static char          *s_playing_uri       = NULL; /* 当前音频管道实际加载的 URI，用于检测暂停时切歌 */
 
 
 /* ── 工具：获取字符串形式的 DLNA 状态 ── */
@@ -406,43 +407,77 @@ static void delayed_stop_notify(void *arg)
     vTaskDelete(NULL);
 }
 
+static void _do_play(const char *uri, int seek_sec)
+{
+    if (!player || !uri) return;
+    esp_err_t err = esp_audio_play(player, AUDIO_CODEC_TYPE_DECODER, uri, 0);
+    if (err == ESP_OK) {
+        set_state(PS_PLAYING);
+        s_accumulated_ms = seek_sec * 1000;
+        s_play_start_us = esp_timer_get_time();
+        s_grace_until = esp_timer_get_time() + 8000000LL;
+        s_user_stopped = 0;
+        free(s_playing_uri);
+        s_playing_uri = strdup(uri);
+        if (seek_sec > 0) {
+            vTaskDelay(pdMS_TO_TICKS(300));
+            esp_audio_seek(player, seek_sec);
+            ESP_LOGI(TAG, "Resumed from %d s (seek)", seek_sec);
+        }
+    } else {
+        ESP_LOGE(TAG, "esp_audio_play failed: 0x%x", err);
+        set_state(PS_STOPPED);
+    }
+}
+
 static void cb_play(void)
 {
     play_state_t cur = get_state();
     ESP_LOGI(TAG, "Play (state=%d, saved_uri=%s, saved_pos=%d)",
              cur, s_saved_uri ? s_saved_uri : "(null)", s_saved_pos_sec);
 
+    if (cur == PS_PLAYING) {
+        /* 正在播放中收到 Play：同 URL 忽略，新 URL 停旧播新 */
+        if (s_playing_uri && s_track_uri && strcmp(s_playing_uri, s_track_uri) == 0) {
+            ESP_LOGI(TAG, "Play while playing, same URL, ignored");
+            return;
+        }
+        ESP_LOGI(TAG, "Play while playing, new URL, switching");
+        esp_audio_stop(player, TERMINATION_TYPE_NOW);
+        vTaskDelay(pdMS_TO_TICKS(50));
+        _do_play(s_track_uri, 0);
+        return;
+    }
+
     if (cur == PS_PAUSED && player) {
-        /* 恢复暂停 — 优先用 esp_audio_resume */
-        esp_audio_resume(player);
-        set_state(PS_PLAYING);
-        s_play_start_us = esp_timer_get_time();  /* 从当前时间继续计时 */
+        /* 检查暂停期间是否推了新 URL */
+        bool uri_changed = s_playing_uri && s_track_uri
+                          && strcmp(s_playing_uri, s_track_uri) != 0;
+        if (uri_changed) {
+            ESP_LOGI(TAG, "URI changed while paused, switching to new track");
+            esp_audio_resume(player);
+            vTaskDelay(pdMS_TO_TICKS(50));
+            esp_audio_stop(player, TERMINATION_TYPE_NOW);
+            vTaskDelay(pdMS_TO_TICKS(50));
+            _do_play(s_track_uri, 0);
+        } else {
+            /* 同 URI 恢复暂停 */
+            esp_audio_resume(player);
+            set_state(PS_PLAYING);
+            s_play_start_us = esp_timer_get_time();
+            ESP_LOGI(TAG, "Resumed from pause (pos=%d ms)", s_accumulated_ms);
+        }
         s_grace_until = esp_timer_get_time() + 8000000LL;
         s_user_stopped = 0;
-        ESP_LOGI(TAG, "Resumed from pause (pos=%d ms)", s_accumulated_ms);
-    } else if (s_track_uri != NULL && player != NULL) {
-        /* 新播放 or 断点续播 */
+        return;
+    }
+
+    /* 新播放 or 断点续播 */
+    if (s_track_uri != NULL && player != NULL) {
         bool same_track = s_saved_uri && s_track_uri
                           && strcmp(s_saved_uri, s_track_uri) == 0
                           && s_saved_pos_sec > 0;
-        int seek_to = same_track ? s_saved_pos_sec : 0;
-
-        esp_err_t err = esp_audio_play(player, AUDIO_CODEC_TYPE_DECODER, s_track_uri, 0);
-        if (err == ESP_OK) {
-            set_state(PS_PLAYING);
-            s_accumulated_ms = seek_to * 1000;  /* 续播时从保存位置开始 */
-            s_play_start_us = esp_timer_get_time();
-            s_grace_until = esp_timer_get_time() + 8000000LL;
-            s_user_stopped = 0;
-            if (seek_to > 0) {
-                vTaskDelay(pdMS_TO_TICKS(300));
-                esp_audio_seek(player, seek_to);
-                ESP_LOGI(TAG, "Resumed from %d s (seek)", seek_to);
-            }
-        } else {
-            ESP_LOGE(TAG, "esp_audio_play failed: 0x%x", err);
-            set_state(PS_STOPPED);
-        }
+        _do_play(s_track_uri, same_track ? s_saved_pos_sec : 0);
     }
     s_saved_pos_sec = 0;
 }
@@ -538,34 +573,47 @@ static bool is_video_uri(const char *uri)
 
 /* Next / Previous */
 static void cb_next(void) {
-    ESP_LOGI(TAG, "Next (next_uri=%s)", s_next_uri ? s_next_uri : "(null)");
+    ESP_LOGI(TAG, "Next (next_uri=%s) state=%d", s_next_uri ? s_next_uri : "(null)", (int)get_state());
+    int was_paused = (get_state() == PS_PAUSED);
     s_accumulated_ms = 0;
     s_play_start_us = 0;
     s_saved_pos_sec = 0;
     free(s_saved_uri); s_saved_uri = NULL;
     if (s_next_uri && s_next_uri[0]) {
-        /* 保存下一首 metadata 再切换，避免 update_uri 清空 DLNA 层 */
         char *next_meta = s_next_metadata;
-        if (player) esp_audio_stop(player, TERMINATION_TYPE_NOW);
+        if (player) {
+            /* 暂停状态下 esp_audio_stop 不工作，先 resume 再 stop */
+            if (was_paused) esp_audio_resume(player);
+            vTaskDelay(pdMS_TO_TICKS(50));
+            esp_audio_stop(player, TERMINATION_TYPE_NOW);
+        }
         free(s_track_uri);
         s_track_uri = s_next_uri;
         s_next_uri = NULL;
         s_next_metadata = NULL;
         if (player) {
             esp_audio_play(player, AUDIO_CODEC_TYPE_DECODER, s_track_uri, 0);
-            set_state(PS_PLAYING);
             s_play_start_us = esp_timer_get_time();
+            free(s_playing_uri);
+            s_playing_uri = strdup(s_track_uri);
+            set_state(PS_PLAYING);
+            if (was_paused) {
+                vTaskDelay(pdMS_TO_TICKS(300));
+                esp_audio_pause(player);
+                set_state(PS_PAUSED);
+            }
         }
-        /* 同步 URI + metadata 到 DLNA 层，GetPositionInfo/GetMediaInfo 才能正确返回 */
         custom_dlna_update_uri(s_track_uri, next_meta);
         free(next_meta);
     } else {
-        if (player) esp_audio_stop(player, TERMINATION_TYPE_NOW);
+        if (player) {
+            if (get_state() == PS_PAUSED) esp_audio_resume(player);
+            vTaskDelay(pdMS_TO_TICKS(50));
+            esp_audio_stop(player, TERMINATION_TYPE_NOW);
+        }
         set_state(PS_STOPPED);
         custom_dlna_update_uri(NULL, NULL);
     }
-    /* 强制通知 controller：切歌时状态可能一直是 PLAYING，
-       set_state() 不会触发 notify，必须显式调用 */
     custom_dlna_notify_transport_state_async();
 }
 static void cb_previous(void) {
@@ -646,8 +694,8 @@ static void cb_set_metadata(const char *metadata)
     extract_tag(artist, sizeof(artist), metadata, "upnp:artist");
     extract_tag(album_art, sizeof(album_art), metadata, "upnp:albumArtURI");
     extract_tag(music_id_str, sizeof(music_id_str), metadata, "netease:musicId");
-    int music_id = music_id_str[0] ? atoi(music_id_str) : 0;
-    ESP_LOGI(TAG, "Extracted: title='%s' artist='%s' musicId=%d", title, artist, music_id);
+    unsigned long music_id = music_id_str[0] ? strtoul(music_id_str, NULL, 10) : 0;
+    ESP_LOGI(TAG, "Extracted: title='%s' artist='%s' musicId=%lu", title, artist, music_id);
 
     if (album_art[0]) {
         /* 没有参数时追加 ?param=200y200 让 CDN 返回小图，节省内存 */
@@ -1255,7 +1303,7 @@ static void ui_update_task(void *arg)
     int tick = 0;
     int last_cur_line = -1;
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(40));
 
         lvgl_port_lock();
 
@@ -1300,17 +1348,33 @@ static void ui_update_task(void *arg)
 
             /* 每 tick 更新逐字高亮（karaoke） */
             if (cur >= 0 && cur < lyr->count && curr[0]) {
-                int line_start = lyr->lines[cur].time_ms;
-                int line_end = (cur + 1 < lyr->count)
-                    ? lyr->lines[cur + 1].time_ms
-                    : s_dur_cache_sec * 1000;
-                if (line_end <= line_start) line_end = line_start + 5000;
-                int line_dur = line_end - line_start;
-                /* 按字数估算演唱时长：每字 250ms + 1.5s 缓冲，避免伴奏停顿拖慢高亮 */
                 int total_chars = utf8_char_count(curr);
-                int est_sing = total_chars * 250 + 1500;
-                if (est_sing < line_dur) line_dur = est_sing;
-                int progress = (pos_ms - line_start) * 100 / line_dur;
+                int progress;
+                /* 优先用 klyric 逐字时间轴，精确到毫秒 */
+                int kprog = lyrics_get_karaoke_progress(lyr->lines[cur].time_ms, pos_ms);
+                if (kprog >= 0) {
+                    progress = kprog;
+                } else {
+                    /* 回退到字数估算，避免伴奏停顿拖慢高亮 */
+                    static bool s_klyric_warned = false;
+                    if (!s_klyric_warned) {
+                        s_klyric_warned = true;
+                        ESP_LOGW(TAG, "klyric: NOT AVAILABLE for line=%d/%d pos=%d (fallback to estimation)",
+                            cur, lyr->count, pos_ms);
+                    }
+                    /* 按行时长估算演唱时长，自适应歌曲节奏 */
+                    int line_start = lyr->lines[cur].time_ms;
+                    int line_end = (cur + 1 < lyr->count)
+                        ? lyr->lines[cur + 1].time_ms
+                        : s_dur_cache_sec * 1000;
+                    if (line_end <= line_start) line_end = line_start + 5000;
+                    int line_dur = line_end - line_start;
+                    /* 用行时长的 80% 估算，快歌行短自动快，慢歌行长安逸 */
+                    /* 慢歌高亮完最后一字应接近下一句出现，避免干等 */
+                    int est_sing = line_dur * 80 / 100;
+                    if (est_sing < 800) est_sing = 800;
+                    progress = (pos_ms - line_start) * 100 / est_sing;
+                }
                 if (progress < 0) progress = 0;
                 if (progress > 100) progress = 100;
                 int char_idx = total_chars * progress / 100;
@@ -1326,7 +1390,7 @@ static void ui_update_task(void *arg)
 
         lvgl_port_unlock();
 
-        if ((++tick % 50) == 0) ESP_LOGI(TAG, "UI tick alive");
+        if ((++tick % 125) == 0) ESP_LOGI(TAG, "UI tick alive");
     }
 }
 

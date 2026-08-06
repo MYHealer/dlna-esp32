@@ -26,7 +26,7 @@ typedef struct {
     bool loaded;                       /* 是否已加载 */
     char song_name[64];                /* 当前歌曲名（缓存 key） */
     char artist[64];                   /* 当前歌手（缓存 key） */
-    int  known_song_id;                /* 已知 songId（>0 跳过搜索） */
+    unsigned long known_song_id;       /* 已知 songId（>0 跳过搜索） */
 } lyric_data_t;
 
 /**
@@ -40,7 +40,7 @@ esp_err_t lyrics_init(void);
  * @param artist   歌手名
  * @param song_id  网易云 songId（>0 时跳过搜索，直接获取歌词）
  */
-void lyrics_fetch_async(const char *title, const char *artist, int song_id);
+void lyrics_fetch_async(const char *title, const char *artist, unsigned long song_id);
 
 /**
  * @brief 根据播放位置获取当前歌词行索引
@@ -48,6 +48,14 @@ void lyrics_fetch_async(const char *title, const char *artist, int song_id);
  * @return 歌词行索引，-1 表示无歌词或未加载
  */
 int lyrics_get_current_line(int position_ms);
+
+/**
+ * @brief 获取 klyric 逐字高亮进度（0-100），-1 表示无 klyric 数据
+ * @param line_start_ms 当前行起始时间（毫秒），来自 LRC time_ms
+ * @param pos_ms        当前播放位置（毫秒）
+ * @return 高亮进度百分比，-1 表示无 klyric
+ */
+int lyrics_get_karaoke_progress(int line_start_ms, int pos_ms);
 
 /**
  * @brief 获取歌词数据（只读指针）

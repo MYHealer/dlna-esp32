@@ -9,6 +9,7 @@
 #define LV_FONT_MONTSERRAT_16 1
 #include "lvgl.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include <string.h>
 
 static const char *TAG = "LVGL_UI";
@@ -20,7 +21,6 @@ LV_IMG_DECLARE(ui_img_zanting1_png);
 LV_IMG_DECLARE(ui_img_shangyi1_png);
 LV_IMG_DECLARE(ui_img_xiyi1_png);
 LV_IMG_DECLARE(ui_img_jiaopian_png);
-LV_IMG_DECLARE(ui_img_bg_gradient);
 LV_FONT_DECLARE(lv_font_simsun_16_cjk);
 
 /* 控件 */
@@ -49,6 +49,12 @@ static lv_obj_t *s_lyrics_next = NULL;    /* 下一句 */
 static int s_lyrics_current = -1;
 static int s_lyrics_prev_line = -1;        /* 上一次的行号，用于检测切换动画 */
 static bool s_lyrics_visible = false;
+static lv_obj_t *s_lyrics_bg_img = NULL; /* 歌词界面背景图 */
+/* 背景渐变（预抖动图片，消除 RGB565 色阶） */
+static lv_obj_t *s_bg_img = NULL;        /* 背景图片控件 */
+static lv_img_dsc_t *s_bg_dsc = NULL;    /* 背景图片描述符（PSRAM 像素数据） */
+static void _generate_dithered_bg(uint8_t r_top, uint8_t g_top, uint8_t b_top,
+                                   uint8_t r_bot, uint8_t g_bot, uint8_t b_bot);
 
 /* 当前句滚动状态（LV_LABEL_LONG_SCROLL 内部管理） */
 
@@ -72,10 +78,11 @@ void lvgl_port_ui_create(void)
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scrollbar_mode(scr, LV_SCROLLBAR_MODE_OFF);
 
-    /* ====== 预渲染背景渐变（消除 RGB565 色阶） ====== */
-    lv_obj_t *bg = lv_img_create(scr);
-    lv_img_set_src(bg, &ui_img_bg_gradient);
-    lv_obj_set_pos(bg, 0, 0);
+    /* ====== 动态背景渐变（预抖动图片，消除 RGB565 色阶） ====== */
+    s_bg_img = lv_img_create(scr);
+    lv_obj_set_pos(s_bg_img, 0, 0);
+    lv_obj_move_background(s_bg_img);
+    _generate_dithered_bg(11, 40, 61, 4, 38, 62);   /* 默认深蓝渐变 */
 
     /* ====== 唱片转盘 ====== */
     /* jiaopian 169x164, zoom=121 → 79x77 像素 */
@@ -168,8 +175,14 @@ void lvgl_port_ui_create(void)
 void lvgl_port_ui_lyrics_create(void)
 {
     s_lyrics_scr = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(s_lyrics_scr, C_BG_TOP, 0);
+    lv_obj_set_style_bg_opa(s_lyrics_scr, LV_OPA_0, 0);   /* 背景透明，由背景图显示 */
     lv_obj_clear_flag(s_lyrics_scr, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* 背景图（与主界面共享 s_bg_dsc 预抖动渐变） */
+    s_lyrics_bg_img = lv_img_create(s_lyrics_scr);
+    lv_obj_set_pos(s_lyrics_bg_img, 0, 0);
+    lv_obj_move_background(s_lyrics_bg_img);
+    if (s_bg_dsc) lv_img_set_src(s_lyrics_bg_img, s_bg_dsc);
 
     /* 暂无歌词占位（居中） */
     s_lyrics_placeholder = lv_label_create(s_lyrics_scr);
@@ -199,7 +212,7 @@ void lvgl_port_ui_lyrics_create(void)
     lv_obj_set_style_text_color(s_lyrics_curr, C_DIM, 0);
     lv_obj_set_style_text_color(s_lyrics_curr, C_ACCENT, LV_PART_SELECTED);
     lv_obj_set_style_bg_color(s_lyrics_curr, C_BG_TOP, LV_PART_SELECTED);
-    lv_obj_set_style_bg_opa(s_lyrics_curr, LV_OPA_COVER, LV_PART_SELECTED);
+    lv_obj_set_style_bg_opa(s_lyrics_curr, LV_OPA_0, LV_PART_SELECTED);   /* 透明背景，让背景图透出 */
     lv_obj_set_style_text_align(s_lyrics_curr, LV_TEXT_ALIGN_LEFT, 0);
     lv_label_set_long_mode(s_lyrics_curr, LV_LABEL_LONG_CLIP);
 
@@ -261,6 +274,122 @@ void lvgl_port_ui_set_state(int state) {
     }
 }
 void lvgl_port_ui_set_volume(int vol) { (void)vol; }
+
+/* ====== 生成预抖动渐变背景（Bayer 4×4 有序抖动，消除 RGB565 色阶） ====== */
+static void _generate_dithered_bg(uint8_t r_top, uint8_t g_top, uint8_t b_top,
+                                   uint8_t r_bot, uint8_t g_bot, uint8_t b_bot)
+{
+    const int W = 128, H = 160;
+
+    /* 首次调用分配 PSRAM 缓冲 + LVGL 图片描述符 */
+    if (!s_bg_dsc) {
+        s_bg_dsc = (lv_img_dsc_t *)lv_mem_alloc(sizeof(lv_img_dsc_t));
+        if (!s_bg_dsc) return;
+        memset(s_bg_dsc, 0, sizeof(lv_img_dsc_t));
+        s_bg_dsc->header.always_zero = 0;
+        s_bg_dsc->header.w = W;
+        s_bg_dsc->header.h = H;
+        s_bg_dsc->header.cf = LV_IMG_CF_TRUE_COLOR;
+        s_bg_dsc->data_size = W * H * sizeof(uint16_t);
+        s_bg_dsc->data = (const uint8_t *)heap_caps_malloc(s_bg_dsc->data_size, MALLOC_CAP_SPIRAM);
+        if (!s_bg_dsc->data) {
+            ESP_LOGW(TAG, "bg dither PSRAM alloc failed");
+            lv_mem_free(s_bg_dsc);
+            s_bg_dsc = NULL;
+            return;
+        }
+    }
+
+    uint16_t *buf = (uint16_t *)s_bg_dsc->data;
+
+    /* 4x4 Bayer 矩阵 */
+    static const uint8_t bayer[16] = {
+         0,  8,  2, 10,
+        12,  4, 14,  6,
+         3, 11,  1,  9,
+        15,  7, 13,  5
+    };
+
+    for (int y = 0; y < H; y++) {
+        int r8 = r_top + ((int)r_bot - r_top) * y / (H - 1);
+        int g8 = g_top + ((int)g_bot - g_top) * y / (H - 1);
+        int b8 = b_top + ((int)b_bot - b_top) * y / (H - 1);
+
+        for (int x = 0; x < W; x++) {
+            int t = bayer[(y & 3) * 4 + (x & 3)];
+
+            /* 有序抖动量化到 RGB565 */
+            int r5 = (r8 * 31 + t * 2 + 128) / 256;
+            int g6 = (g8 * 63 + t * 4 + 128) / 256;
+            int b5 = (b8 * 31 + t * 2 + 128) / 256;
+
+            if (r5 < 0) r5 = 0; else if (r5 > 31) r5 = 31;
+            if (g6 < 0) g6 = 0; else if (g6 > 63) g6 = 63;
+            if (b5 < 0) b5 = 0; else if (b5 > 31) b5 = 31;
+
+            /* BGR565 大端序（ST7735 MADCTL_BGR），与封面格式一致 */
+            uint16_t c = (uint16_t)((b5 << 11) | (g6 << 5) | r5);
+            buf[y * W + x] = (c >> 8) | (c << 8);
+        }
+    }
+
+    lv_img_set_src(s_bg_img, s_bg_dsc);
+    lv_obj_invalidate(s_bg_img);
+    if (s_lyrics_bg_img) {
+        lv_img_set_src(s_lyrics_bg_img, s_bg_dsc);
+        lv_obj_invalidate(s_lyrics_bg_img);
+    }
+}
+
+/* ====== 从封面 BGR565 大端序像素提取主色并更新背景 ====== */
+static void _update_bg_from_cover(const uint16_t *pixels, int w, int h)
+{
+    if (!pixels || w <= 0 || h <= 0) return;
+
+    /* BGR565 大端序（ST7735 MADCTL_BGR）：
+     * 内存布局: byte[0] = B5 + G3_high, byte[1] = G3_low + R5
+     * uint16_t 小端读: [G2 G1 G0 R4 R3 R2 R1 R0] [B4 B3 B2 B1 B0 G5 G4 G3]
+     *
+     * R: bits 12-8 → (p >> 8) & 0x1F
+     * G: bits 15-13, 2-0 → ((p >> 13) & 0x07) | ((p & 0x07) << 3)
+     * B: bits 7-3  → (p >> 3) & 0x1F
+     */
+    unsigned long r_sum = 0, g_sum = 0, b_sum = 0;
+    int count = w * h;
+
+    for (int i = 0; i < count; i++) {
+        uint16_t p = pixels[i];
+        int r5 = (p >> 8) & 0x1F;
+        int g6 = ((p >> 13) & 0x07) | ((p & 0x07) << 3);
+        int b5 = (p >> 3) & 0x1F;
+        r_sum += (r5 << 3) | (r5 >> 2);   /* 5→8 位扩展 */
+        g_sum += (g6 << 2) | (g6 >> 4);   /* 6→8 位扩展 */
+        b_sum += (b5 << 3) | (b5 >> 2);   /* 5→8 位扩展 */
+    }
+
+    if (count == 0) return;
+
+    /* 暗化到 ~35% 作为背景主色 */
+    uint8_t r = (uint8_t)((r_sum / count) * 90 / 256);
+    uint8_t g = (uint8_t)((g_sum / count) * 90 / 256);
+    uint8_t b = (uint8_t)((b_sum / count) * 90 / 256);
+
+    /* 最小亮度保证 */
+    if (r < 8 && g < 8 && b < 8) {
+        r = 10; g = 10; b = 20;
+    }
+
+    /* 顶部稍亮，底部稍暗，形成极浅渐变 */
+    uint8_t r_top = r + 6 > 255 ? 255 : r + 6;
+    uint8_t g_top = g + 6 > 255 ? 255 : g + 6;
+    uint8_t b_top = b + 8 > 255 ? 255 : b + 8;
+    uint8_t r_bot = r > 6 ? r - 6 : 0;
+    uint8_t g_bot = g > 6 ? g - 6 : 0;
+    uint8_t b_bot = b > 8 ? b - 8 : 0;
+
+    _generate_dithered_bg(r_top, g_top, b_top, r_bot, g_bot, b_bot);
+}
+
 static void _opa_anim_cb(void *obj, int32_t v)
 {
     lv_obj_set_style_opa((lv_obj_t *)obj, (lv_opa_t)v, 0);
@@ -342,16 +471,18 @@ void lvgl_port_ui_lyrics_karaoke(int byte_idx)
 
     /* 仅当文本超长时才左移，否则只高亮不移动 */
     if (s_scroll_total > 0) {
-        /* 当前字保持在屏幕 1/4 位置 */
+        /* 当前字保持在屏幕 1/4 位置，但不超出右边界 */
         int16_t w = lv_txt_get_width(text, byte_idx,
             lv_obj_get_style_text_font(s_lyrics_curr, 0), 0, LV_TEXT_FLAG_NONE);
         int label_w = lv_obj_get_width(s_lyrics_curr);
         int anchor = label_w / 4;
+        int offset = 0;
         if (w > anchor) {
-            ((lv_label_t *)s_lyrics_curr)->offset.x = anchor - w;
-        } else {
-            ((lv_label_t *)s_lyrics_curr)->offset.x = 0;
+            offset = anchor - w;
         }
+        /* 限制左移不超出右边界（最后一个字能在右边显示即可） */
+        if (offset < -s_scroll_total) offset = -s_scroll_total;
+        ((lv_label_t *)s_lyrics_curr)->offset.x = offset;
     }
 }
 
@@ -421,6 +552,7 @@ void lvgl_port_ui_set_cover(const uint16_t *pixels, int w, int h) {
 
     ESP_LOGI(TAG, "set_cover: %dx%d", w, h);
     memcpy(s_cover_buf, pixels, px_size);
+    _update_bg_from_cover(s_cover_buf, w, h);   /* 依据封面主色更新背景 */
 
     lv_img_dsc_t *dsc = (lv_img_dsc_t *)lv_mem_alloc(sizeof(lv_img_dsc_t));
     if (!dsc) return;
