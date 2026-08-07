@@ -144,6 +144,8 @@ static play_state_t get_state(void)
 /* ── Delayed STOPPED notification (forward decl) ── */
 static void delayed_stop_notify(void *arg);
 static void cb_next(void);
+static void cb_previous(void);
+static void cb_play_toggle(void);
 
 /* ─────────────────────── Player event handler ───────────────────────
  * esp_audio 的底层事件 — 用来把我们自己的状态机和底层硬件对齐。
@@ -323,14 +325,19 @@ static void _vol_debounce_cb(void *arg)
 {
     (void)arg;
     if (s_i2s_el && s_vol_pending >= 0) {
-        int alc_gain = -(100 - s_vol_pending) * 30 / 100;
+        int diff = 100 - s_vol_pending;
+        int alc_gain = -(diff * diff * 30) / 10000;
         i2s_alc_volume_set(s_i2s_el, alc_gain);
         ESP_LOGI(TAG, "vol=%d -> alc_gain=%d", s_vol_pending, alc_gain);
         s_vol_pending = -1;
     }
 }
 
-/* ── 自定义 vol_set：映射 0-100 到 ALC 增益（防抖）── */
+/* ── 自定义 vol_set：映射 0-100 到 ALC 增益（防抖）
+ *    平方曲线：低音量时下降更慢，保留更多有效位
+ *    vol=100 → 0dB, vol=50 → -7.5dB, vol=0 → -30dB
+ *    对比线性：vol=50 → -15dB（平方在 50% 音量时保真度更高）
+ */
 static esp_err_t _my_vol_set(void *handle, int volume)
 {
     if (!s_i2s_el) return ESP_ERR_INVALID_STATE;
@@ -526,6 +533,17 @@ static void cb_pause(void)
     }
 }
 
+/* ── 播放/暂停切换（旋钮播放按钮） ── */
+static void cb_play_toggle(void)
+{
+    play_state_t cur = get_state();
+    if (cur == PS_PLAYING) {
+        cb_pause();
+    } else {
+        cb_play();
+    }
+}
+
 static void cb_stop(void)
 {
     s_finish_notify_spawned = false;
@@ -634,11 +652,17 @@ static void cb_next(void) {
         custom_dlna_update_uri(s_track_uri, next_meta);
         free(next_meta);
     } else {
+        /* 无 next_uri → 模拟自然播完（参考 miair-next next_track()）：
+         * 位置设到曲末 + STOPPED，控制端判定自然结束自动推下一首 */
         if (player) {
             if (get_state() == PS_PAUSED) esp_audio_resume(player);
             vTaskDelay(pdMS_TO_TICKS(50));
             esp_audio_stop(player, TERMINATION_TYPE_NOW);
         }
+        if (s_dur_cache_sec > 0) {
+            s_accumulated_ms = s_dur_cache_sec * 1000;  /* 位置=曲末 */
+        }
+        s_play_start_us = 0;
         set_state(PS_STOPPED);
         custom_dlna_update_uri(NULL, NULL);
     }
@@ -1246,13 +1270,16 @@ static void rotary_encoder_setup(void)
         ESP_LOGE(TAG, "gpio_install_isr_service failed: %s", esp_err_to_name(ret));
         return;
     }
-    static const rotary_encoder_config_t cfg = {
+    /* 旋钮回调从 LVGL 输入驱动获取（旋转=焦点切换，按下=选中） */
+    void (*rot_cb)(void*, int) = NULL;
+    void (*btn_cb)(void*)      = NULL;
+    lvgl_port_get_encoder_callbacks(&rot_cb, &btn_cb);
+    rotary_encoder_config_t cfg = {
         .clk_gpio     = 4,
         .dt_gpio      = 5,
         .sw_gpio      = 6,
-        .vol_step     = 5,
-        .on_rotate    = _enc_on_rotate,
-        .on_btn_click = _enc_on_btn,
+        .on_rotate    = rot_cb,
+        .on_btn_click = btn_cb,
         .arg          = NULL,
     };
     ret = rotary_encoder_init(&cfg);
@@ -1525,6 +1552,12 @@ void app_main(void)
     /* ── TFT 显示 + LVGL ── */
     tft_init();
     lvgl_port_init(5);
+
+    /* 旋钮焦点框选 → 播放控制 */
+    lvgl_port_ui_register_btn_prev_cb(cb_previous);
+    lvgl_port_ui_register_btn_play_cb(cb_play_toggle);
+    lvgl_port_ui_register_btn_next_cb(cb_next);
+
     lyrics_init();
     xTaskCreatePinnedToCore(ui_update_task, "ui_update", 4096, NULL, 3, NULL, 0);
 }

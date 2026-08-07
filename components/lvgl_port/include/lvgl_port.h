@@ -24,6 +24,17 @@ extern "C" {
 esp_err_t lvgl_port_init(int task_priority);
 
 /**
+ * @brief 注册旋钮编码器为 LVGL 输入设备（创建焦点组）
+ */
+void lvgl_port_indev_init(void);
+
+/**
+ * @brief 获取旋钮回调（供 rotary_encoder_init 接线到 LVGL）
+ */
+void lvgl_port_get_encoder_callbacks(void (**on_rotate)(void*, int),
+                                     void (**on_btn_click)(void*));
+
+/**
  * @brief LVGL 互斥锁（display_task 中调用 lvgl 前必须 lock）
  */
 void lvgl_port_lock(void);
@@ -48,6 +59,24 @@ void lvgl_port_ui_lyrics_create(void);
 void lvgl_port_ui_toggle_lyrics(void);
 bool lvgl_port_ui_lyrics_is_visible(void);
 void lvgl_port_ui_lyrics_clear(void);
+
+/* ══════════════════════════════════════════════
+ *  旋钮控制按钮回调注册
+ * ══════════════════════════════════════════════ */
+typedef void (*lvgl_btn_cb_t)(void);
+void lvgl_port_ui_register_btn_prev_cb(lvgl_btn_cb_t cb);
+void lvgl_port_ui_register_btn_play_cb(lvgl_btn_cb_t cb);
+void lvgl_port_ui_register_btn_next_cb(lvgl_btn_cb_t cb);
+
+/**
+ * @brief 显示/隐藏焦点框（旋转时显示，10s 无操作后隐藏）
+ */
+void lvgl_port_ui_set_focus_visible(bool visible);
+
+/**
+ * @brief 焦点归位到播放按钮
+ */
+void lvgl_port_ui_focus_play(void);
 
 #ifdef __cplusplus
 }

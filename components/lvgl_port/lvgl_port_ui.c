@@ -10,6 +10,8 @@
 #include "lvgl.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <string.h>
 #include <math.h>
 
@@ -40,6 +42,38 @@ static lv_obj_t *s_label_time2;
 static lv_obj_t *s_btn_play;
 static lv_obj_t *s_btn_next;
 static lv_obj_t *s_btn_prev;
+
+/* 按钮回调存储 */
+static lvgl_btn_cb_t s_cb_btn_prev = NULL;
+static lvgl_btn_cb_t s_cb_btn_play = NULL;
+static lvgl_btn_cb_t s_cb_btn_next = NULL;
+
+/* 按钮动作执行任务（独立栈，不阻塞 LVGL 任务） */
+static void _btn_action_task(void *arg)
+{
+    lvgl_btn_cb_t cb = (lvgl_btn_cb_t)arg;
+    if (cb) cb();
+    vTaskDelete(NULL);
+}
+
+/* 按钮点击事件处理 */
+static void _btn_click_cb(lv_event_t *e)
+{
+    lv_obj_t *btn = lv_event_get_target(e);
+    lvgl_btn_cb_t cb = NULL;
+    if (btn == s_btn_prev) cb = s_cb_btn_prev;
+    else if (btn == s_btn_play) cb = s_cb_btn_play;
+    else if (btn == s_btn_next) cb = s_cb_btn_next;
+
+    /* 在独立任务中执行回调，不阻塞 LVGL 任务 */
+    if (cb) {
+        xTaskCreatePinnedToCore(_btn_action_task, "btn_act", 3072, (void*)cb, 6, NULL, 1);
+    }
+
+    /* 退出 editing 模式，恢复旋钮焦点导航 */
+    lv_group_t *g = lv_group_get_default();
+    if (g) lv_group_set_editing(g, false);
+}
 
 /* 主屏幕引用（用于切换回主界面） */
 static lv_obj_t *s_main_scr = NULL;
@@ -186,8 +220,40 @@ void lvgl_port_ui_create(void)
     lv_obj_set_pos(s_btn_next, 80, 129);
     lv_obj_set_size(s_btn_next, 31, 31);
 
+    /* ====== 旋钮焦点框选（旋转切焦点，按下执行） ====== */
+    /* 白色 2px 边框，聚焦时显示方形选择框 */
+    lv_obj_set_style_border_width(s_btn_prev, 2, LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(s_btn_prev, C_WHITE, LV_STATE_FOCUSED);
+    lv_obj_set_style_border_opa(s_btn_prev, LV_OPA_COVER, LV_STATE_FOCUSED);
+    lv_obj_set_style_radius(s_btn_prev, 0, LV_STATE_FOCUSED);
+
+    lv_obj_set_style_border_width(s_btn_play, 2, LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(s_btn_play, C_WHITE, LV_STATE_FOCUSED);
+    lv_obj_set_style_border_opa(s_btn_play, LV_OPA_COVER, LV_STATE_FOCUSED);
+    lv_obj_set_style_radius(s_btn_play, 0, LV_STATE_FOCUSED);
+
+    lv_obj_set_style_border_width(s_btn_next, 2, LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(s_btn_next, C_WHITE, LV_STATE_FOCUSED);
+    lv_obj_set_style_border_opa(s_btn_next, LV_OPA_COVER, LV_STATE_FOCUSED);
+    lv_obj_set_style_radius(s_btn_next, 0, LV_STATE_FOCUSED);
+
+    /* 加入旋钮焦点组，默认焦点在播放/暂停 */
+    lv_group_t *g = lv_group_get_default();
+    if (g) {
+        lv_group_add_obj(g, s_btn_prev);
+        lv_group_add_obj(g, s_btn_play);
+        lv_group_add_obj(g, s_btn_next);
+        lv_group_focus_obj(s_btn_play);
+    }
+
+    /* 点击回调（旋钮按下 ENTER 同样触发 CLICKED） */
+    lv_obj_add_event_cb(s_btn_prev, _btn_click_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(s_btn_play, _btn_click_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(s_btn_next, _btn_click_cb, LV_EVENT_CLICKED, NULL);
+
     lvgl_port_ui_lyrics_create();
     s_main_scr = scr;  /* 保存主屏幕引用 */
+    lvgl_port_ui_set_focus_visible(false);  /* 初始隐藏焦点框 */
     ESP_LOGI(TAG, "UI created");
 }
 
@@ -652,4 +718,23 @@ void lvgl_port_ui_set_cover(const uint16_t *pixels, int w, int h) {
     s_last_ui_state = -1; /* 触发下次 set_state 放下唱针 + 旋转 */
     if (s_cover_prev) lv_mem_free(s_cover_prev);
     s_cover_prev = dsc;
+}
+
+/* ── 旋钮控制按钮回调注册 ── */
+void lvgl_port_ui_register_btn_prev_cb(lvgl_btn_cb_t cb) { s_cb_btn_prev = cb; }
+void lvgl_port_ui_register_btn_play_cb(lvgl_btn_cb_t cb) { s_cb_btn_play = cb; }
+void lvgl_port_ui_register_btn_next_cb(lvgl_btn_cb_t cb) { s_cb_btn_next = cb; }
+
+/* ── 焦点框显示/隐藏（旋转显示，10s 无操作隐藏归位） ── */
+void lvgl_port_ui_set_focus_visible(bool visible)
+{
+    ESP_LOGI(TAG, "set_focus_visible(%d)", (int)visible);
+    lv_obj_set_style_border_width(s_btn_prev, visible ? 2 : 0, LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(s_btn_play, visible ? 2 : 0, LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(s_btn_next, visible ? 2 : 0, LV_STATE_FOCUSED);
+}
+
+void lvgl_port_ui_focus_play(void)
+{
+    if (s_btn_play) lv_group_focus_obj(s_btn_play);
 }

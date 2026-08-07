@@ -74,7 +74,10 @@ esp_err_t lvgl_port_init(int task_priority)
     s_disp_drv.draw_buf = &s_disp_buf;
     s_disp = lv_disp_drv_register(&s_disp_drv);
 
-    /* 先创建 UI，再启动 LVGL 任务（避免任务在 UI 未就绪时刷新） */
+    /* 旋钮输入（必须在 UI 创建前，让 group 已存在） */
+    lvgl_port_indev_init();
+
+    /* 创建 UI */
     lvgl_port_ui_create();
 
     /* 创建 LVGL 处理任务 */
