@@ -100,6 +100,10 @@ static volatile bool s_lyrics_ui_clear_pending = false;
 static int64_t        s_play_start_us     = 0;   /* 播放开始时间（esp_timer us），0=未在播放 */
 static int            s_accumulated_ms    = 0;   /* 累计已播放 ms（暂停/停止时冻结） */
 static char          *s_playing_uri       = NULL; /* 当前音频管道实际加载的 URI，用于检测暂停时切歌 */
+/* 主动播完检测（参考 miair-next _check_play_status）：
+ * 软件位置接近曲末但底层未触发 FINISHED 时的兜底，避免控制器等不到 STOPPED 不切歌 */
+static int            s_near_end_count    = 0;   /* 连续接近曲末的 tick 数 */
+static bool           s_finish_notify_spawned = false; /* 防重复触发播完处理 */
 
 
 /* ── 工具：获取字符串形式的 DLNA 状态 ── */
@@ -139,6 +143,7 @@ static play_state_t get_state(void)
 
 /* ── Delayed STOPPED notification (forward decl) ── */
 static void delayed_stop_notify(void *arg);
+static void cb_next(void);
 
 /* ─────────────────────── Player event handler ───────────────────────
  * esp_audio 的底层事件 — 用来把我们自己的状态机和底层硬件对齐。
@@ -360,6 +365,8 @@ static void apply_volume_hw(void)
 
 static void cb_set_uri(const char *uri)
 {
+    s_finish_notify_spawned = false;
+    s_near_end_count = 0;
     /* 视频过滤 */
     if (uri && is_video_uri(uri)) {
         ESP_LOGW(TAG, "Rejected video URI: %.128s", uri);
@@ -389,26 +396,43 @@ static void cb_set_uri(const char *uri)
     ESP_LOGI(TAG, "SetURI: %s", s_track_uri ? s_track_uri : "(null)");
 }
 
-/* ── Delayed STOPPED notification: wait for I2S buffer to drain ── */
+/* ── 播完处理：支持 next_uri 自动切换 + 防重复触发 ── */
 static void delayed_stop_notify(void *arg)
 {
     (void)arg;
+    if (s_finish_notify_spawned) { vTaskDelete(NULL); return; }
+    s_finish_notify_spawned = true;
+
     /* 冻结最终位置 */
     if (s_play_start_us > 0) {
         s_accumulated_ms += (int)((esp_timer_get_time() - s_play_start_us) / 1000LL);
         s_play_start_us = 0;
     }
-    /* 立即通知 STOPPED，让 App 及时发送下一首。
-     * （不能静默：网易云靠 STOPPED 事件才知道歌播完并推下一首） */
+
+    /* 有预载的下一首 → 自动续播（参考 miair-next _check_play_status） */
+    if (s_next_uri && s_next_uri[0]) {
+        ESP_LOGI(TAG, "Track finished, auto-playing next: %s", s_next_uri);
+        s_accumulated_ms = 0;
+        s_near_end_count = 0;
+        s_finish_notify_spawned = false;
+        cb_next();
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /* 否则发 STOPPED，让控制器推下一首 */
     set_state(PS_STOPPED);
     ESP_LOGI(TAG, "Track finished -> STOPPED (dur=%d ms)", s_accumulated_ms);
-    /* 重置位置追踪为下一首做准备 */
     s_accumulated_ms = 0;
+    s_near_end_count = 0;
+    s_finish_notify_spawned = false;
     vTaskDelete(NULL);
 }
 
 static void _do_play(const char *uri, int seek_sec)
 {
+    s_finish_notify_spawned = false;
+    s_near_end_count = 0;
     if (!player || !uri) return;
     esp_err_t err = esp_audio_play(player, AUDIO_CODEC_TYPE_DECODER, uri, 0);
     if (err == ESP_OK) {
@@ -504,6 +528,8 @@ static void cb_pause(void)
 
 static void cb_stop(void)
 {
+    s_finish_notify_spawned = false;
+    s_near_end_count = 0;
     ESP_LOGI(TAG, "Stop");
     /* 冻结累计播放时间 */
     if (s_play_start_us > 0) {
@@ -524,6 +550,8 @@ static void cb_stop(void)
 /* ── Seek 防抖：拖动进度条时 controller 连发多个 Seek，只执行最后一个 ── */
 static void cb_seek(int seconds)
 {
+    s_finish_notify_spawned = false;
+    s_near_end_count = 0;
     ESP_LOGI(TAG, "Seek %d s", seconds);
     if (!player) return;
     esp_audio_seek(player, seconds);
@@ -617,6 +645,8 @@ static void cb_next(void) {
     custom_dlna_notify_transport_state_async();
 }
 static void cb_previous(void) {
+    s_finish_notify_spawned = false;
+    s_near_end_count = 0;
     ESP_LOGI(TAG, "Previous");
     s_accumulated_ms = 0;
     s_play_start_us = 0;
@@ -1383,6 +1413,24 @@ static void ui_update_task(void *arg)
             }
         } else {
             last_cur_line = -1;
+        }
+
+        /* ── 主动播完检测（参考 miair-next _check_play_status）──
+         * 软件位置接近曲末但底层未触发 FINISHED 时的兜底。
+         * 连续 30 tick（~1.2s）剩余 <1.5s 时触发。 */
+        if (get_state() == PS_PLAYING && s_dur_cache_sec > 0 && !s_finish_notify_spawned) {
+            int remain_ms = s_dur_cache_sec * 1000 - get_position_ms();
+            if (remain_ms < 1500) {
+                if (++s_near_end_count >= 30) {
+                    s_near_end_count = 0;
+                    ESP_LOGI(TAG, "Software near-end detected (remain=%d), forcing completion", remain_ms);
+                    xTaskCreatePinnedToCore(delayed_stop_notify, "stop_dly", 3072, NULL, 5, NULL, 1);
+                }
+            } else {
+                s_near_end_count = 0;
+            }
+        } else {
+            s_near_end_count = 0;
         }
 
         /* 每 tick 缓慢左移当前行 */

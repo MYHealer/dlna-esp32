@@ -11,6 +11,7 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include <string.h>
+#include <math.h>
 
 static const char *TAG = "LVGL_UI";
 
@@ -21,10 +22,13 @@ LV_IMG_DECLARE(ui_img_zanting1_png);
 LV_IMG_DECLARE(ui_img_shangyi1_png);
 LV_IMG_DECLARE(ui_img_xiyi1_png);
 LV_IMG_DECLARE(ui_img_jiaopian_png);
+LV_IMG_DECLARE(ui_img_citou_png);
 LV_FONT_DECLARE(lv_font_simsun_16_cjk);
 
 /* 控件 */
 static lv_obj_t *s_cover_img;
+static lv_obj_t *s_cover_container;      /* 圆形裁剪容器 */
+static lv_obj_t *s_img_citou;           /* 唱片唱针 */
 static lv_img_dsc_t *s_cover_prev = NULL; /* 前一个动态封面，用于释放 */
 #define COVER_BUF_SIZE (48 * 48)
 static uint16_t s_cover_buf[COVER_BUF_SIZE]; /* 静态封面缓冲区（内部RAM，无缓存问题） */
@@ -49,6 +53,7 @@ static lv_obj_t *s_lyrics_next = NULL;    /* 下一句 */
 static int s_lyrics_current = -1;
 static int s_lyrics_prev_line = -1;        /* 上一次的行号，用于检测切换动画 */
 static bool s_lyrics_visible = false;
+static bool s_cover_ready = false;         /* 封面图片已加载就绪 */
 static lv_obj_t *s_lyrics_bg_img = NULL; /* 歌词界面背景图 */
 /* 背景渐变（预抖动图片，消除 RGB565 色阶） */
 static lv_obj_t *s_bg_img = NULL;        /* 背景图片控件 */
@@ -92,19 +97,34 @@ void lvgl_port_ui_create(void)
     lv_img_set_zoom(disc, 121);
     lv_img_set_pivot(disc, 0, 0);
 
-    /* ====== 封面（中心对齐转盘） ====== */
-    s_cover_img = lv_img_create(scr);
-    lv_obj_set_pos(s_cover_img, 40, 17);
+    /* ====== 封面（容器圆形裁剪 + 图片在容器内旋转） ====== */
+    s_cover_container = lv_obj_create(scr);
+    lv_obj_set_size(s_cover_container, 48, 48);
+    lv_obj_set_pos(s_cover_container, 40, 17);
+    lv_obj_set_style_radius(s_cover_container, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_clip_corner(s_cover_container, true, 0);
+    lv_obj_set_style_border_width(s_cover_container, 0, 0);
+    lv_obj_set_style_bg_opa(s_cover_container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_pad_all(s_cover_container, 0, 0);
+    lv_obj_clear_flag(s_cover_container, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_cover_img = lv_img_create(s_cover_container);
     lv_img_set_src(s_cover_img, &ui_img_haibao_png);
     lv_img_set_zoom(s_cover_img, 132);
-    lv_img_set_pivot(s_cover_img, 0, 0);
-    lv_obj_set_style_radius(s_cover_img, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_clip_corner(s_cover_img, true, 0);
-    lv_obj_set_style_border_width(s_cover_img, 0, 0);
+    lv_img_set_pivot(s_cover_img, 46, 46);  /* 中心 pivot */
+    lv_obj_set_pos(s_cover_img, -22, -22);  /* 补偿偏移：46*(1-132/256)=22 */
+
+    /* ====== 唱片唱针（citou 68x141，zoom≈121 → 32x67） ====== */
+    s_img_citou = lv_img_create(scr);
+    lv_img_set_src(s_img_citou, &ui_img_citou_png);
+    lv_img_set_zoom(s_img_citou, 121);
+    lv_img_set_pivot(s_img_citou, 50, 28);  /* 旋转轴心：唱针头部 */
+    lv_obj_set_pos(s_img_citou, 63, -8);    /* pivot 落在转盘右上缘 ≈(87,5) */
+    lv_img_set_angle(s_img_citou, -200);    /* 初始抬起（停止位） */
 
     /* ====== 标题 ====== */
     s_label_title = lv_label_create(scr);
-    lv_obj_set_pos(s_label_title, 0, 78);
+    lv_obj_set_pos(s_label_title, 0, 76);
     lv_obj_set_width(s_label_title, 128);
     lv_label_set_text(s_label_title, "DLNA Player");
     lv_obj_set_style_text_color(s_label_title, C_WHITE, 0);
@@ -115,7 +135,7 @@ void lvgl_port_ui_create(void)
 
     /* ====== 歌手 ====== */
     s_label_artist = lv_label_create(scr);
-    lv_obj_set_pos(s_label_artist, 0, 96);
+    lv_obj_set_pos(s_label_artist, 0, 94);
     lv_obj_set_width(s_label_artist, 128);
     lv_label_set_text(s_label_artist, "Waiting...");
     lv_obj_set_style_text_color(s_label_artist, C_WHITE80, 0);
@@ -266,11 +286,69 @@ void lvgl_port_ui_set_progress(int position_sec, int duration_sec) {
         lv_label_set_text(s_label_time2, "0:00");
     }
 }
+/* ── 封面旋转 ── */
+static void _cover_anim_cb(void *obj, int32_t v)
+{
+    lv_img_set_angle((lv_obj_t *)obj, v);
+}
+
+/* ── 唱针平滑移动动画 ── */
+static void _citou_anim_cb(void *obj, int32_t v)
+{
+    lv_img_set_angle((lv_obj_t *)obj, v);
+}
+
+static void _animate_citou(int target_angle)
+{
+    if (!s_img_citou) return;
+    lv_anim_del(s_img_citou, _citou_anim_cb);  /* 取消正在进行的动画 */
+    int32_t cur = lv_img_get_angle(s_img_citou);
+    /* 归一化目标到 0-3600 */
+    while (target_angle < 0) target_angle += 3600;
+    while (target_angle >= 3600) target_angle -= 3600;
+    /* 计算最短路径方向（顺时针/逆时针） */
+    int32_t diff = target_angle - cur;
+    if (diff > 1800) diff -= 3600;
+    if (diff < -1800) diff += 3600;
+    int32_t end = cur + diff;
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_img_citou);
+    lv_anim_set_exec_cb(&a, _citou_anim_cb);
+    lv_anim_set_values(&a, cur, end);
+    lv_anim_set_time(&a, 100);                 /* 100ms 干脆利落 */
+    lv_anim_set_path_cb(&a, lv_anim_path_linear);    /* 匀速 */
+    lv_anim_start(&a);
+}
+
+static int s_last_ui_state = -1;  /* 上次 set_state 的值，用于检测变化 */
+
 void lvgl_port_ui_set_state(int state) {
+    if (state == s_last_ui_state) return;  /* 状态没变，跳过 */
+    s_last_ui_state = state;
+
     if (state == 1) {
         lv_imgbtn_set_src(s_btn_play, LV_IMGBTN_STATE_RELEASED, NULL, &ui_img_zanting1_png, NULL);
+        /* 播放：封面就绪后才放下唱针 + 旋转 */
+        if (s_cover_ready) {
+            _animate_citou(110);   /* 唱针平滑放下 */
+            if (s_cover_img && !lv_anim_get(s_cover_img, _cover_anim_cb)) {
+                int32_t cur = lv_img_get_angle(s_cover_img);
+                lv_anim_t a;
+                lv_anim_init(&a);
+                lv_anim_set_var(&a, s_cover_img);
+                lv_anim_set_exec_cb(&a, _cover_anim_cb);
+                lv_anim_set_values(&a, cur, cur + 3600);
+                lv_anim_set_time(&a, 8000);
+                lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+                lv_anim_start(&a);
+            }
+        }
     } else {
         lv_imgbtn_set_src(s_btn_play, LV_IMGBTN_STATE_RELEASED, NULL, &ui_img_bofang1_png, NULL);
+        /* 暂停/停止：停止动画（封面保持当前角度）+ 唱针平滑抬起 */
+        lv_anim_del(s_cover_img, _cover_anim_cb);
+        _animate_citou(-200);
     }
 }
 void lvgl_port_ui_set_volume(int vol) { (void)vol; }
@@ -564,11 +642,14 @@ void lvgl_port_ui_set_cover(const uint16_t *pixels, int w, int h) {
     dsc->data = (const uint8_t *)s_cover_buf;
     lv_img_set_src(s_cover_img, dsc);
     lv_obj_invalidate(s_cover_img);
-    /* 48x48 原尺寸显示，居中于转盘 */
+    /* 48x48 原尺寸，容器内 (0,0) 填满，zoom=256 无偏移 */
     lv_img_set_zoom(s_cover_img, 256);
-    lv_img_set_pivot(s_cover_img, 0, 0);
-    lv_obj_set_pos(s_cover_img, 64 - w / 2, 41 - h / 2);
+    lv_img_set_pivot(s_cover_img, w / 2, h / 2);
+    lv_obj_set_pos(s_cover_img, 0, 0);
     lv_obj_clear_flag(s_cover_img, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(s_cover_container, LV_OBJ_FLAG_HIDDEN);
+    s_cover_ready = true;   /* 封面就绪 */
+    s_last_ui_state = -1; /* 触发下次 set_state 放下唱针 + 旋转 */
     if (s_cover_prev) lv_mem_free(s_cover_prev);
     s_cover_prev = dsc;
 }
