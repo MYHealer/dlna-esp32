@@ -9,7 +9,7 @@
 
 /* ── 色彩 ── */
 #define LV_COLOR_DEPTH         16
-#define LV_COLOR_16_SWAP       0
+#define LV_COLOR_16_SWAP       1
 #define LV_COLOR_SCREEN_TRANSP 0
 
 /* ── 内存 — 64KB LVGL 堆，从 PSRAM 分配 ── */
@@ -34,6 +34,7 @@
 #define LV_FONT_MONTSERRAT_14  1
 #define LV_FONT_MONTSERRAT_16  1
 #define LV_FONT_SIMSUN_16_CJK  1
+#define LV_FONT_FMT_TXT_LARGE  1
 #define LV_FONT_DEFAULT        &lv_font_montserrat_14
 
 /* ── 日志 ── */

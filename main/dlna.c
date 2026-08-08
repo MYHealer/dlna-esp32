@@ -1,35 +1,34 @@
-/* DLNA MediaRenderer — HTTP stream + ADF esp_audio playback
+/* DLNA MediaRenderer — GMF pipeline 播放
  *
- * 参考 airplay-esp32 的思路做了这些改进：
- *   - 播放状态机 + mutex，避免回调与 UI 的竞态
- *   - Stop/Seek/Next 时显式 flush pipeline（audio_element_stop_reset）
- *   - 加大 http_stream / i2s_stream ringbuffer，吸收网络抖动
- *   - HTTP 请求大小 request_size 调到 MSS 级别，减少小包开销
- *   - 软音量（vol/mute 缓存 + 事件通知），避免频繁 HAL 调用
+ * 从 ESP-ADF 迁移到 ESP-GMF，保留 DLNA 协议逻辑不变。
+ * 音频管线：io_http → aud_dec → aud_alc → aud_ch_cvt → aud_bit_cvt → io_codec_dev
  */
 
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "board.h"
-#include "esp_peripherals.h"
-#include "periph_wifi.h"
 #include "esp_timer.h"
-
-#include "audio_mem.h"
 #include "esp_wifi.h"
-#include "esp_audio.h"
-#include "esp_decoder.h"
-#include "http_stream.h"
-#include "i2s_stream.h"
-#include "media_lib_adapter.h"
-#include "audio_idf_version.h"
-#include "audio_element.h"
-#include "ringbuf.h"
+#include "esp_netif.h"
+#include "esp_event.h"
+
+/* GMF 音频框架 */
+#include "esp_gmf_pipeline.h"
+#include "esp_gmf_pool.h"
+#include "esp_gmf_io_http.h"
+#include "esp_gmf_io_codec_dev.h"
+#include "esp_gmf_audio_dec.h"
+#include "esp_gmf_alc.h"
+#include "esp_gmf_event.h"
+#include "esp_gmf_info.h"
+#include "esp_gmf_audio_element.h"
+#include "gmf_loader_setup_defaults.h"
 
 #include "custom_dlna.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/event_groups.h"
 #include "driver/gpio.h"
 #include "rotary_encoder.h"
 #include "tft_display.h"
@@ -37,31 +36,13 @@
 #include "lyrics_fetch.h"
 #include "esp_http_client.h"
 #include "esp_jpeg_dec.h"
-#include "audio_forge.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #define lodepng_malloc(s) heap_caps_malloc(s, MALLOC_CAP_SPIRAM)
 #define lodepng_free(p)  heap_caps_free(p)
 #include "extra/libs/png/lodepng.h"
 
-#if (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 1, 0))
-#include "esp_netif.h"
-#else
-#include "tcpip_adapter.h"
-#endif
-
 static const char *TAG = "DLNA_APP";
-
-/* ── Wrap audio_forge_init: 增大默认栈 4KB→8KB ── */
-extern audio_element_handle_t __real_audio_forge_init(audio_forge_cfg_t *config);
-audio_element_handle_t __wrap_audio_forge_init(audio_forge_cfg_t *config)
-{
-    if (config && config->task_stack < 8192) {
-        ESP_LOGI(TAG, "Audio_forge: stack %d -> 8192", config->task_stack);
-        config->task_stack = 8192;
-    }
-    return __real_audio_forge_init(config);
-}
 
 #define DLNA_DEVICE_UUID "8db0797a-f01a-4949-8f59-51188b18180b"
 
@@ -73,18 +54,28 @@ typedef enum {
     PS_PAUSED   = 2,
 } play_state_t;
 
-static esp_audio_handle_t player          = NULL;
-static audio_element_handle_t s_http_el   = NULL;
-static audio_element_handle_t s_i2s_el    = NULL;
+/* GMF 音频管线 */
+static esp_gmf_pipeline_handle_t s_pipe       = NULL;
+static esp_gmf_task_handle_t     s_work_task  = NULL;
+static esp_codec_dev_handle_t    s_codec_dev   = NULL;
+static esp_gmf_element_handle_t  s_dec_el     = NULL;
+static esp_gmf_element_handle_t  s_alc_el     = NULL;
+static esp_gmf_pool_handle_t     s_pool       = NULL;
 
 static SemaphoreHandle_t s_state_mux     = NULL;
 static play_state_t  s_state             = PS_STOPPED;
 static char         *s_track_uri         = NULL;
 static int           s_vol               = 35;
+static int           s_last_applied_vol  = 35;  /* 上次实际应用到 ALC 的音量 */
 static int           s_mute              = 0;
+/* I2S 时钟跟踪：避免重复重配 */
+static int           s_last_i2s_rate     = 48000;
+static int           s_last_i2s_bits     = 16;
+static int           s_last_i2s_ch       = 2;
 /* 断点续播：记住暂停/停止时的播放位置 */
 static int           s_saved_pos_sec     = 0;
 static char         *s_saved_uri         = NULL;
+static unsigned long s_music_id          = 0;   /* 当前歌曲 ID，用于检测音质切换 */
 /* 用于 GENA 去抖：相同状态不重复 notify */
 static play_state_t  s_last_notified     = PS_STOPPED;
 /* 宽限期：play() 后 8 秒内不被轮询覆盖 PLAYING 状态 */
@@ -147,48 +138,61 @@ static void cb_next(void);
 static void cb_previous(void);
 static void cb_play_toggle(void);
 
-/* ─────────────────────── Player event handler ───────────────────────
- * esp_audio 的底层事件 — 用来把我们自己的状态机和底层硬件对齐。
- * 注意：这里不能做耗时 I/O（比如 HTTP callback / GENA notify 内部 I/O
- * 会放在另外的 FreeRTOS task 里）。
- */
-static void player_event_handler(esp_audio_state_t *state, void *ctx)
+/* ─────────────────────── GMF pipeline 事件回调 ─────────────────────── */
+static esp_gmf_err_t pipeline_event_cb(esp_gmf_event_pkt_t *event, void *ctx)
 {
     (void)ctx;
-    if (!state) return;
+    if (!event) return ESP_GMF_ERR_OK;
 
-    ESP_LOGD(TAG, "player event: status=%d err=%d", state->status, state->err_msg);
+    if (event->type == ESP_GMF_EVT_TYPE_CHANGE_STATE) {
+        esp_gmf_event_state_t st = (esp_gmf_event_state_t)event->sub;
+        ESP_LOGD(TAG, "GMF event: state=%s", esp_gmf_event_get_state_str(st));
 
-    switch (state->status) {
-        case AUDIO_STATUS_RUNNING:
-            set_state(PS_PLAYING);
-            /* 如果 play() 没设置追踪（非 cb_play 触发），在这里初始化 */
-            if (s_play_start_us == 0) {
-                s_play_start_us = esp_timer_get_time();
+        switch (st) {
+            case ESP_GMF_EVENT_STATE_RUNNING:
+                set_state(PS_PLAYING);
+                if (s_play_start_us == 0) {
+                    s_play_start_us = esp_timer_get_time();
+                }
+                break;
+            case ESP_GMF_EVENT_STATE_PAUSED:
+                if (s_user_stopped) set_state(PS_PAUSED);
+                break;
+            case ESP_GMF_EVENT_STATE_STOPPED:
+                if (get_state() != PS_PAUSED) set_state(PS_STOPPED);
+                break;
+            case ESP_GMF_EVENT_STATE_FINISHED:
+                if (get_state() == PS_PAUSED) break;
+                xTaskCreatePinnedToCore(delayed_stop_notify, "stop_dly", 3072, NULL, 5, NULL, 1);
+                break;
+            case ESP_GMF_EVENT_STATE_ERROR:
+                set_state(PS_STOPPED);
+                break;
+            default:
+                break;
+        }
+    } else if (event->type == ESP_GMF_EVT_TYPE_REPORT_INFO
+               && event->sub == ESP_GMF_INFO_SOUND) {
+        /* 解码器报告音频信息 → 原子重配 I2S（参照 FAKE_POD_NANO） */
+        if (event->payload && event->payload_size >= sizeof(esp_gmf_info_sound_t)) {
+            esp_gmf_info_sound_t info;
+            memcpy(&info, event->payload, sizeof(info));
+            int rate = info.sample_rates;
+            int bits = info.bits;
+            int ch   = info.channels;
+            if (rate <= 0) rate = 48000;
+            if (bits != 16 && bits != 24 && bits != 32) bits = 16;
+            if (ch <= 0 || ch > 2) ch = 2;
+            ESP_LOGI(TAG, "Audio info: %d Hz, %d ch, %d bit", rate, ch, bits);
+            if (rate != s_last_i2s_rate || bits != s_last_i2s_bits || ch != s_last_i2s_ch) {
+                audio_out_set_clk(NULL, rate, ch, bits);
+                s_last_i2s_rate = rate;
+                s_last_i2s_bits = bits;
+                s_last_i2s_ch   = ch;
             }
-            break;
-        case AUDIO_STATUS_PAUSED:
-            /* 只在用户主动 pause 时才切 PAUSED。
-             * I2S 在采样率切换（audio_rate_follow_task 调 i2s_stream_set_clk）
-             * 时会短暂进入 PAUSED，若无条件切状态会导致界面误显示"暂停"。 */
-            if (s_user_stopped) set_state(PS_PAUSED);
-            break;
-        case AUDIO_STATUS_STOPPED:
-            /* If we intentionally paused, ignore spurious STOPPED from esp_audio */
-            if (get_state() != PS_PAUSED) set_state(PS_STOPPED);
-            break;
-        case AUDIO_STATUS_FINISHED:
-            /* Same: don't let FINISHED clobber our PAUSED state */
-            if (get_state() == PS_PAUSED) break;
-            /* Don't notify STOPPED immediately — let I2S buffer drain first */
-            xTaskCreatePinnedToCore(delayed_stop_notify, "stop_dly", 3072, NULL, 5, NULL, 1);
-            break;
-        case AUDIO_STATUS_ERROR:
-            set_state(PS_STOPPED);
-            break;
-        default:
-            break;
+        }
     }
+    return ESP_GMF_ERR_OK;
 }
 
 /* ─────────────────────── DLNA 回调桥 ─────────────────────── */
@@ -324,35 +328,41 @@ static int s_vol_pending = -1;
 static void _vol_debounce_cb(void *arg)
 {
     (void)arg;
-    if (s_i2s_el && s_vol_pending >= 0) {
-        int diff = 100 - s_vol_pending;
-        int alc_gain = -(diff * diff * 30) / 10000;
-        i2s_alc_volume_set(s_i2s_el, alc_gain);
-        ESP_LOGI(TAG, "vol=%d -> alc_gain=%d", s_vol_pending, alc_gain);
+    if (s_alc_el && s_vol_pending >= 0) {
+        int vol = s_vol_pending;
+        int alc_gain;
+        if (vol <= 0) {
+            alc_gain = -64;  /* 静音 */
+        } else {
+            int diff = 100 - vol;
+            alc_gain = -(diff * diff * 30) / 10000;
+            if (alc_gain < -64) alc_gain = -64;
+        }
+        esp_gmf_alc_set_gain(s_alc_el, 0, (int8_t)alc_gain);
+        esp_gmf_alc_set_gain(s_alc_el, 1, (int8_t)alc_gain);
+        ESP_LOGI(TAG, "vol=%d -> alc_gain=%d", vol, alc_gain);
         s_vol_pending = -1;
     }
 }
 
-/* ── 自定义 vol_set：映射 0-100 到 ALC 增益（防抖）
+/* ── 自定义 vol_set：映射 0-100 到 ALC 增益
  *    平方曲线：低音量时下降更慢，保留更多有效位
- *    vol=100 → 0dB, vol=50 → -7.5dB, vol=0 → -30dB
- *    对比线性：vol=50 → -15dB（平方在 50% 音量时保真度更高）
+ *    vol=100 → 0dB, vol=50 → -7.5dB, vol=0 → -64dB（静音）
  */
 static esp_err_t _my_vol_set(void *handle, int volume)
 {
-    if (!s_i2s_el) return ESP_ERR_INVALID_STATE;
-    s_vol_pending = volume;
-    if (!s_vol_debounce) {
-        /* 首次调用时创建定时器 */
-        const esp_timer_create_args_t args = {
-            .callback = _vol_debounce_cb,
-            .name = "vol_debounce",
-        };
-        esp_timer_create(&args, &s_vol_debounce);
+    if (!s_alc_el) return ESP_ERR_INVALID_STATE;
+    int alc_gain;
+    if (volume <= 0) {
+        alc_gain = -64;
+    } else {
+        int diff = 100 - volume;
+        alc_gain = -(diff * diff * 30) / 10000;
+        if (alc_gain < -64) alc_gain = -64;
     }
-    /* 重置定时器：50ms 内无新值才真正应用 */
-    esp_timer_stop(s_vol_debounce);
-    esp_timer_start_once(s_vol_debounce, 50000);
+    esp_gmf_alc_set_gain(s_alc_el, 0, (int8_t)alc_gain);
+    esp_gmf_alc_set_gain(s_alc_el, 1, (int8_t)alc_gain);
+    ESP_LOGD(TAG, "vol=%d -> alc_gain=%d", volume, alc_gain);
     return ESP_OK;
 }
 
@@ -380,11 +390,11 @@ static void cb_set_uri(const char *uri)
         return;
     }
     if (s_state_mux) xSemaphoreTake(s_state_mux, portMAX_DELAY);
-    /* 新 URI 不同于保存的 URI 时，清除断点 */
-    if (uri && s_saved_uri && strcmp(uri, s_saved_uri) != 0) {
-        s_saved_pos_sec = 0;
-        free(s_saved_uri);
-        s_saved_uri = NULL;
+    /* 新 URI 时保存当前播放位置（直接读 s_state，避免 get_state() 递归锁） */
+    if (s_state == PS_PLAYING && s_play_start_us > 0) {
+        s_saved_pos_sec = (s_accumulated_ms + (int)((esp_timer_get_time() - s_play_start_us) / 1000LL)) / 1000;
+    } else if (s_state == PS_PAUSED) {
+        s_saved_pos_sec = s_accumulated_ms / 1000;
     }
     free(s_track_uri);
     s_track_uri = uri ? strdup(uri) : NULL;
@@ -440,9 +450,19 @@ static void _do_play(const char *uri, int seek_sec)
 {
     s_finish_notify_spawned = false;
     s_near_end_count = 0;
-    if (!player || !uri) return;
-    esp_err_t err = esp_audio_play(player, AUDIO_CODEC_TYPE_DECODER, uri, 0);
-    if (err == ESP_OK) {
+    if (!s_pipe || !uri) return;
+
+    /* 重置 I2S 跟踪，确保新歌重新配置 */
+    s_last_i2s_rate = 0;
+    s_last_i2s_bits = 0;
+    s_last_i2s_ch   = 0;
+
+    /* 如果管线已被 stop（如切歌），重置元素状态为 INITIALIZED 才能重新注册 job */
+    esp_gmf_pipeline_reset(s_pipe);
+    esp_gmf_pipeline_set_in_uri(s_pipe, uri);
+    esp_gmf_pipeline_loading_jobs(s_pipe);
+    esp_gmf_err_t err = esp_gmf_pipeline_run(s_pipe);
+    if (err == ESP_GMF_ERR_OK) {
         set_state(PS_PLAYING);
         s_accumulated_ms = seek_sec * 1000;
         s_play_start_us = esp_timer_get_time();
@@ -452,11 +472,12 @@ static void _do_play(const char *uri, int seek_sec)
         s_playing_uri = strdup(uri);
         if (seek_sec > 0) {
             vTaskDelay(pdMS_TO_TICKS(300));
-            esp_audio_seek(player, seek_sec);
+            /* GMF seek 按字节偏移，粗略估算（128kbps MP3 ≈ 16000 B/s） */
+            esp_gmf_pipeline_seek(s_pipe, (uint64_t)seek_sec * 16000);
             ESP_LOGI(TAG, "Resumed from %d s (seek)", seek_sec);
         }
     } else {
-        ESP_LOGE(TAG, "esp_audio_play failed: 0x%x", err);
+        ESP_LOGE(TAG, "esp_gmf_pipeline_run failed: %d", err);
         set_state(PS_STOPPED);
     }
 }
@@ -474,26 +495,24 @@ static void cb_play(void)
             return;
         }
         ESP_LOGI(TAG, "Play while playing, new URL, switching");
-        esp_audio_stop(player, TERMINATION_TYPE_NOW);
+        esp_gmf_pipeline_stop(s_pipe);
         vTaskDelay(pdMS_TO_TICKS(50));
         _do_play(s_track_uri, 0);
         return;
     }
 
-    if (cur == PS_PAUSED && player) {
+    if (cur == PS_PAUSED && s_pipe) {
         /* 检查暂停期间是否推了新 URL */
         bool uri_changed = s_playing_uri && s_track_uri
                           && strcmp(s_playing_uri, s_track_uri) != 0;
         if (uri_changed) {
             ESP_LOGI(TAG, "URI changed while paused, switching to new track");
-            esp_audio_resume(player);
-            vTaskDelay(pdMS_TO_TICKS(50));
-            esp_audio_stop(player, TERMINATION_TYPE_NOW);
+            esp_gmf_pipeline_stop(s_pipe);
             vTaskDelay(pdMS_TO_TICKS(50));
             _do_play(s_track_uri, 0);
         } else {
             /* 同 URI 恢复暂停 */
-            esp_audio_resume(player);
+            esp_gmf_pipeline_resume(s_pipe);
             set_state(PS_PLAYING);
             s_play_start_us = esp_timer_get_time();
             ESP_LOGI(TAG, "Resumed from pause (pos=%d ms)", s_accumulated_ms);
@@ -504,7 +523,7 @@ static void cb_play(void)
     }
 
     /* 新播放 or 断点续播 */
-    if (s_track_uri != NULL && player != NULL) {
+    if (s_track_uri != NULL && s_pipe != NULL) {
         bool same_track = s_saved_uri && s_track_uri
                           && strcmp(s_saved_uri, s_track_uri) == 0
                           && s_saved_pos_sec > 0;
@@ -517,7 +536,7 @@ static void cb_pause(void)
 {
     play_state_t cur = get_state();
     ESP_LOGI(TAG, "Pause (state=%d)", cur);
-    if (player && cur == PS_PLAYING) {
+    if (s_pipe && cur == PS_PLAYING) {
         /* 冻结累计播放时间 */
         if (s_play_start_us > 0) {
             s_accumulated_ms += (int)((esp_timer_get_time() - s_play_start_us) / 1000LL);
@@ -526,10 +545,10 @@ static void cb_pause(void)
         s_saved_pos_sec = s_accumulated_ms / 1000;
         free(s_saved_uri);
         s_saved_uri = s_track_uri ? strdup(s_track_uri) : NULL;
-        esp_err_t err = esp_audio_pause(player);
+        esp_gmf_err_t err = esp_gmf_pipeline_pause(s_pipe);
         set_state(PS_PAUSED);
         s_user_stopped = 1;
-        ESP_LOGI(TAG, "Paused at %d ms (err=0x%x)", s_accumulated_ms, err);
+        ESP_LOGI(TAG, "Paused at %d ms (err=%d)", s_accumulated_ms, err);
     }
 }
 
@@ -557,7 +576,7 @@ static void cb_stop(void)
     s_saved_pos_sec = s_accumulated_ms / 1000;
     free(s_saved_uri);
     s_saved_uri = s_track_uri ? strdup(s_track_uri) : NULL;
-    if (player) esp_audio_stop(player, TERMINATION_TYPE_NOW);
+    if (s_pipe) esp_gmf_pipeline_stop(s_pipe);
     set_state(PS_STOPPED);
     s_user_stopped = 1;
     free(s_next_uri); s_next_uri = NULL;
@@ -565,27 +584,61 @@ static void cb_stop(void)
     ESP_LOGI(TAG, "Stopped at %d ms", s_accumulated_ms);
 }
 
-/* ── Seek 防抖：拖动进度条时 controller 连发多个 Seek，只执行最后一个 ── */
+/* ── Seek：拖动进度条 ── */
 static void cb_seek(int seconds)
 {
     s_finish_notify_spawned = false;
     s_near_end_count = 0;
-    ESP_LOGI(TAG, "Seek %d s", seconds);
-    if (!player) return;
-    esp_audio_seek(player, seconds);
+    ESP_LOGI(TAG, "Seek %d s (dur=%d)", seconds, s_dur_cache_sec);
+    if (!s_pipe) return;
+
+    /* GMF seek 需要管线处于 PAUSED/STOPPED/FINISHED 状态 */
+    play_state_t cur = get_state();
+    bool was_playing = (cur == PS_PLAYING);
+    if (was_playing) {
+        esp_gmf_pipeline_pause(s_pipe);
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    /* 计算字节偏移：从 HTTP IO 获取文件大小 */
+    uint64_t byte_pos = 0;
+    esp_gmf_info_file_t file_info = {0};
+    esp_gmf_io_handle_t in_io = ESP_GMF_PIPELINE_GET_IN_INSTANCE(s_pipe);
+    if (in_io) {
+        esp_gmf_io_get_info(in_io, &file_info);
+    }
+    if (file_info.size > 0 && s_dur_cache_sec > 0) {
+        byte_pos = ((uint64_t)seconds * file_info.size) / s_dur_cache_sec;
+        ESP_LOGI(TAG, "Seek: %d/%d s → byte %llu/%llu",
+                 seconds, s_dur_cache_sec, byte_pos, file_info.size);
+    } else {
+        /* 回退：粗略估算 128kbps MP3 ≈ 16000 B/s */
+        byte_pos = (uint64_t)seconds * 16000;
+        ESP_LOGW(TAG, "Seek fallback: no file_size/duration, estimate byte=%llu", byte_pos);
+    }
+
+    esp_gmf_err_t err = esp_gmf_pipeline_seek(s_pipe, byte_pos);
+    if (err != ESP_GMF_ERR_OK) {
+        ESP_LOGE(TAG, "Seek failed: %d", err);
+    }
+
     /* 更新位置追踪 */
     s_accumulated_ms = seconds * 1000;
     s_play_start_us = esp_timer_get_time();
+
+    if (was_playing) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        esp_gmf_pipeline_resume(s_pipe);
+    }
 }
 
 static void cb_set_volume(int v)
 {
     s_vol = v;
     if (s_mute) {
-        /* 用户在静音状态下调音量 —— 顺手取消静音更自然 */
         s_mute = 0;
     }
-    apply_volume_hw();
+    _my_vol_set(NULL, s_mute ? 0 : s_vol);
 }
 
 static void cb_set_mute(int m)
@@ -627,25 +680,19 @@ static void cb_next(void) {
     free(s_saved_uri); s_saved_uri = NULL;
     if (s_next_uri && s_next_uri[0]) {
         char *next_meta = s_next_metadata;
-        if (player) {
-            /* 暂停状态下 esp_audio_stop 不工作，先 resume 再 stop */
-            if (was_paused) esp_audio_resume(player);
-            vTaskDelay(pdMS_TO_TICKS(50));
-            esp_audio_stop(player, TERMINATION_TYPE_NOW);
+        if (s_pipe) {
+            esp_gmf_pipeline_stop(s_pipe);
         }
         free(s_track_uri);
         s_track_uri = s_next_uri;
         s_next_uri = NULL;
         s_next_metadata = NULL;
-        if (player) {
-            esp_audio_play(player, AUDIO_CODEC_TYPE_DECODER, s_track_uri, 0);
-            s_play_start_us = esp_timer_get_time();
-            free(s_playing_uri);
-            s_playing_uri = strdup(s_track_uri);
-            set_state(PS_PLAYING);
+        if (s_pipe) {
+            /* _do_play 会探测格式→配置 I2S→reset→loading_jobs→run */
+            _do_play(s_track_uri, 0);
             if (was_paused) {
                 vTaskDelay(pdMS_TO_TICKS(300));
-                esp_audio_pause(player);
+                esp_gmf_pipeline_pause(s_pipe);
                 set_state(PS_PAUSED);
             }
         }
@@ -654,10 +701,8 @@ static void cb_next(void) {
     } else {
         /* 无 next_uri → 模拟自然播完（参考 miair-next next_track()）：
          * 位置设到曲末 + STOPPED，控制端判定自然结束自动推下一首 */
-        if (player) {
-            if (get_state() == PS_PAUSED) esp_audio_resume(player);
-            vTaskDelay(pdMS_TO_TICKS(50));
-            esp_audio_stop(player, TERMINATION_TYPE_NOW);
+        if (s_pipe) {
+            esp_gmf_pipeline_stop(s_pipe);
         }
         if (s_dur_cache_sec > 0) {
             s_accumulated_ms = s_dur_cache_sec * 1000;  /* 位置=曲末 */
@@ -676,14 +721,12 @@ static void cb_previous(void) {
     s_play_start_us = 0;
     s_saved_pos_sec = 0;
     free(s_saved_uri); s_saved_uri = NULL;
-    if (player && s_track_uri) {
-        esp_audio_stop(player, TERMINATION_TYPE_NOW);
+    if (s_pipe && s_track_uri) {
+        esp_gmf_pipeline_stop(s_pipe);
         vTaskDelay(pdMS_TO_TICKS(200));
-        esp_audio_play(player, AUDIO_CODEC_TYPE_DECODER, s_track_uri, 0);
-        set_state(PS_PLAYING);
-        s_play_start_us = esp_timer_get_time();
+        _do_play(s_track_uri, 0);
     } else {
-        if (player) esp_audio_stop(player, TERMINATION_TYPE_NOW);
+        if (s_pipe) esp_gmf_pipeline_stop(s_pipe);
         set_state(PS_STOPPED);
     }
     custom_dlna_notify_transport_state_async();
@@ -751,6 +794,13 @@ static void cb_set_metadata(const char *metadata)
     unsigned long music_id = music_id_str[0] ? strtoul(music_id_str, NULL, 10) : 0;
     ESP_LOGI(TAG, "Extracted: title='%s' artist='%s' musicId=%lu", title, artist, music_id);
 
+    /* 音质切换检测：同 music_id 保留断点续播，不同则清除 */
+    if (s_music_id && music_id && music_id != s_music_id) {
+        s_saved_pos_sec = 0;
+        free(s_saved_uri); s_saved_uri = NULL;
+    }
+    if (music_id) s_music_id = music_id;
+
     if (album_art[0]) {
         /* 没有参数时追加 ?param=200y200 让 CDN 返回小图，节省内存 */
         if (!strchr(album_art, '?')) {
@@ -778,13 +828,20 @@ static void cb_set_metadata(const char *metadata)
 /* ── 用原始 socket 下载封面，全部走 PSRAM，避免 esp_http_client 争抢内部 RAM ── */
 static int simple_http_get(const char *url, uint8_t **out_data, int *out_len)
 {
-    /* 解析 URL: http://host[:port]/path */
+    /* 解析 URL: http://host[:port]/path（支持 https:// 降级为 http://） */
     const char *p = url;
-    if (strncmp(p, "http://", 7) == 0) p += 7;
-    else { ESP_LOGW(TAG, "Only http supported"); return -1; }
+    bool is_https = (strncmp(p, "https://", 8) == 0);
+    if (strncmp(p, "http://", 7) == 0) {
+        p += 7;
+    } else if (is_https) {
+        ESP_LOGW(TAG, "HTTPS cover, downgrading to HTTP");
+        p += 8;
+    } else {
+        ESP_LOGW(TAG, "Only http/https supported"); return -1;
+    }
 
     char host[128] = "";
-    int port = 80;
+    int port = is_https ? 443 : 80;
     const char *path = "/";
     /* 提取 host */
     int i = 0;
@@ -792,6 +849,11 @@ static int simple_http_get(const char *url, uint8_t **out_data, int *out_len)
     host[i] = '\0';
     if (*p == ':') { p++; port = atoi(p); while (*p && *p != '/') p++; }
     if (*p == '/') path = p;
+
+    if (is_https) {
+        /* HTTPS 降级为 HTTP 下载（CDN 通常支持） */
+        port = 80;
+    }
 
     /* DNS 解析 */
     struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
@@ -1084,131 +1146,65 @@ static void fetch_album_art_async(const char *url)
     }
 }
 
-/* ─────────────────────── HTTP stream event ─────────────────────── */
-static int _http_stream_event_handle(http_stream_event_msg_t *msg)
-{
-    if (!msg) return ESP_OK;
-    switch (msg->event_id) {
-        case HTTP_STREAM_RESOLVE_ALL_TRACKS:
-            return ESP_OK;
-        case HTTP_STREAM_FINISH_TRACK:
-            return http_stream_next_track(msg->el);
-        case HTTP_STREAM_FINISH_PLAYLIST:
-            return http_stream_restart(msg->el);
-        default:
-            return ESP_OK;
-    }
-}
-
-/* ─────────────────────── Audio player init ─────────────────────── */
+/* ─────────────────────── Audio player init (GMF) ─────────────────────── */
 static void audio_player_init(void)
 {
-    audio_board_handle_t board_handle = audio_board_init();
-    audio_hal_ctrl_codec(board_handle->audio_hal,
-                         AUDIO_HAL_CODEC_MODE_DECODE,
-                         AUDIO_HAL_CTRL_START);
-
-    /* ── esp_audio 主体
-     *    N16R8 有 8MB PSRAM，大胆用！
-     *    prefer_type = SPEED：优先性能，减少解码延迟
-     *    in_stream_buf = 512KB：HTTP→Decoder 缓冲，减少网络抖动
-     *    out_stream_buf = 128KB：Decoder→I2S 缓冲，防止 underrun
-     */
-    esp_audio_cfg_t cfg = DEFAULT_ESP_AUDIO_CONFIG();
-    cfg.vol_handle = board_handle->audio_hal;
-    cfg.vol_set = (audio_volume_set)audio_hal_set_volume;
-    cfg.vol_get = (audio_volume_get)audio_hal_get_volume;
-    cfg.prefer_type  = ESP_AUDIO_PREFER_SPEED;
-    cfg.resample_rate = 0;           /* 0=禁用重采样，I2S 跟随源采样率（参考 Jw-Y1）*/
-    cfg.in_stream_buf_size  = 512 * 1024;  /* 512KB，充分吸收网络抖动 */
-    cfg.out_stream_buf_size = 128 * 1024;  /* 128KB，解码后充裕缓冲 */
-    cfg.task_prio   = 8;
-    cfg.task_stack  = 8 * 1024;
-    player = esp_audio_create(&cfg);
-
-    /* ── HTTP stream reader
-     *    out_rb = 1MB：PSRAM 大缓冲，预加载整首歌的很大一部分
-     *    request_size = 32KB：大块读取，减少 HTTP RTT
-     *    user_agent = 浏览器 UA：网易云对非浏览器 UA 会限速/给低码率
-     *                 （参考 Jw-Y1 + miair-next 的 UA 伪装）
-     *    stack_in_ext = true：任务栈放 PSRAM，节省 IRAM
-     */
-    http_stream_cfg_t http_cfg = HTTP_STREAM_CFG_DEFAULT();
-    http_cfg.event_handle      = _http_stream_event_handle;
-    http_cfg.type              = AUDIO_STREAM_READER;
-    http_cfg.enable_playlist_parser = true;
-    http_cfg.task_prio         = 6;
-    http_cfg.task_stack        = 8 * 1024;
-    http_cfg.stack_in_ext      = true;
-    http_cfg.out_rb_size       = 1024 * 1024;  /* 1MB PSRAM 环形缓冲 */
-    http_cfg.request_size      = 32768;         /* 32KB 请求块，减少 RTT */
-    http_cfg.user_agent        = "Mozilla/5.0 (Linux; Android 12) "
-                                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                 "Chrome/120.0.0.0 Mobile Safari/537.36";
-    s_http_el = http_stream_init(&http_cfg);
-    esp_audio_input_stream_add(player, s_http_el);
-
-    /* ── Decoders（mp3/aac/wav/ts...）── */
-    audio_decoder_t auto_decode[] = {
-        DEFAULT_ESP_MP3_DECODER_CONFIG(),
-        DEFAULT_ESP_WAV_DECODER_CONFIG(),
-        DEFAULT_ESP_AAC_DECODER_CONFIG(),
-        DEFAULT_ESP_M4A_DECODER_CONFIG(),
-        DEFAULT_ESP_TS_DECODER_CONFIG(),
-    };
-    esp_decoder_cfg_t auto_dec_cfg = DEFAULT_ESP_DECODER_CONFIG();
-    esp_audio_codec_lib_add(player, AUDIO_CODEC_TYPE_DECODER,
-                            esp_decoder_init(&auto_dec_cfg, auto_decode, 5));
-
-    /* ── I2S stream writer
-     *    out_rb = 256KB：PSRAM 缓冲，彻底杜绝 DMA underrun
-     *    task_core = 1：与 WiFi（core0）分开，避免竞争
-     *    task_prio = 9：最高优先级，及时喂 DMA
-     */
-    i2s_stream_cfg_t i2s_writer = I2S_STREAM_CFG_DEFAULT();
-    i2s_writer.type             = AUDIO_STREAM_WRITER;
-    i2s_writer.stack_in_ext     = true;
-    i2s_writer.task_prio        = 9;
-    i2s_writer.task_core        = 1;
-    i2s_writer.task_stack       = 4 * 1024;
-    i2s_writer.out_rb_size      = 256 * 1024;  /* 256KB PSRAM，杜绝 underrun */
-    i2s_writer.use_alc          = true;
-    s_i2s_el = i2s_stream_init(&i2s_writer);
-    i2s_stream_set_clk(s_i2s_el, 48000, 16, 2);
-    esp_audio_output_stream_add(player, s_i2s_el);
-
-    /* ── 起手音量 ── */
-    _my_vol_set(NULL, s_vol);
-    esp_audio_callback_set(player, player_event_handler, NULL);
-
-    ESP_LOGI(TAG, "Audio player ready (http_rb=%d, i2s_rb=%d, req=%d, in_buf=%d, out_buf=%d)",
-             http_cfg.out_rb_size, i2s_writer.out_rb_size, http_cfg.request_size,
-             cfg.in_stream_buf_size, cfg.out_stream_buf_size);
-}
-
-/* ─────────────────────── 采样率跟随 ───────────────────────
- * 参考 Jw-Y1: I2S 跟随源采样率，不做强制重采样（省 CPU、保音质）。
- * 独立 task 周期读取 esp_audio 音乐信息，检测到采样率变化时更新 I2S clk。
- */
-static void audio_rate_follow_task(void *arg)
-{
-    (void)arg;
-    esp_audio_music_info_t info;
-    int last_rate = 0;
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(500));
-        if (!player || !s_i2s_el) continue;
-        if (get_state() != PS_PLAYING) continue;
-        if (esp_audio_music_info_get(player, &info) == ESP_ERR_AUDIO_NO_ERROR) {
-            if (info.sample_rates > 0 && info.sample_rates != last_rate) {
-                ESP_LOGI(TAG, "I2S rate follow: %d -> %d Hz (%dch)",
-                         last_rate, info.sample_rates, info.channels);
-                int ch = (info.channels == 1) ? 1 : 2;
-                i2s_stream_set_clk(s_i2s_el, info.sample_rates, 16, ch);
-                last_rate = info.sample_rates;
-            }
-        }
+    /* ── 1. 初始化 I2S + esp_codec_dev（PCM5102A 纯 I2S 输出）── */
+    s_codec_dev = audio_out_init();
+    if (!s_codec_dev) {
+        ESP_LOGE(TAG, "audio_out_init failed!");
+        return;
     }
+
+    /* ── 2. 创建 GMF 池，注册所有默认元素 ── */
+    esp_gmf_pool_init(&s_pool);
+    gmf_loader_setup_io_default(s_pool);
+    gmf_loader_setup_audio_codec_default(s_pool);
+    gmf_loader_setup_audio_effects_default(s_pool);
+
+    /* ── 3. 创建管线：io_http → aud_dec → aud_alc → io_codec_dev
+     *    禁用重采样（aud_rate_cvt 不在管线中），I2S 跟随源采样率
+     *    去掉 aud_ch_cvt / aud_bit_cvt（DLNA 源通常是 16-bit 立体声，PCM5102A 直接输出）
+     */
+    /* 播放前探测格式 → 预配置 I2S 时钟，管线中无需重采样 */
+    const char *name[] = {"aud_dec", "aud_alc"};
+    esp_gmf_err_t ret = esp_gmf_pool_new_pipeline(s_pool,
+        "io_http", name, sizeof(name) / sizeof(char *), "io_codec_dev", &s_pipe);
+    if (ret != ESP_GMF_ERR_OK) {
+        ESP_LOGE(TAG, "esp_gmf_pool_new_pipeline failed: %d", ret);
+        return;
+    }
+
+    /* ── 4. 注入 codec_dev handle ── */
+    esp_gmf_io_codec_dev_set_dev(ESP_GMF_PIPELINE_GET_OUT_INSTANCE(s_pipe), s_codec_dev);
+
+    /* ── 5. 获取解码器和 ALC 元素句柄 ── */
+    esp_gmf_pipeline_get_el_by_name(s_pipe, "aud_dec", &s_dec_el);
+    esp_gmf_pipeline_get_el_by_name(s_pipe, "aud_alc", &s_alc_el);
+
+    /* ── 6. 创建 GMF 任务并绑定到管线 ── */
+    esp_gmf_task_cfg_t task_cfg = DEFAULT_ESP_GMF_TASK_CONFIG();
+    task_cfg.name = "dlna_audio";
+    task_cfg.thread.stack = 16 * 1024;
+    task_cfg.thread.prio = 8;
+    task_cfg.thread.stack_in_ext = true;
+    ret = esp_gmf_task_init(&task_cfg, &s_work_task);
+    if (ret != ESP_GMF_ERR_OK) {
+        ESP_LOGE(TAG, "esp_gmf_task_init failed: %d", ret);
+        return;
+    }
+    esp_gmf_pipeline_bind_task(s_pipe, s_work_task);
+    esp_gmf_task_set_timeout(s_work_task, 20000);
+    /* 注意：不在 init 时 loading_jobs！否则首次 pipeline_run 会跑旧 job（无 URI）导致卡死。
+     * 每次 _do_play 中 reset + set_in_uri + loading_jobs + run 即可。 */
+
+    /* ── 7. 设置事件回调 ── */
+    esp_gmf_pipeline_set_event(s_pipe, pipeline_event_cb, NULL);
+
+    /* ── 8. 起手音量 ── */
+    _my_vol_set(NULL, s_vol);
+
+    ESP_LOGI(TAG, "GMF audio pipeline ready (io_http → aud_dec → aud_alc → ch_cvt → bit_cvt → io_codec_dev)");
 }
 
 /* ─────────────────────── Rotary encoder ─────────────────────── */
@@ -1381,6 +1377,12 @@ static void ui_update_task(void *arg)
         ESP_LOGI(TAG, "UI: pos=%d dur=%d state=%d", pos_sec, s_dur_cache_sec, (int)get_state());
         lvgl_port_ui_set_progress(pos_sec, s_dur_cache_sec);
         lvgl_port_ui_set_state((int)get_state());
+        /* 音量变化检测：滑动时 SOAP 排队，这里 40ms 检测一次，只应用最新值 */
+        if (s_vol != s_last_applied_vol) {
+            int hw = s_mute ? 0 : s_vol;
+            _my_vol_set(NULL, hw);
+            s_last_applied_vol = s_vol;
+        }
         lvgl_port_ui_set_volume(s_vol);
 
         const lyric_data_t *lyr = lyrics_get_data();
@@ -1469,21 +1471,75 @@ static void ui_update_task(void *arg)
     }
 }
 
+/* ── WiFi 事件组 ── */
+static EventGroupHandle_t s_wifi_event_group;
+#define WIFI_CONNECTED_BIT BIT0
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data)
+{
+    (void)arg;
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGW(TAG, "WiFi disconnected, reconnecting...");
+        esp_wifi_connect();
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        ESP_LOGI(TAG, "WiFi connected, IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+static void wifi_init(void)
+{
+    s_wifi_event_group = xEventGroupCreate();
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    esp_event_handler_instance_t instance_any_id;
+    esp_event_handler_instance_t instance_got_ip;
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                        &wifi_event_handler, NULL, &instance_any_id));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                                        &wifi_event_handler, NULL, &instance_got_ip));
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = CONFIG_WIFI_SSID,
+            .password = CONFIG_WIFI_PASSWORD,
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+            .pmf_cfg.capable = false,
+            .pmf_cfg.required = false,
+        },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    /* 等待连接（最多 15 秒） */
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT,
+                                           pdFALSE, pdFALSE, pdMS_TO_TICKS(15000));
+    if (bits & WIFI_CONNECTED_BIT) {
+        ESP_LOGI(TAG, "WiFi connected");
+    } else {
+        ESP_LOGW(TAG, "WiFi connection timeout, continuing...");
+    }
+}
+
 /* ─────────────────────── Entry point ─────────────────────── */
 void app_main(void)
 {
     esp_log_level_set("*", ESP_LOG_INFO);
     esp_log_level_set(TAG, ESP_LOG_DEBUG);
-    esp_log_level_set("AUDIO_ELEMENT", ESP_LOG_WARN);
-    esp_log_level_set("AUDIO_PIPELINE", ESP_LOG_ERROR);
-    esp_log_level_set("ESP_AUDIO_CTRL", ESP_LOG_WARN);
-    /* 诊断卡顿：临时提高 HTTP/解码/内存日志级别 */
-    esp_log_level_set("HTTP_STREAM", ESP_LOG_DEBUG);
-    esp_log_level_set("ESP_AUDIO_TASK", ESP_LOG_DEBUG);
+    esp_log_level_set("ESP_GMF", ESP_LOG_WARN);
     esp_log_level_set("esp_http_client", ESP_LOG_DEBUG);
     esp_log_level_set("esp_netif_lwip", ESP_LOG_WARN);
     esp_log_level_set("LYRIC", ESP_LOG_DEBUG);
-    media_lib_add_default_adapter();
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES) {
@@ -1492,41 +1548,16 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-#if (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 1, 0))
     ESP_ERROR_CHECK(esp_netif_init());
-#else
-    tcpip_adapter_init();
-#endif
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     /* ── 状态互斥锁（必须在其他组件之前创建）── */
     s_state_mux = xSemaphoreCreateMutex();
 
-    /* ── WiFi
-     *   关键点：关闭省电模式 + 固定主机名，从 airplay-esp32 参考过来。
-     */
-    {
-        esp_periph_config_t periph_cfg = DEFAULT_ESP_PERIPH_SET_CONFIG();
-        esp_periph_set_handle_t set = esp_periph_set_init(&periph_cfg);
+    /* ── WiFi（直接 ESP-IDF API，无 ADF esp_peripherals）── */
+    wifi_init();
 
-        periph_wifi_cfg_t wifi_cfg = {
-            .wifi_config.sta.ssid = CONFIG_WIFI_SSID,
-            .wifi_config.sta.password = CONFIG_WIFI_PASSWORD,
-            .wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK,
-            .wifi_config.sta.pmf_cfg.capable = false,
-            .wifi_config.sta.pmf_cfg.required = false,
-            .wifi_config.sta.listen_interval = 1,
-            .reconnect_timeout_ms = 5000,
-            .disable_auto_reconnect = false,
-        };
-        esp_periph_handle_t wifi_handle = periph_wifi_init(&wifi_cfg);
-        esp_periph_start(set, wifi_handle);
-        periph_wifi_wait_for_connected(wifi_handle, pdMS_TO_TICKS(15000));
-        ESP_LOGI(TAG, "WiFi %s", periph_wifi_is_connected(wifi_handle) ? "connected" : "timeout, continuing...");
-    }
-
-    /* ── 主机名 + WiFi 协议/功耗
-     *   路由器 UI / mDNS / 网络邻居 里就能看到 "ESP32-S3-DLNA"。
-     */
+    /* ── 主机名 + WiFi 协议/功耗 ── */
     {
         esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
         if (sta_netif) esp_netif_set_hostname(sta_netif, "ESP32-S3-DLNA");
@@ -1539,9 +1570,7 @@ void app_main(void)
     /* ── 音频播放 ── */
     audio_player_init();
 
-    /* ── 采样率跟随（I2S 动态匹配源采样率，core1）── */
-    xTaskCreatePinnedToCore(audio_rate_follow_task, "rate_follow", 4096, NULL, 4, NULL, 1);
-
+        
     /* ── DLNA 服务（SSDP + HTTP + SOAP）── */
     start_dlna();
 

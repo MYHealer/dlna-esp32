@@ -15,25 +15,32 @@ list(APPEND COMPONENT_ADD_INCLUDEDIRS ./esp_audio/include
                             ./esp_new_jpeg/include
                             ./media_lib_sal/include
                             ./media_lib_sal/include/port
-                            ./esp_muxer/include)
+                            ./esp_muxer/include
+                            ./esp_audio_effects/include
+                            ./esp_audio_codec/include
+                            ./esp_audio_codec/include/simple_dec
+                            ./esp_audio_codec/include/encoder
+                            ./esp_audio_codec/include/encoder/impl
+                            ./esp_audio_codec/include/decoder
+                            ./esp_audio_codec/include/decoder/impl
+                            ./esp_muxer/include
+                            ./esp_muxer/include/impl)
 
 if (CONFIG_MEDIA_PROTOCOL_LIB_ENABLE)
     list(APPEND COMPONENT_ADD_INCLUDEDIRS  ./esp_media_protocols/include)
 endif()
 
-list(APPEND COMPONENT_SRCS ./esp_codec/audio_alc.c
-                    ./esp_codec/audio_sonic.c
-                    ./esp_codec/audio_forge.c
-                    ./esp_codec/downmix.c
-                    ./esp_codec/equalizer.c
-                    ./esp_codec/filter_resample.c
-                    ./esp_codec/wav_encoder.c
-                    ./media_lib_sal/media_lib_common.c
+list(APPEND COMPONENT_SRCS ./media_lib_sal/media_lib_common.c
                     ./media_lib_sal/media_lib_os.c
                     ./media_lib_sal/mem_trace/media_lib_mem_trace.c
                     ./media_lib_sal/mem_trace/media_lib_mem_his.c
                     ./media_lib_sal/port/media_lib_os_freertos.c
-                    ./media_lib_sal/media_lib_adapter.c)
+                    ./media_lib_sal/media_lib_adapter.c
+                    # esp_audio_codec 注册源文件（嵌套组件不被 IDF 发现，手工加入）
+                    # audio_encoder_reg.c 不需要（CONFIG_GMF_AUDIO_CODEC_INIT_ENCODER=n）
+                    # 且 sp_alac_enc.h 缺少 stdbool.h 导致编译失败
+                    ./esp_audio_codec/src/audio_decoder_reg.c
+                    ./esp_audio_codec/src/simple_decoder_reg.c)
 
 if (CONFIG_MEDIA_PROTOCOL_LIB_ENABLE)
 list(APPEND COMPONENT_SRCS ./media_lib_sal/media_lib_crypt.c  ./media_lib_sal/port/media_lib_crypt_default.c
@@ -43,7 +50,7 @@ list(APPEND COMPONENT_SRCS ./media_lib_sal/media_lib_crypt.c  ./media_lib_sal/po
 endif()
 
 
-set(COMPONENT_REQUIRES audio_pipeline audio_sal nghttp esp-tls esp_netif)
+set(COMPONENT_REQUIRES nghttp esp-tls esp_netif freertos)
 
 register_component()
 
@@ -64,7 +71,7 @@ if (CONFIG_MEDIA_PROTOCOL_LIB_ENABLE)
     list(APPEND TARGET_LIB_PATH  "-L ${CMAKE_CURRENT_SOURCE_DIR}/esp_media_protocols/lib/${CONFIG_IDF_TARGET}")
 endif()
 
-target_link_libraries(${COMPONENT_TARGET} "${TARGET_LIB_PATH}")
+target_link_libraries(${COMPONENT_TARGET} PRIVATE "${TARGET_LIB_PATH}")
 
 
 # GREATER_EQUAL is only available on CMake +3.7.
@@ -85,12 +92,21 @@ IF (IDF_VERSION_MAJOR GREATER 3)
                  PRIV_REQUIRES esp-adf-libs)
     add_prebuilt_library(esp_muxer "${CMAKE_CURRENT_SOURCE_DIR}/esp_muxer/lib/${CONFIG_IDF_TARGET}/libesp_muxer.a"
                  PRIV_REQUIRES esp-adf-libs)
+    add_prebuilt_library(esp_audio_effects "${CMAKE_CURRENT_SOURCE_DIR}/esp_audio_effects/lib/${CONFIG_IDF_TARGET}/libesp_audio_effects.a"
+                 PRIV_REQUIRES esp-adf-libs)
+    add_prebuilt_library(esp_audio_simple_dec "${CMAKE_CURRENT_SOURCE_DIR}/esp_audio_codec/lib/${CONFIG_IDF_TARGET}/libesp_audio_simple_dec.a"
+                 PRIV_REQUIRES esp-adf-libs)
+    add_prebuilt_library(esp_audio_codec_lib "${CMAKE_CURRENT_SOURCE_DIR}/esp_audio_codec/lib/${CONFIG_IDF_TARGET}/libesp_audio_codec.a"
+                 PRIV_REQUIRES esp-adf-libs)
 ENDIF (IDF_VERSION_MAJOR GREATER 3)
 
-set(TARGET_LIB_NAME esp_processing esp_audio esp_codec esp_new_jpeg esp_muxer ${esp_h264_name})
+set(TARGET_LIB_NAME esp_processing esp_audio esp_codec esp_new_jpeg esp_muxer esp_audio_effects esp_audio_simple_dec esp_audio_codec_lib ${esp_h264_name})
 if (CONFIG_MEDIA_PROTOCOL_LIB_ENABLE)
     list(APPEND TARGET_LIB_NAME esp_media_protocols)
 endif()
 
-target_link_libraries(${COMPONENT_TARGET}  "-Wl,--start-group" ${TARGET_LIB_NAME} "-Wl,--end-group")
+# PUBLIC 让依赖 esp-adf-libs 的组件（如 gmf_audio）能链接到预编译库
+# --allow-multiple-definition: 旧 libesp_codec.a 和新 libesp_audio_codec.a 都包含 FLAC 等解码器
+target_link_libraries(${COMPONENT_TARGET} PRIVATE "-Wl,--allow-multiple-definition")
+target_link_libraries(${COMPONENT_TARGET} PUBLIC "-Wl,--start-group" ${TARGET_LIB_NAME} "-Wl,--end-group")
 

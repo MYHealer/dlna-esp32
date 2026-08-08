@@ -1,91 +1,117 @@
 /*
- * ESPRESSIF MIT License
+ * I2S PA board — 裸 I2S 输出 (PCM5102A)
  *
- * Copyright (c) 2022 <ESPRESSIF SYSTEMS (SHANGHAI) CO., LTD>
- *
- * Permission is hereby granted for use on all ESPRESSIF SYSTEMS products, in which case,
- * it is free of charge, to any person obtaining a copy of this software and associated
- * documentation files (the "Software"), to deal in the Software without restriction, including
- * without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the Software is furnished
- * to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all copies or
- * substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
- * FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
- * COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
- * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
- * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
- *
+ * 绕过 esp_codec_dev（其软件音量默认 0 静音）。
+ * 直接初始化 I2S 并暴露 tx_handle，音量由 GMF ALC 软件控制。
  */
 
 #include "esp_log.h"
+#include "esp_err.h"
 #include "include/board.h"
 
-#include "board_def.h"
-#include "i2c_bus.h"
+#include "driver/i2s_std.h"
 
-#include "audio_mem.h"
-#include "periph_adc_button.h"
-#include "i2s_pa.h"
-#include "driver/i2c_master.h"
+static const char *TAG = "AUDIO_OUT";
 
-static const char *TAG = "AUDIO_BOARD";
+static i2s_chan_handle_t s_tx_handle = NULL;
+static bool s_initialized = false;
 
-static audio_board_handle_t board_handle = 0;
+i2s_chan_handle_t audio_out_get_tx_handle(void)
+{
+    return s_tx_handle;
+}
 
-audio_board_handle_t audio_board_init(void) {
-    ESP_LOGI(TAG, "std i2s pa codec init");
-    if (board_handle) {
-        ESP_LOGW(TAG, "The board has already been initialized!");
-        return board_handle;
+esp_codec_dev_handle_t audio_out_init(void)
+{
+    if (s_initialized) {
+        ESP_LOGW(TAG, "Already initialized");
+        return (esp_codec_dev_handle_t)s_tx_handle;
     }
 
-    board_handle = (audio_board_handle_t) audio_calloc(1, sizeof(struct audio_board_handle));
-    AUDIO_MEM_CHECK(TAG, board_handle, return NULL);
-    ESP_LOGI(TAG, "codec init");
-    board_handle->audio_hal = audio_board_codec_init();
-    ESP_LOGI(TAG, "enable pa");
-    return board_handle;
-}
+    /* ── 1. 创建 I2S TX 通道 ── */
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    chan_cfg.auto_clear = true;
+    esp_err_t ret = i2s_new_channel(&chan_cfg, &s_tx_handle, NULL);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "i2s_new_channel failed: %s", esp_err_to_name(ret));
+        return NULL;
+    }
 
-
-audio_hal_handle_t audio_board_adc_init(void) {
-    return NULL;
-}
-
-audio_hal_handle_t audio_board_codec_init(void) {
-    audio_hal_func_t std_i2s_pa_handle = {
-        .audio_codec_initialize = i2s_pa_initialize,
-        .audio_codec_deinitialize = i2s_pa_deinitialize,
-        .audio_codec_ctrl = i2s_pa_ctrl,
-        .audio_codec_config_iface = i2s_pa_config_iface,
-        .audio_codec_set_mute = i2s_pa_set_mute,
-        .audio_codec_set_volume = i2s_pa_set_volume,
-        .audio_codec_get_volume = i2s_pa_get_volume,
-        .audio_codec_enable_pa = i2s_pa_enable_pa,
-        .audio_hal_lock = NULL,
-        .handle = NULL,
+    /* ── 2. 初始化 I2S STD 模式 ── */
+    i2s_std_config_t std_cfg = {
+        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(48000),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
+                                                         I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = GPIO_I2S_MCLK,
+            .bclk = GPIO_I2S_SCLK,
+            .ws   = GPIO_I2S_LRCK,
+            .dout = GPIO_I2S_DOUT,
+            .din  = I2S_GPIO_UNUSED,
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv   = false,
+            },
+        },
     };
+    ret = i2s_channel_init_std_mode(s_tx_handle, &std_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "i2s_channel_init_std_mode failed: %s", esp_err_to_name(ret));
+        return NULL;
+    }
 
-    audio_hal_codec_config_t audio_codec_cfg = AUDIO_CODEC_DEFAULT_CONFIG();
-    audio_codec_cfg.codec_mode = AUDIO_HAL_CODEC_MODE_DECODE;
-    audio_hal_handle_t codec_hal = audio_hal_init(&audio_codec_cfg, &std_i2s_pa_handle);
-    AUDIO_NULL_CHECK(TAG, codec_hal, return NULL);
-    return codec_hal;
+    i2s_channel_enable(s_tx_handle);
+    s_initialized = true;
+    ESP_LOGI(TAG, "I2S STD TX enabled (MCLK=GPIO%d, BCK=GPIO%d, LRCK=GPIO%d, DOUT=GPIO%d)",
+             GPIO_I2S_MCLK, GPIO_I2S_SCLK, GPIO_I2S_LRCK, GPIO_I2S_DOUT);
+
+    /* 返回 dummy 非空指针，供 esp_gmf_io_codec_dev_set_dev 的 NULL 检查通过 */
+    return (esp_codec_dev_handle_t)s_tx_handle;
 }
 
-audio_board_handle_t audio_board_get_handle(void) {
-    return board_handle;
-}
+void audio_out_set_clk(esp_codec_dev_handle_t dev, int rate, int ch, int bits)
+{
+    (void)dev;
+    if (!s_tx_handle || !s_initialized) {
+        ESP_LOGW(TAG, "I2S not ready, skip clk reconfig");
+        return;
+    }
 
-esp_err_t audio_board_deinit(audio_board_handle_t audio_board) {
-    esp_err_t ret = ESP_OK;
-    ret |= audio_hal_deinit(audio_board->audio_hal);
-    audio_free(audio_board);
-    board_handle = NULL;
-    return ret;
+    /* 禁用通道 → 重配时钟/时隙 → 重新启用（原子操作，参考 FAKE_POD_NANO） */
+    esp_err_t ret = i2s_channel_disable(s_tx_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "i2s_channel_disable failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(rate);
+    /* 24-bit 需要 MCLK 384x 倍频，否则 BCLK 分频不整数导致采样率不精确 */
+    if (bits == 24) {
+        clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_384;
+    }
+    ret = i2s_channel_reconfig_std_clock(s_tx_handle, &clk_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "reconfig_std_clock(%d) failed: %s", rate, esp_err_to_name(ret));
+    }
+
+    i2s_data_bit_width_t bit_w;
+    switch (bits) {
+        case 24: bit_w = I2S_DATA_BIT_WIDTH_24BIT; break;
+        case 32: bit_w = I2S_DATA_BIT_WIDTH_32BIT; break;
+        default: bit_w = I2S_DATA_BIT_WIDTH_16BIT; break;
+    }
+    i2s_slot_mode_t slot_mode = (ch <= 1) ? I2S_SLOT_MODE_MONO : I2S_SLOT_MODE_STEREO;
+    i2s_std_slot_config_t slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(bit_w, slot_mode);
+    ret = i2s_channel_reconfig_std_slot(s_tx_handle, &slot_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "reconfig_std_slot failed: %s", esp_err_to_name(ret));
+    }
+
+    ret = i2s_channel_enable(s_tx_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "i2s_channel_enable failed: %s", esp_err_to_name(ret));
+    }
+
+    ESP_LOGI(TAG, "I2S reconfig: %d Hz, %d bit, %d ch", rate, bits, ch);
 }

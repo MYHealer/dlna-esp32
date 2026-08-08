@@ -55,3 +55,8 @@ config MEDIA_LIB_MEM_TRACE_SAVE_PATH
         Set memory trace save path
 
 endmenu
+
+# esp_audio_codec 是嵌套组件，其 Kconfig 不被 IDF 自动发现。
+# 这里手动引入，否则 AUDIO_DECODER_MP3_SUPPORT 等宏未定义，
+# 导致 GMF 解码器类型选择 GMF_AUDIO_CODEC_DECODER_TYPE_* 全部不可用。
+rsource "esp_audio_codec/Kconfig"

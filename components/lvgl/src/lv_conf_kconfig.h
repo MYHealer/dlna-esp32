@@ -14,6 +14,10 @@ extern "C" {
 #  ifdef ESP_PLATFORM
 #    include "sdkconfig.h"
 #    include "esp_attr.h"
+/* SPI 显示屏需要字节交换，在 lv_conf_internal.h 之前强制定义 */
+#    ifndef LV_COLOR_16_SWAP
+#      define LV_COLOR_16_SWAP 1
+#    endif
 #  endif
 
 #  ifdef __NuttX__

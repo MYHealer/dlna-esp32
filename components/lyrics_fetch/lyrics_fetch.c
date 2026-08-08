@@ -305,7 +305,7 @@ static unsigned long search_song(const char *title, const char *artist)
         ESP_LOGI(TAG, "song[%d]: id=%d name='%s'", s, song_id, song_name);
         if (song_id > 0 && best_id == 0) {
             best_id = song_id;
-            strncpy(best_name, song_name, sizeof(best_name) - 1);
+            snprintf(best_name, sizeof(best_name), "%s", song_name);
         }
 
         pos = obj_end;
@@ -553,8 +553,8 @@ static void fetch_task(void *arg)
     unsigned long known_id;
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    strncpy(title, data->song_name, sizeof(title) - 1);
-    strncpy(artist, data->artist, sizeof(artist) - 1);
+    snprintf(title, sizeof(title), "%s", data->song_name);
+    snprintf(artist, sizeof(artist), "%s", data->artist);
     known_id = data->known_song_id;
     xSemaphoreGive(s_mutex);
 

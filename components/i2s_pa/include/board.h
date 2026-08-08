@@ -1,93 +1,50 @@
 /*
- * ESPRESSIF MIT License
+ * I2S PA board — esp_codec_dev 初始化 (PCM5102A, 无 I2C 控制)
  *
- * Copyright (c) 2022 <ESPRESSIF SYSTEMS (SHANGHAI) CO., LTD>
- *
- * Permission is hereby granted for use on all ESPRESSIF SYSTEMS products, in which case,
- * it is free of charge, to any person obtaining a copy of this software and associated
- * documentation files (the "Software"), to deal in the Software without restriction, including
- * without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the Software is furnished
- * to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all copies or
- * substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
- * FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
- * COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
- * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
- * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
- *
+ * 替换原 ADF audio_hal/audio_board，使用 esp_codec_dev 直接管理 I2S。
+ * PCM5102A 无控制接口，codec_if=NULL，音量由 GMF ALC 软件控制。
  */
 
 #ifndef _AUDIO_BOARD_H_
 #define _AUDIO_BOARD_H_
 
-#define GPIO_PWR_CTRL       (GPIO_NUM_NC)
-
-#include "audio_element.h"
-#include "audio_hal.h"
 #include "board_def.h"
-#include "board_pins_config.h"
-#include "esp_peripherals.h"
-#include "display_service.h"
-#include "periph_sdcard.h"
-#include "periph_lcd.h"
+/* 仅保留 esp_codec_dev.h 用于 esp_codec_dev_handle_t 类型 */
+#include "esp_codec_dev.h"
+#include "driver/i2s_std.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /**
- * @brief Audio board handle
+ * @brief 获取 I2S TX 通道句柄（绕过 esp_codec_dev 直接写 I2S 时使用）
+ *
+ * @return i2s_chan_handle_t，未初始化返回 NULL
  */
-struct audio_board_handle {
-    audio_hal_handle_t audio_hal; /*!< audio hardware abstract layer handle */
-    audio_hal_handle_t adc_hal;   /*!< adc hardware abstract layer handle */
-};
-
-typedef struct audio_board_handle *audio_board_handle_t;
+i2s_chan_handle_t audio_out_get_tx_handle(void);
 
 /**
- * @brief Initialize audio board
+ * @brief 初始化 I2S + esp_codec_dev（PCM5102A 纯 I2S 输出）
  *
- * @return The audio board handle
+ * 内部创建 I2S STD TX 通道 + codec_dev handle。
+ * 返回的 handle 可直接传给 esp_gmf_io_codec_dev_set_dev()。
+ *
+ * @return esp_codec_dev_handle_t，失败返回 NULL
  */
-audio_board_handle_t audio_board_init(void);
+esp_codec_dev_handle_t audio_out_init(void);
 
 /**
- * @brief Initialize codec chip
+ * @brief 更新输出采样率（动态跟随源采样率时调用）
  *
- * @return The audio hal handle
+ * 内部调用 esp_codec_dev_open() 重新配置 I2S 格式参数。
+ *
+ * @param dev    codec_dev handle
+ * @param rate   新采样率 (Hz)
+ * @param ch     通道数 (1 or 2)
+ * @param bits   位深 (16/24/32)
  */
-audio_hal_handle_t audio_board_codec_init(void);
-
-/**
- * @brief Initialize adc
- *
- * @return The adc hal handle
- */
-audio_hal_handle_t audio_board_adc_init(void);
-
-
-/**
- * @brief Query audio_board_handle
- *
- * @return The audio board handle
- */
-audio_board_handle_t audio_board_get_handle(void);
-
-/**
- * @brief Uninitialize the audio board
- *
- * @param audio_board The handle of audio board
- *
- * @return  0       success,
- *          others  fail
- */
-esp_err_t audio_board_deinit(audio_board_handle_t audio_board);
+void audio_out_set_clk(esp_codec_dev_handle_t dev, int rate, int ch, int bits);
 
 #ifdef __cplusplus
 }
