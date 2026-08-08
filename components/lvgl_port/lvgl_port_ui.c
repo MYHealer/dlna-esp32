@@ -460,12 +460,16 @@ static void _generate_dithered_bg(uint8_t r_top, uint8_t g_top, uint8_t b_top,
 
     uint16_t *buf = (uint16_t *)s_bg_dsc->data;
 
-    /* 4x4 Bayer 矩阵 */
-    static const uint8_t bayer[16] = {
-         0,  8,  2, 10,
-        12,  4, 14,  6,
-         3, 11,  1,  9,
-        15,  7, 13,  5
+    /* 8x8 Bayer 矩阵（64 级阈值，比 4x4 更细腻，消除浅渐变色阶） */
+    static const uint8_t bayer[64] = {
+         0, 32,  8, 40,  2, 34, 10, 42,
+        48, 16, 56, 24, 50, 18, 58, 26,
+        12, 44,  4, 36, 14, 46,  6, 38,
+        60, 28, 52, 20, 62, 30, 54, 22,
+         3, 35, 11, 43,  1, 33,  9, 41,
+        51, 19, 59, 27, 49, 17, 57, 25,
+        15, 47,  7, 39, 13, 45,  5, 37,
+        63, 31, 55, 23, 61, 29, 53, 21
     };
 
     for (int y = 0; y < H; y++) {
@@ -474,12 +478,12 @@ static void _generate_dithered_bg(uint8_t r_top, uint8_t g_top, uint8_t b_top,
         int b8 = b_top + ((int)b_bot - b_top) * y / (H - 1);
 
         for (int x = 0; x < W; x++) {
-            int t = bayer[(y & 3) * 4 + (x & 3)];
+            int t = bayer[(y & 7) * 8 + (x & 7)];
 
-            /* 有序抖动量化到 RGB565 */
-            int r5 = (r8 * 31 + t * 2 + 128) / 256;
-            int g6 = (g8 * 63 + t * 4 + 128) / 256;
-            int b5 = (b8 * 31 + t * 2 + 128) / 256;
+            /* 有序抖动量化到 RGB565（8x8 矩阵，阈值范围 0-63） */
+            int r5 = (r8 * 31 + t + 32) / 64;
+            int g6 = (g8 * 63 + t * 2 + 32) / 64;
+            int b5 = (b8 * 31 + t + 32) / 64;
 
             if (r5 < 0) r5 = 0; else if (r5 > 31) r5 = 31;
             if (g6 < 0) g6 = 0; else if (g6 > 63) g6 = 63;
