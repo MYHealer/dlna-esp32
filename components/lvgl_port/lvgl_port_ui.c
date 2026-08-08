@@ -148,12 +148,12 @@ void lvgl_port_ui_create(void)
     lv_img_set_pivot(s_cover_img, 46, 46);  /* 中心 pivot */
     lv_obj_set_pos(s_cover_img, -22, -22);  /* 补偿偏移：46*(1-132/256)=22 */
 
-    /* ====== 唱片唱针（citou 68x141，zoom≈121 → 32x67） ====== */
+    /* ====== 唱片唱针（32x67 原尺寸，zoom=256 无缩放） ====== */
     s_img_citou = lv_img_create(scr);
     lv_img_set_src(s_img_citou, &ui_img_citou_png);
-    lv_img_set_zoom(s_img_citou, 121);
-    lv_img_set_pivot(s_img_citou, 50, 28);  /* 旋转轴心：唱针头部 */
-    lv_obj_set_pos(s_img_citou, 63, -8);    /* pivot 落在转盘右上缘 ≈(87,5) */
+    lv_img_set_zoom(s_img_citou, 256);
+    lv_img_set_pivot(s_img_citou, 28, 7);   /* 旋转轴心：唱针固定端（镜像自原版 11dip,15dip） */
+    lv_obj_set_pos(s_img_citou, 88, 7);    /* pivot 落在转盘右上缘 */
     lv_img_set_angle(s_img_citou, -200);    /* 初始抬起（停止位） */
 
     /* ====== 标题 ====== */
@@ -224,18 +224,32 @@ void lvgl_port_ui_create(void)
     /* 白色 2px 边框，聚焦时显示方形选择框 */
     lv_obj_set_style_border_width(s_btn_prev, 2, LV_STATE_FOCUSED);
     lv_obj_set_style_border_color(s_btn_prev, C_WHITE, LV_STATE_FOCUSED);
-    lv_obj_set_style_border_opa(s_btn_prev, LV_OPA_COVER, LV_STATE_FOCUSED);
-    lv_obj_set_style_radius(s_btn_prev, 0, LV_STATE_FOCUSED);
+    lv_obj_set_style_border_opa(s_btn_prev, LV_OPA_TRANSP, LV_STATE_FOCUSED);  /* 初始透明，渐显 */
+    lv_obj_set_style_radius(s_btn_prev, 6, LV_STATE_FOCUSED);
 
     lv_obj_set_style_border_width(s_btn_play, 2, LV_STATE_FOCUSED);
     lv_obj_set_style_border_color(s_btn_play, C_WHITE, LV_STATE_FOCUSED);
-    lv_obj_set_style_border_opa(s_btn_play, LV_OPA_COVER, LV_STATE_FOCUSED);
-    lv_obj_set_style_radius(s_btn_play, 0, LV_STATE_FOCUSED);
+    lv_obj_set_style_border_opa(s_btn_play, LV_OPA_TRANSP, LV_STATE_FOCUSED);
+    lv_obj_set_style_radius(s_btn_play, 6, LV_STATE_FOCUSED);
 
     lv_obj_set_style_border_width(s_btn_next, 2, LV_STATE_FOCUSED);
     lv_obj_set_style_border_color(s_btn_next, C_WHITE, LV_STATE_FOCUSED);
-    lv_obj_set_style_border_opa(s_btn_next, LV_OPA_COVER, LV_STATE_FOCUSED);
-    lv_obj_set_style_radius(s_btn_next, 0, LV_STATE_FOCUSED);
+    lv_obj_set_style_border_opa(s_btn_next, LV_OPA_TRANSP, LV_STATE_FOCUSED);
+    lv_obj_set_style_radius(s_btn_next, 6, LV_STATE_FOCUSED);
+
+    /* 按压反馈：按下时变暗，松开恢复（替代 scale，性能更优） */
+    static lv_style_transition_dsc_t press_tr;
+    static lv_style_prop_t press_props[] = { LV_STYLE_OPA, (lv_style_prop_t)0 };
+    lv_style_transition_dsc_init(&press_tr, press_props, lv_anim_path_ease_out, 120, 0, NULL);
+    lv_obj_set_style_transition(s_btn_prev, &press_tr, LV_STATE_PRESSED);
+    lv_obj_set_style_transition(s_btn_prev, &press_tr, LV_STATE_DEFAULT);
+    lv_obj_set_style_transition(s_btn_play, &press_tr, LV_STATE_PRESSED);
+    lv_obj_set_style_transition(s_btn_play, &press_tr, LV_STATE_DEFAULT);
+    lv_obj_set_style_transition(s_btn_next, &press_tr, LV_STATE_PRESSED);
+    lv_obj_set_style_transition(s_btn_next, &press_tr, LV_STATE_DEFAULT);
+    lv_obj_set_style_opa(s_btn_prev, LV_OPA_70, LV_STATE_PRESSED);
+    lv_obj_set_style_opa(s_btn_play, LV_OPA_70, LV_STATE_PRESSED);
+    lv_obj_set_style_opa(s_btn_next, LV_OPA_70, LV_STATE_PRESSED);
 
     /* 加入旋钮焦点组，默认焦点在播放/暂停 */
     lv_group_t *g = lv_group_get_default();
@@ -343,7 +357,7 @@ void lvgl_port_ui_set_progress(int position_sec, int duration_sec) {
         int dmin = duration_sec / 60, dsec = duration_sec % 60;
         int permille = position_sec * 1000 / duration_sec;
         if (permille > 1000) permille = 1000;
-        lv_bar_set_value(s_bar_progress, permille, LV_ANIM_OFF);
+        lv_bar_set_value(s_bar_progress, permille, LV_ANIM_ON);
         lv_label_set_text_fmt(s_label_time1, "%d:%02d", pmin, psec);
         lv_label_set_text_fmt(s_label_time2, "%d:%02d", dmin, dsec);
     } else {
@@ -383,7 +397,7 @@ static void _animate_citou(int target_angle)
     lv_anim_set_exec_cb(&a, _citou_anim_cb);
     lv_anim_set_values(&a, cur, end);
     lv_anim_set_time(&a, 100);                 /* 100ms 干脆利落 */
-    lv_anim_set_path_cb(&a, lv_anim_path_linear);    /* 匀速 */
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);    /* 快起慢停，模拟物理惯性 */
     lv_anim_start(&a);
 }
 
@@ -397,7 +411,7 @@ void lvgl_port_ui_set_state(int state) {
         lv_imgbtn_set_src(s_btn_play, LV_IMGBTN_STATE_RELEASED, NULL, &ui_img_zanting1_png, NULL);
         /* 播放：封面就绪后才放下唱针 + 旋转 */
         if (s_cover_ready) {
-            _animate_citou(110);   /* 唱针平滑放下 */
+            _animate_citou(70);    /* 唱针平滑放下（角度减小，不要抬太高） */
             if (s_cover_img && !lv_anim_get(s_cover_img, _cover_anim_cb)) {
                 int32_t cur = lv_img_get_angle(s_cover_img);
                 lv_anim_t a;
@@ -548,14 +562,16 @@ void lvgl_port_ui_lyrics_update(int current_idx, const char *prev, const char *c
         lv_anim_set_var(&a, s_lyrics_prev);
         lv_anim_set_exec_cb(&a, _opa_anim_cb);
         lv_anim_set_values(&a, LV_OPA_COVER, LV_OPA_TRANSP);
-        lv_anim_set_time(&a, 200);
+        lv_anim_set_time(&a, 150);               /* 退出更快 */
+        lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
         lv_anim_start(&a);
 
         lv_anim_init(&a);
         lv_anim_set_var(&a, s_lyrics_curr);
         lv_anim_set_exec_cb(&a, _opa_anim_cb);
         lv_anim_set_values(&a, LV_OPA_TRANSP, LV_OPA_COVER);
-        lv_anim_set_time(&a, 300);
+        lv_anim_set_time(&a, 250);               /* 进入稍慢 */
+        lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
         lv_anim_start(&a);
     }
 
@@ -725,13 +741,30 @@ void lvgl_port_ui_register_btn_prev_cb(lvgl_btn_cb_t cb) { s_cb_btn_prev = cb; }
 void lvgl_port_ui_register_btn_play_cb(lvgl_btn_cb_t cb) { s_cb_btn_play = cb; }
 void lvgl_port_ui_register_btn_next_cb(lvgl_btn_cb_t cb) { s_cb_btn_next = cb; }
 
+/* 焦点边框 opacity 动画回调 */
+static void _border_opa_anim_cb(void *obj, int32_t v)
+{
+    lv_obj_set_style_border_opa((lv_obj_t *)obj, (lv_opa_t)v, LV_STATE_FOCUSED);
+}
+
 /* ── 焦点框显示/隐藏（旋转显示，10s 无操作隐藏归位） ── */
 void lvgl_port_ui_set_focus_visible(bool visible)
 {
     ESP_LOGI(TAG, "set_focus_visible(%d)", (int)visible);
-    lv_obj_set_style_border_width(s_btn_prev, visible ? 2 : 0, LV_STATE_FOCUSED);
-    lv_obj_set_style_border_width(s_btn_play, visible ? 2 : 0, LV_STATE_FOCUSED);
-    lv_obj_set_style_border_width(s_btn_next, visible ? 2 : 0, LV_STATE_FOCUSED);
+    lv_opa_t target = visible ? LV_OPA_COVER : LV_OPA_TRANSP;
+    lv_obj_t *btns[] = { s_btn_prev, s_btn_play, s_btn_next };
+    for (int i = 0; i < 3; i++) {
+        lv_anim_del(btns[i], _border_opa_anim_cb);
+        lv_opa_t cur = lv_obj_get_style_border_opa(btns[i], LV_STATE_FOCUSED);
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, btns[i]);
+        lv_anim_set_exec_cb(&a, _border_opa_anim_cb);
+        lv_anim_set_values(&a, cur, target);
+        lv_anim_set_time(&a, 100);
+        lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+        lv_anim_start(&a);
+    }
 }
 
 void lvgl_port_ui_focus_play(void)
