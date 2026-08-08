@@ -58,6 +58,15 @@ int lyrics_get_current_line(int position_ms);
 int lyrics_get_karaoke_progress(int line_start_ms, int pos_ms);
 
 /**
+ * @brief 获取逐字高亮的字节偏移（精确到当前字）
+ * @param line_idx      当前 LRC 行索引
+ * @param line_text     当前 LRC 行文本
+ * @param pos_ms        当前播放位置（毫秒）
+ * @return 当前字在 line_text 中的字节偏移，-1 表示无数据
+ */
+int lyrics_get_karaoke_byte_idx(int line_idx, const char *line_text, int pos_ms);
+
+/**
  * @brief 获取歌词数据（只读指针）
  */
 const lyric_data_t *lyrics_get_data(void);

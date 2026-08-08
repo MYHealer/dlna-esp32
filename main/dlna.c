@@ -1407,37 +1407,25 @@ static void ui_update_task(void *arg)
 
             /* 每 tick 更新逐字高亮（karaoke） */
             if (cur >= 0 && cur < lyr->count && curr[0]) {
-                int total_chars = utf8_char_count(curr);
-                int progress;
-                /* 优先用 klyric 逐字时间轴，精确到毫秒 */
-                int kprog = lyrics_get_karaoke_progress(lyr->lines[cur].time_ms, pos_ms);
-                if (kprog >= 0) {
-                    progress = kprog;
-                } else {
-                    /* 回退到字数估算，避免伴奏停顿拖慢高亮 */
-                    static bool s_klyric_warned = false;
-                    if (!s_klyric_warned) {
-                        s_klyric_warned = true;
-                        ESP_LOGW(TAG, "klyric: NOT AVAILABLE for line=%d/%d pos=%d (fallback to estimation)",
-                            cur, lyr->count, pos_ms);
-                    }
-                    /* 按行时长估算演唱时长，自适应歌曲节奏 */
+                /* 优先用精确字节偏移（klyric/pseudo-klyric 逐字时间戳） */
+                int byte_idx = lyrics_get_karaoke_byte_idx(cur, curr, pos_ms);
+                if (byte_idx < 0) {
+                    /* 回退到百分比估算 */
+                    int total_chars = utf8_char_count(curr);
                     int line_start = lyr->lines[cur].time_ms;
                     int line_end = (cur + 1 < lyr->count)
                         ? lyr->lines[cur + 1].time_ms
                         : s_dur_cache_sec * 1000;
                     if (line_end <= line_start) line_end = line_start + 5000;
                     int line_dur = line_end - line_start;
-                    /* 用行时长的 80% 估算，快歌行短自动快，慢歌行长安逸 */
-                    /* 慢歌高亮完最后一字应接近下一句出现，避免干等 */
                     int est_sing = line_dur * 80 / 100;
                     if (est_sing < 800) est_sing = 800;
-                    progress = (pos_ms - line_start) * 100 / est_sing;
+                    int progress = (pos_ms - line_start) * 100 / est_sing;
+                    if (progress < 0) progress = 0;
+                    if (progress > 100) progress = 100;
+                    int char_idx = total_chars * progress / 100;
+                    byte_idx = utf8_byte_offset(curr, char_idx);
                 }
-                if (progress < 0) progress = 0;
-                if (progress > 100) progress = 100;
-                int char_idx = total_chars * progress / 100;
-                int byte_idx = utf8_byte_offset(curr, char_idx);
                 lvgl_port_ui_lyrics_karaoke(byte_idx);
             }
         } else {
