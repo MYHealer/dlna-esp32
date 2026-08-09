@@ -31,6 +31,8 @@ esp_codec_dev_handle_t audio_out_init(void)
     /* ── 1. 创建 I2S TX 通道 ── */
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     chan_cfg.auto_clear = true;
+    chan_cfg.dma_desc_num = 8;
+    chan_cfg.dma_frame_num = 512;
     esp_err_t ret = i2s_new_channel(&chan_cfg, &s_tx_handle, NULL);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "i2s_new_channel failed: %s", esp_err_to_name(ret));

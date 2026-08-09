@@ -95,6 +95,7 @@ static char          *s_playing_uri       = NULL; /* 当前音频管道实际加
  * 软件位置接近曲末但底层未触发 FINISHED 时的兜底，避免控制器等不到 STOPPED 不切歌 */
 static int            s_near_end_count    = 0;   /* 连续接近曲末的 tick 数 */
 static bool           s_finish_notify_spawned = false; /* 防重复触发播完处理 */
+static volatile int   s_album_art_gen = 0;  /* 封面任务代次，切歌时递增取消旧任务 */
 
 
 /* ── 工具：获取字符串形式的 DLNA 状态 ── */
@@ -321,30 +322,6 @@ static int cb_get_duration_sec(void)
 static int cb_get_volume(void) { return s_mute ? 0 : s_vol; }
 static int cb_get_mute(void)   { return s_mute; }
 
-/* ── 音量防抖：滑动时只应用最终值 ── */
-static esp_timer_handle_t s_vol_debounce = NULL;
-static int s_vol_pending = -1;
-
-static void _vol_debounce_cb(void *arg)
-{
-    (void)arg;
-    if (s_alc_el && s_vol_pending >= 0) {
-        int vol = s_vol_pending;
-        int alc_gain;
-        if (vol <= 0) {
-            alc_gain = -64;  /* 静音 */
-        } else {
-            int diff = 100 - vol;
-            alc_gain = -(diff * diff * 30) / 10000;
-            if (alc_gain < -64) alc_gain = -64;
-        }
-        esp_gmf_alc_set_gain(s_alc_el, 0, (int8_t)alc_gain);
-        esp_gmf_alc_set_gain(s_alc_el, 1, (int8_t)alc_gain);
-        ESP_LOGI(TAG, "vol=%d -> alc_gain=%d", vol, alc_gain);
-        s_vol_pending = -1;
-    }
-}
-
 /* ── 自定义 vol_set：映射 0-100 到 ALC 增益
  *    平方曲线：低音量时下降更慢，保留更多有效位
  *    vol=100 → 0dB, vol=50 → -7.5dB, vol=0 → -64dB（静音）
@@ -360,8 +337,7 @@ static esp_err_t _my_vol_set(void *handle, int volume)
         alc_gain = -(diff * diff * 30) / 10000;
         if (alc_gain < -64) alc_gain = -64;
     }
-    esp_gmf_alc_set_gain(s_alc_el, 0, (int8_t)alc_gain);
-    esp_gmf_alc_set_gain(s_alc_el, 1, (int8_t)alc_gain);
+    esp_gmf_alc_set_gain_all(s_alc_el, (int8_t)alc_gain);
     ESP_LOGD(TAG, "vol=%d -> alc_gain=%d", volume, alc_gain);
     return ESP_OK;
 }
@@ -494,11 +470,12 @@ static void cb_play(void)
             ESP_LOGI(TAG, "Play while playing, same URL, ignored");
             return;
         }
-        ESP_LOGI(TAG, "Play while playing, new URL, switching");
+        ESP_LOGI(TAG, "Play while playing, new URL, switching (saved_pos=%d)", s_saved_pos_sec);
         s_user_stopped = 0;  /* 防止旧管线 PAUSED 事件误触发暂停状态 */
         esp_gmf_pipeline_stop(s_pipe);
-        vTaskDelay(pdMS_TO_TICKS(50));
-        _do_play(s_track_uri, 0);
+        vTaskDelay(pdMS_TO_TICKS(10));
+        _do_play(s_track_uri, s_saved_pos_sec);
+        s_saved_pos_sec = 0;
         return;
     }
 
@@ -507,11 +484,12 @@ static void cb_play(void)
         bool uri_changed = s_playing_uri && s_track_uri
                           && strcmp(s_playing_uri, s_track_uri) != 0;
         if (uri_changed) {
-            ESP_LOGI(TAG, "URI changed while paused, switching to new track");
+            ESP_LOGI(TAG, "URI changed while paused, switching to new track (saved_pos=%d)", s_saved_pos_sec);
             s_user_stopped = 0;  /* 防止旧管线 PAUSED 事件误触发暂停状态 */
             esp_gmf_pipeline_stop(s_pipe);
-            vTaskDelay(pdMS_TO_TICKS(50));
-            _do_play(s_track_uri, 0);
+            vTaskDelay(pdMS_TO_TICKS(10));
+            _do_play(s_track_uri, s_saved_pos_sec);
+            s_saved_pos_sec = 0;
         } else {
             /* 同 URI 恢复暂停 */
             esp_gmf_pipeline_resume(s_pipe);
@@ -944,9 +922,16 @@ static void album_art_task(void *arg)
 {
     const char *url = (const char *)arg;
     if (!url) { free(arg); vTaskDelete(NULL); return; }
+    int my_gen = s_album_art_gen;
 
-    /* 等音频管线稳定 */
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    /* 等音频管线稳定（1 秒足够首帧解码 + I2S 配置） */
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    /* 切歌后新任务已启动，放弃本次下载 */
+    if (s_album_art_gen != my_gen) {
+        ESP_LOGI(TAG, "Cover task cancelled (gen mismatch)");
+        free(arg); vTaskDelete(NULL); return;
+    }
 
     uint8_t *img_data = NULL;
     int img_len = 0;
@@ -955,6 +940,12 @@ static void album_art_task(void *arg)
         free(arg);
         vTaskDelete(NULL);
         return;
+    }
+
+    /* 再次检查：下载期间可能切歌了 */
+    if (s_album_art_gen != my_gen) {
+        ESP_LOGI(TAG, "Cover task cancelled after download");
+        heap_caps_free(img_data); free(arg); vTaskDelete(NULL); return;
     }
 
     /* 检测图片格式并解码 */
@@ -1141,9 +1132,10 @@ static void fetch_album_art_async(const char *url)
 {
     char *url_copy = strdup(url);
     if (!url_copy) return;
+    s_album_art_gen++;  /* 递增代次，旧任务会自行退出 */
     /* Core 1: 与 WiFi (Core 0) 完全隔离，避免争抢内部 RAM */
     BaseType_t ret = xTaskCreatePinnedToCore(album_art_task, "album_art",
-        8 * 1024, url_copy, 1, NULL, 1);  /* 最低优先级，避免与音频管线争抢 CPU */
+        8 * 1024, url_copy, 1, NULL, 1);
     if (ret != pdPASS) {
         ESP_LOGW(TAG, "album_art task create failed: %d", ret);
         free(url_copy);
@@ -1360,7 +1352,9 @@ static void ui_update_task(void *arg)
     int tick = 0;
     int last_cur_line = -1;
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(40));
+        play_state_t ui_state = get_state();
+        /* 空闲态降频到 2Hz，播放态保持 25Hz */
+        vTaskDelay(pdMS_TO_TICKS((ui_state == PS_PLAYING || ui_state == PS_PAUSED) ? 40 : 500));
 
         lvgl_port_lock();
 
