@@ -45,7 +45,7 @@ static void parse_klyric(const char *klyric_text);
 
 /* ── HTTP 响应缓冲 ── */
 #define HTTP_SEARCH_BUF   2048
-#define HTTP_LYRIC_BUF    16384
+#define HTTP_LYRIC_BUF    32768
 
 typedef struct {
     char    *buf;
@@ -135,6 +135,9 @@ static char *http_request(const char *url, const char *post_data,
     }
 
     int status = esp_http_client_get_status_code(client);
+    int content_length = esp_http_client_get_content_length(client);
+    ESP_LOGI(TAG, "HTTP status=%d, content_length=%d, received=%d",
+             status, content_length, ctx.len);
     esp_http_client_cleanup(client);
 
     if (status != 200) {

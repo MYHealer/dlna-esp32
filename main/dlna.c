@@ -495,6 +495,7 @@ static void cb_play(void)
             return;
         }
         ESP_LOGI(TAG, "Play while playing, new URL, switching");
+        s_user_stopped = 0;  /* 防止旧管线 PAUSED 事件误触发暂停状态 */
         esp_gmf_pipeline_stop(s_pipe);
         vTaskDelay(pdMS_TO_TICKS(50));
         _do_play(s_track_uri, 0);
@@ -507,6 +508,7 @@ static void cb_play(void)
                           && strcmp(s_playing_uri, s_track_uri) != 0;
         if (uri_changed) {
             ESP_LOGI(TAG, "URI changed while paused, switching to new track");
+            s_user_stopped = 0;  /* 防止旧管线 PAUSED 事件误触发暂停状态 */
             esp_gmf_pipeline_stop(s_pipe);
             vTaskDelay(pdMS_TO_TICKS(50));
             _do_play(s_track_uri, 0);
@@ -576,9 +578,9 @@ static void cb_stop(void)
     s_saved_pos_sec = s_accumulated_ms / 1000;
     free(s_saved_uri);
     s_saved_uri = s_track_uri ? strdup(s_track_uri) : NULL;
+    s_user_stopped = 1;
     if (s_pipe) esp_gmf_pipeline_stop(s_pipe);
     set_state(PS_STOPPED);
-    s_user_stopped = 1;
     free(s_next_uri); s_next_uri = NULL;
     free(s_next_metadata); s_next_metadata = NULL;
     ESP_LOGI(TAG, "Stopped at %d ms", s_accumulated_ms);
@@ -674,6 +676,7 @@ static bool is_video_uri(const char *uri)
 static void cb_next(void) {
     ESP_LOGI(TAG, "Next (next_uri=%s) state=%d", s_next_uri ? s_next_uri : "(null)", (int)get_state());
     int was_paused = (get_state() == PS_PAUSED);
+    s_user_stopped = 0;  /* 防止旧管线 PAUSED 事件误触发暂停状态 */
     s_accumulated_ms = 0;
     s_play_start_us = 0;
     s_saved_pos_sec = 0;
@@ -717,6 +720,7 @@ static void cb_previous(void) {
     s_finish_notify_spawned = false;
     s_near_end_count = 0;
     ESP_LOGI(TAG, "Previous");
+    s_user_stopped = 0;  /* 防止旧管线 PAUSED 事件误触发暂停状态 */
     s_accumulated_ms = 0;
     s_play_start_us = 0;
     s_saved_pos_sec = 0;
