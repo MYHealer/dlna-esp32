@@ -85,6 +85,8 @@ static char         *s_next_uri          = NULL;
 static char         *s_next_metadata     = NULL;
 /* 用户主动停止标志 */
 static int           s_user_stopped      = 0;
+/* 卡住暂停检测：记录非用户暂停的起始时间 */
+static int64_t       s_stuck_paused_since = 0;
 /* 歌词 UI 清除请求（新歌切歌时，UI 任务处理） */
 static volatile bool s_lyrics_ui_clear_pending = false;
 /* 位置追踪：纯软件方案（参考 miair-next） */
@@ -160,6 +162,11 @@ static esp_gmf_err_t pipeline_event_cb(esp_gmf_event_pkt_t *event, void *ctx)
                 if (s_user_stopped) set_state(PS_PAUSED);
                 break;
             case ESP_GMF_EVENT_STATE_STOPPED:
+                /* Grace 保护期内忽略降级事件（旧管线的残留事件） */
+                if (esp_timer_get_time() < s_grace_until) {
+                    ESP_LOGD(TAG, "STOPPED ignored (grace period)");
+                    break;
+                }
                 if (get_state() != PS_PAUSED) set_state(PS_STOPPED);
                 break;
             case ESP_GMF_EVENT_STATE_FINISHED:
@@ -167,6 +174,10 @@ static esp_gmf_err_t pipeline_event_cb(esp_gmf_event_pkt_t *event, void *ctx)
                 xTaskCreatePinnedToCore(delayed_stop_notify, "stop_dly", 3072, NULL, 5, NULL, 1);
                 break;
             case ESP_GMF_EVENT_STATE_ERROR:
+                if (esp_timer_get_time() < s_grace_until) {
+                    ESP_LOGD(TAG, "ERROR ignored (grace period)");
+                    break;
+                }
                 set_state(PS_STOPPED);
                 break;
             default:
@@ -389,7 +400,8 @@ static void cb_set_uri(const char *uri)
     ESP_LOGI(TAG, "SetURI: %s", s_track_uri ? s_track_uri : "(null)");
 }
 
-/* ── 播完处理：支持 next_uri 自动切换 + 防重复触发 ── */
+/* ── 播完处理（参考 miair-next next_track()）──
+ * FINISHED 事件 → 冻结位置 → 转交给 cb_next() 统一处理 */
 static void delayed_stop_notify(void *arg)
 {
     (void)arg;
@@ -402,23 +414,7 @@ static void delayed_stop_notify(void *arg)
         s_play_start_us = 0;
     }
 
-    /* 有预载的下一首 → 自动续播（参考 miair-next _check_play_status） */
-    if (s_next_uri && s_next_uri[0]) {
-        ESP_LOGI(TAG, "Track finished, auto-playing next: %s", s_next_uri);
-        s_accumulated_ms = 0;
-        s_near_end_count = 0;
-        s_finish_notify_spawned = false;
-        cb_next();
-        vTaskDelete(NULL);
-        return;
-    }
-
-    /* 否则发 STOPPED，让控制器推下一首 */
-    set_state(PS_STOPPED);
-    ESP_LOGI(TAG, "Track finished -> STOPPED (dur=%d ms)", s_accumulated_ms);
-    s_accumulated_ms = 0;
-    s_near_end_count = 0;
-    s_finish_notify_spawned = false;
+    cb_next();
     vTaskDelete(NULL);
 }
 
@@ -471,9 +467,10 @@ static void cb_play(void)
             return;
         }
         ESP_LOGI(TAG, "Play while playing, new URL, switching (saved_pos=%d)", s_saved_pos_sec);
-        s_user_stopped = 0;  /* 防止旧管线 PAUSED 事件误触发暂停状态 */
+        s_user_stopped = 0;
+        s_grace_until = esp_timer_get_time() + 1500000LL;
         esp_gmf_pipeline_stop(s_pipe);
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(1000));
         _do_play(s_track_uri, s_saved_pos_sec);
         s_saved_pos_sec = 0;
         return;
@@ -485,9 +482,10 @@ static void cb_play(void)
                           && strcmp(s_playing_uri, s_track_uri) != 0;
         if (uri_changed) {
             ESP_LOGI(TAG, "URI changed while paused, switching to new track (saved_pos=%d)", s_saved_pos_sec);
-            s_user_stopped = 0;  /* 防止旧管线 PAUSED 事件误触发暂停状态 */
+            s_user_stopped = 0;
+            s_grace_until = esp_timer_get_time() + 1500000LL;
             esp_gmf_pipeline_stop(s_pipe);
-            vTaskDelay(pdMS_TO_TICKS(10));
+            vTaskDelay(pdMS_TO_TICKS(1000));
             _do_play(s_track_uri, s_saved_pos_sec);
             s_saved_pos_sec = 0;
         } else {
@@ -557,6 +555,9 @@ static void cb_stop(void)
     free(s_saved_uri);
     s_saved_uri = s_track_uri ? strdup(s_track_uri) : NULL;
     s_user_stopped = 1;
+    /* 宽限期：抑制 pipeline_stop 触发的中间 STOPPED 事件
+     * 网易云流程: Stop → SetAVTransportURI → Play，可能间隔很短 */
+    s_grace_until = esp_timer_get_time() + 2000000LL;
     if (s_pipe) esp_gmf_pipeline_stop(s_pipe);
     set_state(PS_STOPPED);
     free(s_next_uri); s_next_uri = NULL;
@@ -627,11 +628,14 @@ static void cb_set_mute(int m)
     apply_volume_hw();
 }
 
-/* ── 视频过滤：检测 URI 是否指向视频文件 ── */
+/* ── 视频过滤：检测 URI 是否指向视频文件 ──
+ * 注意：网易云 DLNA 投屏用 video/flv MIME + object.item.videoItem，
+ * 但实际是纯音频流通过本地代理转发。只检查明确的视频文件扩展名。 */
 static bool is_video_uri(const char *uri)
 {
     if (!uri) return false;
-    const char *exts[] = { ".mp4", ".mov", ".avi", ".mkv", ".flv", ".wmv",
+    /* 只过滤明确的视频容器格式，不包含 .flv（网易云用 FLV 封装音频） */
+    const char *exts[] = { ".mp4", ".mov", ".avi", ".mkv", ".wmv",
                            ".m4v", ".3gp", ".ts", ".mts", ".m2ts", NULL };
     /* 找到 URI 的路径部分（跳过 scheme://host） */
     const char *path = strstr(uri, "://");
@@ -646,45 +650,54 @@ static bool is_video_uri(const char *uri)
             if (strncasecmp(tail, exts[i], elen) == 0) return true;
         }
     }
-    if (strstr(uri, "video/")) return true;
     return false;
 }
 
-/* Next / Previous */
+/* Next — 严格对齐 miair-next next_track() 流程 */
 static void cb_next(void) {
     ESP_LOGI(TAG, "Next (next_uri=%s) state=%d", s_next_uri ? s_next_uri : "(null)", (int)get_state());
-    int was_paused = (get_state() == PS_PAUSED);
-    s_user_stopped = 0;  /* 防止旧管线 PAUSED 事件误触发暂停状态 */
+    s_user_stopped = 0;
     s_accumulated_ms = 0;
     s_play_start_us = 0;
     s_saved_pos_sec = 0;
     free(s_saved_uri); s_saved_uri = NULL;
+    s_near_end_count = 0;
+    s_finish_notify_spawned = false;
+
     if (s_next_uri && s_next_uri[0]) {
-        char *next_meta = s_next_metadata;
+        /* ── 有 next_uri：stop → sleep 1.0s → promote → play ── */
+        /* 设置宽限期，抑制 pipeline_stop 触发的中间 STOPPED 事件通知控制器
+         * （参考项目 notify_state_change() 只在最终状态后调用） */
+        s_grace_until = esp_timer_get_time() + 1500000LL;
         if (s_pipe) {
             esp_gmf_pipeline_stop(s_pipe);
         }
+        /* 增加延迟到 1.0s，确保完全停止播放并清空硬件缓存（对齐参考项目） */
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        /* 更新播放信息：next → current */
         free(s_track_uri);
         s_track_uri = s_next_uri;
         s_next_uri = NULL;
+        char *next_meta = s_next_metadata;
         s_next_metadata = NULL;
+
         if (s_pipe) {
             /* _do_play 会探测格式→配置 I2S→reset→loading_jobs→run */
             _do_play(s_track_uri, 0);
-            if (was_paused) {
-                vTaskDelay(pdMS_TO_TICKS(300));
-                esp_gmf_pipeline_pause(s_pipe);
-                set_state(PS_PAUSED);
-            }
         }
         custom_dlna_update_uri(s_track_uri, next_meta);
         free(next_meta);
     } else {
-        /* 无 next_uri → 模拟自然播完（参考 miair-next next_track()）：
-         * 位置设到曲末 + STOPPED，控制端判定自然结束自动推下一首 */
+        /* ── 无 next_uri：stop → sleep 0.5s → 位置设到曲末 → STOPPED ── */
+        /* 同样抑制中间 STOPPED 事件 */
+        s_grace_until = esp_timer_get_time() + 1000000LL;
         if (s_pipe) {
             esp_gmf_pipeline_stop(s_pipe);
         }
+        /* 短暂延迟，确保完全停止播放（对齐参考项目 0.5s） */
+        vTaskDelay(pdMS_TO_TICKS(500));
+
         if (s_dur_cache_sec > 0) {
             s_accumulated_ms = s_dur_cache_sec * 1000;  /* 位置=曲末 */
         }
@@ -698,14 +711,14 @@ static void cb_previous(void) {
     s_finish_notify_spawned = false;
     s_near_end_count = 0;
     ESP_LOGI(TAG, "Previous");
-    s_user_stopped = 0;  /* 防止旧管线 PAUSED 事件误触发暂停状态 */
+    s_user_stopped = 0;
     s_accumulated_ms = 0;
     s_play_start_us = 0;
     s_saved_pos_sec = 0;
     free(s_saved_uri); s_saved_uri = NULL;
     if (s_pipe && s_track_uri) {
+        s_grace_until = esp_timer_get_time() + 1000000LL;
         esp_gmf_pipeline_stop(s_pipe);
-        vTaskDelay(pdMS_TO_TICKS(200));
         _do_play(s_track_uri, 0);
     } else {
         if (s_pipe) esp_gmf_pipeline_stop(s_pipe);
@@ -1432,11 +1445,14 @@ static void ui_update_task(void *arg)
 
         /* ── 主动播完检测（参考 miair-next _check_play_status）──
          * 软件位置接近曲末但底层未触发 FINISHED 时的兜底。
-         * 连续 30 tick（~1.2s）剩余 <1.5s 时触发。 */
+         * 对齐参考项目：剩余 <1.0s，连续 2 次检测（≈2s 窗口，25Hz 下 50 tick）。 */
         if (get_state() == PS_PLAYING && s_dur_cache_sec > 0 && !s_finish_notify_spawned) {
             int remain_ms = s_dur_cache_sec * 1000 - get_position_ms();
-            if (remain_ms < 1500) {
-                if (++s_near_end_count >= 30) {
+            if (remain_ms <= 0) {
+                /* remain_ms <= 0 说明已到曲末或时长被下一首覆盖，跳过 */
+                s_near_end_count = 0;
+            } else if (remain_ms < 1000) {
+                if (++s_near_end_count >= 50) {
                     s_near_end_count = 0;
                     ESP_LOGI(TAG, "Software near-end detected (remain=%d), forcing completion", remain_ms);
                     xTaskCreatePinnedToCore(delayed_stop_notify, "stop_dly", 3072, NULL, 5, NULL, 1);
@@ -1446,6 +1462,21 @@ static void ui_update_task(void *arg)
             }
         } else {
             s_near_end_count = 0;
+        }
+
+        /* ── 卡住暂停检测（参考 miair-next stuck-paused）──
+         * 非用户暂停超过 30 秒 → 自动复位到 STOPPED */
+        if (get_state() == PS_PAUSED && !s_user_stopped) {
+            if (s_stuck_paused_since == 0) {
+                s_stuck_paused_since = esp_timer_get_time();
+            } else if ((esp_timer_get_time() - s_stuck_paused_since) > 30000000LL) {
+                ESP_LOGW(TAG, "Stuck paused for 30s, resetting to STOPPED");
+                if (s_pipe) esp_gmf_pipeline_stop(s_pipe);
+                set_state(PS_STOPPED);
+                s_stuck_paused_since = 0;
+            }
+        } else {
+            s_stuck_paused_since = 0;
         }
 
         /* 每 tick 缓慢左移当前行 */
@@ -1469,11 +1500,27 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         ESP_LOGW(TAG, "WiFi disconnected, reconnecting...");
+        xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        /* WiFi 断连时暂停播放（避免管线报错），重连后自动恢复 */
+        if (s_pipe && get_state() == PS_PLAYING) {
+            ESP_LOGW(TAG, "WiFi lost, pausing playback");
+            esp_gmf_pipeline_pause(s_pipe);
+            set_state(PS_PAUSED);
+            s_user_stopped = 0;  /* 标记为非用户主动暂停 */
+            s_stuck_paused_since = esp_timer_get_time();
+        }
         esp_wifi_connect();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "WiFi connected, IP: " IPSTR, IP2STR(&event->ip_info.ip));
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        /* WiFi 恢复后自动恢复播放 */
+        if (s_pipe && get_state() == PS_PAUSED && !s_user_stopped) {
+            ESP_LOGI(TAG, "WiFi restored, resuming playback");
+            esp_gmf_pipeline_resume(s_pipe);
+            set_state(PS_PLAYING);
+            s_play_start_us = esp_timer_get_time();
+        }
     }
 }
 

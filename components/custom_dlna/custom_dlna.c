@@ -457,7 +457,7 @@ static void cleanup_stale_subscriptions(void)
 static int find_sub_by_sid(const char *sid)
 {
     for (int i = 0; i < MAX_SUBSCRIBERS; i++) {
-        if (s_subs[i].url[0] != '\0' && strcmp(s_subs[i].sid, sid) == 0)
+        if (s_subs[i].sid[0] != '\0' && strcmp(s_subs[i].sid, sid) == 0)
             return i;
     }
     return -1;
@@ -486,7 +486,7 @@ void custom_dlna_notify_transport_state(void)
      * 精简事件（对齐 miair-next）：只发 TransportState。
      * 不夹带 CurrentTrackDuration/CurrentTrackURI 等值 —— 播放中
      * esp_audio_duration_get 返回错误值会导致 controller 处理异常。 */
-    int n = snprintf(buf, 4096,
+    int n = snprintf(buf, 1024,
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
         "<e:propertyset xmlns:e=\"urn:schemas-upnp-org:event-1-0\">"
         "<e:property><LastChange>"
@@ -853,7 +853,22 @@ static esp_err_t event_handler(httpd_req_t *req)
             int idx = find_sub_by_sid(sid);
             if (idx >= 0) {
                 s_subs[idx].expiry_time = esp_timer_get_time() / 1000000 + SUB_TIMEOUT_SEC;
-                ESP_LOGI(TAG, "SUBSCRIBE renewed: SID=%s (slot %d)", sid, idx);
+                /* Renewal 也可能带 CALLBACK 头，更新 URL（URL 可能被清理过） */
+                size_t cb_len = httpd_req_get_hdr_value_len(req, "CALLBACK");
+                if (cb_len > 0 && cb_len < 255) {
+                    char cb[256];
+                    httpd_req_get_hdr_value_str(req, "CALLBACK", cb, sizeof(cb));
+                    char *url = cb;
+                    if (url[0] == '<') url++;
+                    char *end = strchr(url, '>');
+                    if (end) *end = '\0';
+                    if (url[0] && strcmp(s_subs[idx].url, url) != 0) {
+                        snprintf(s_subs[idx].url, sizeof(s_subs[idx].url), "%s", url);
+                        ESP_LOGI(TAG, "SUBSCRIBE URL updated: %s", url);
+                    }
+                }
+                ESP_LOGI(TAG, "SUBSCRIBE renewed: SID=%s (slot %d, url=%s)", sid, idx,
+                         s_subs[idx].url[0] ? s_subs[idx].url : "(none)");
                 /* Return 200 with SID and TIMEOUT */
                 httpd_resp_set_status(req, "200 OK");
                 httpd_resp_set_hdr(req, "SID", s_subs[idx].sid);
@@ -884,7 +899,19 @@ static esp_err_t event_handler(httpd_req_t *req)
                 snprintf(s_subs[slot].sid, sizeof(s_subs[slot].sid), "%s", fixed_sid);
                 s_subs[slot].expiry_time = esp_timer_get_time() / 1000000 + SUB_TIMEOUT_SEC;
                 s_subs[slot].seq = 0;
-                /* 保留旧 URL 如果存在（清理时可能还在） */
+                /* rebuild 时也尝试读 CALLBACK 头 */
+                size_t cb_len2 = httpd_req_get_hdr_value_len(req, "CALLBACK");
+                if (cb_len2 > 0 && cb_len2 < 255) {
+                    char cb2[256];
+                    httpd_req_get_hdr_value_str(req, "CALLBACK", cb2, sizeof(cb2));
+                    char *url2 = cb2;
+                    if (url2[0] == '<') url2++;
+                    char *end2 = strchr(url2, '>');
+                    if (end2) *end2 = '\0';
+                    if (url2[0]) {
+                        snprintf(s_subs[slot].url, sizeof(s_subs[slot].url), "%s", url2);
+                    }
+                }
                 ESP_LOGI(TAG, "SUBSCRIBE rebuild fixed SID=%s (slot %d, url=%s)",
                          fixed_sid, slot, s_subs[slot].url[0] ? s_subs[slot].url : "(none)");
                 httpd_resp_set_status(req, "200 OK");
