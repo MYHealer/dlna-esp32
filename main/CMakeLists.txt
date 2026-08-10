@@ -20,4 +20,5 @@ idf_component_register(SRCS "dlna.c"
                         esp-tls
                         esp_mm
                         esp_netif
-                        esp_wifi)
+                        esp_wifi
+                        espressif__mdns)

@@ -771,3 +771,29 @@ void lvgl_port_ui_focus_play(void)
 {
     if (s_btn_play) lv_group_focus_obj(s_btn_play);
 }
+
+/* ====== 小米音箱模式：接管画面 ====== */
+void lvgl_port_ui_set_speaker_mode(bool active)
+{
+    if (active) {
+        /* 显示接管提示 */
+        lv_label_set_text(s_label_title, "音频已由手机接管");
+        lv_label_set_text(s_label_artist, "小米音箱模式");
+        /* 隐藏封面和唱针 */
+        if (s_cover_container) lv_obj_add_flag(s_cover_container, LV_OBJ_FLAG_HIDDEN);
+        if (s_img_citou) lv_img_set_angle(s_img_citou, -200);  /* 唱针抬起 */
+        lv_anim_del(s_cover_img, _cover_anim_cb);  /* 停止旋转 */
+        /* 进度条归零 */
+        lv_bar_set_value(s_bar_progress, 0, LV_ANIM_OFF);
+        lv_label_set_text(s_label_time1, "0:00");
+        lv_label_set_text(s_label_time2, "0:00");
+        ESP_LOGI(TAG, "Speaker mode UI: takeover screen shown");
+    } else {
+        /* 恢复默认 */
+        lv_label_set_text(s_label_title, "DLNA Player");
+        lv_label_set_text(s_label_artist, "Waiting...");
+        /* 恢复封面容器（如果有封面数据会自动更新） */
+        if (s_cover_container) lv_obj_clear_flag(s_cover_container, LV_OBJ_FLAG_HIDDEN);
+        ESP_LOGI(TAG, "Speaker mode UI: normal restored");
+    }
+}

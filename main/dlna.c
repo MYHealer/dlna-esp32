@@ -38,6 +38,7 @@
 #include "esp_jpeg_dec.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
+#include "mdns.h"
 #define lodepng_malloc(s) heap_caps_malloc(s, MALLOC_CAP_SPIRAM)
 #define lodepng_free(p)  heap_caps_free(p)
 #include "extra/libs/png/lodepng.h"
@@ -89,6 +90,8 @@ static int           s_user_stopped      = 0;
 static int64_t       s_stuck_paused_since = 0;
 /* 歌词 UI 清除请求（新歌切歌时，UI 任务处理） */
 static volatile bool s_lyrics_ui_clear_pending = false;
+/* 小米音箱模式：HyperAll REMOTE_SUBMIX 音频接管 */
+static volatile bool s_xiaomi_speaker_mode = false;
 /* 位置追踪：纯软件方案（参考 miair-next） */
 static int64_t        s_play_start_us     = 0;   /* 播放开始时间（esp_timer us），0=未在播放 */
 static int            s_accumulated_ms    = 0;   /* 累计已播放 ms（暂停/停止时冻结） */
@@ -171,12 +174,28 @@ static esp_gmf_err_t pipeline_event_cb(esp_gmf_event_pkt_t *event, void *ctx)
                 break;
             case ESP_GMF_EVENT_STATE_FINISHED:
                 if (get_state() == PS_PAUSED) break;
+                /* 小米音箱模式：流结束 → 自动退出 */
+                if (s_xiaomi_speaker_mode) {
+                    s_xiaomi_speaker_mode = false;
+                    ESP_LOGI(TAG, "=== 小米音箱模式 DEACTIVATED (stream finished) ===");
+                    lvgl_port_lock();
+                    lvgl_port_ui_set_speaker_mode(false);
+                    lvgl_port_unlock();
+                }
                 xTaskCreatePinnedToCore(delayed_stop_notify, "stop_dly", 3072, NULL, 5, NULL, 1);
                 break;
             case ESP_GMF_EVENT_STATE_ERROR:
                 if (esp_timer_get_time() < s_grace_until) {
                     ESP_LOGD(TAG, "ERROR ignored (grace period)");
                     break;
+                }
+                /* 小米音箱模式：流中断 → 自动退出 */
+                if (s_xiaomi_speaker_mode) {
+                    s_xiaomi_speaker_mode = false;
+                    ESP_LOGI(TAG, "=== 小米音箱模式 DEACTIVATED (stream error) ===");
+                    lvgl_port_lock();
+                    lvgl_port_ui_set_speaker_mode(false);
+                    lvgl_port_unlock();
                 }
                 set_state(PS_STOPPED);
                 break;
@@ -376,6 +395,25 @@ static void cb_set_uri(const char *uri)
         ESP_LOGW(TAG, "Rejected video URI: %.128s", uri);
         return;
     }
+
+    /* 小米音箱模式检测：HyperAll REMOTE_SUBMIX 流走 8090 端口 */
+    if (uri && strstr(uri, ":8090")) {
+        if (!s_xiaomi_speaker_mode) {
+            s_xiaomi_speaker_mode = true;
+            ESP_LOGI(TAG, "=== 小米音箱模式 ACTIVATED === URI: %s", uri);
+            lvgl_port_lock();
+            lvgl_port_ui_set_speaker_mode(true);
+            lvgl_port_unlock();
+        }
+    } else if (s_xiaomi_speaker_mode) {
+        /* 非 8090 端口的新 URI → 普网易云模式，清除小米音箱模式 */
+        s_xiaomi_speaker_mode = false;
+        ESP_LOGI(TAG, "=== 小米音箱模式 DEACTIVATED (new URI) ===");
+        lvgl_port_lock();
+        lvgl_port_ui_set_speaker_mode(false);
+        lvgl_port_unlock();
+    }
+
     if (s_state_mux) xSemaphoreTake(s_state_mux, portMAX_DELAY);
     /* 新 URI 时保存当前播放位置（直接读 s_state，避免 get_state() 递归锁） */
     if (s_state == PS_PLAYING && s_play_start_us > 0) {
@@ -546,6 +584,16 @@ static void cb_stop(void)
     s_finish_notify_spawned = false;
     s_near_end_count = 0;
     ESP_LOGI(TAG, "Stop");
+
+    /* 小米音箱模式：手机断开 → 回到普通网易云模式 */
+    if (s_xiaomi_speaker_mode) {
+        s_xiaomi_speaker_mode = false;
+        ESP_LOGI(TAG, "=== 小米音箱模式 DEACTIVATED (stop) ===");
+        lvgl_port_lock();
+        lvgl_port_ui_set_speaker_mode(false);
+        lvgl_port_unlock();
+    }
+
     /* 冻结累计播放时间 */
     if (s_play_start_us > 0) {
         s_accumulated_ms += (int)((esp_timer_get_time() - s_play_start_us) / 1000LL);
@@ -777,6 +825,12 @@ static void decode_html_entities(char *dst, size_t dst_size, const char *src)
 
 static void cb_set_metadata(const char *metadata)
 {
+    /* 小米音箱模式：跳过元数据/歌词/封面，专注接收稳定性 */
+    if (s_xiaomi_speaker_mode) {
+        ESP_LOGD(TAG, "Metadata skipped (小米音箱模式)");
+        return;
+    }
+
     ESP_LOGI(TAG, "Metadata: %s", metadata);
     parse_duration_from_metadata(metadata);
 
@@ -1564,6 +1618,21 @@ static void wifi_init(void)
     }
 }
 
+/* ─────────────────────── mDNS 服务发现 ─────────────────────── */
+static void mdns_service_init(void)
+{
+    esp_err_t err = mdns_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "mdns_init failed: %s", esp_err_to_name(err));
+        return;
+    }
+    mdns_hostname_set("esp32-dlna");
+    mdns_instance_name_set("MS01B");
+    /* 注册 DLNA 服务，HyperAll 可通过 _dlna._tcp 快速发现（1-3秒） */
+    mdns_service_add(NULL, "_dlna", "_tcp", 8080, NULL, 0);
+    ESP_LOGI(TAG, "mDNS: esp32-dlna.local._dlna._tcp:8080 registered");
+}
+
 /* ─────────────────────── Entry point ─────────────────────── */
 void app_main(void)
 {
@@ -1599,6 +1668,9 @@ void app_main(void)
     esp_wifi_set_protocol(ESP_IF_WIFI_STA,
                           WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
     esp_wifi_set_max_tx_power(78);
+
+    /* ── mDNS 服务发现（WiFi 已连接）── */
+    mdns_service_init();
 
     /* ── 音频播放 ── */
     audio_player_init();

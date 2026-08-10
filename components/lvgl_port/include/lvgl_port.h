@@ -60,6 +60,12 @@ void lvgl_port_ui_toggle_lyrics(void);
 bool lvgl_port_ui_lyrics_is_visible(void);
 void lvgl_port_ui_lyrics_clear(void);
 
+/**
+ * @brief 小米音箱模式：显示/隐藏接管画面
+ * @param active true=显示"音频已由手机接管", false=恢复正常UI
+ */
+void lvgl_port_ui_set_speaker_mode(bool active);
+
 /* ══════════════════════════════════════════════
  *  旋钮控制按钮回调注册
  * ══════════════════════════════════════════════ */
