@@ -101,6 +101,11 @@ static char          *s_playing_uri       = NULL; /* 当前音频管道实际加
 static int            s_near_end_count    = 0;   /* 连续接近曲末的 tick 数 */
 static bool           s_finish_notify_spawned = false; /* 防重复触发播完处理 */
 static volatile int   s_album_art_gen = 0;  /* 封面任务代次，切歌时递增取消旧任务 */
+/* 封面 worker 任务：队列驱动 + PSRAM 栈（避免内部 SRAM 碎片导致任务创建失败） */
+#define ALBUM_ART_QUEUE_LEN 1
+static QueueHandle_t  s_album_art_queue = NULL;
+static StaticTask_t   s_album_art_tcb;
+static StackType_t   *s_album_art_stack = NULL;
 
 
 /* ── 工具：获取字符串形式的 DLNA 状态 ── */
@@ -181,6 +186,7 @@ static esp_gmf_err_t pipeline_event_cb(esp_gmf_event_pkt_t *event, void *ctx)
                     lvgl_port_lock();
                     lvgl_port_ui_set_speaker_mode(false);
                     lvgl_port_unlock();
+                    custom_dlna_set_music_source(MUSIC_SRC_NETEASE);
                 }
                 xTaskCreatePinnedToCore(delayed_stop_notify, "stop_dly", 3072, NULL, 5, NULL, 1);
                 break;
@@ -196,6 +202,7 @@ static esp_gmf_err_t pipeline_event_cb(esp_gmf_event_pkt_t *event, void *ctx)
                     lvgl_port_lock();
                     lvgl_port_ui_set_speaker_mode(false);
                     lvgl_port_unlock();
+                    custom_dlna_set_music_source(MUSIC_SRC_NETEASE);
                 }
                 set_state(PS_STOPPED);
                 break;
@@ -386,6 +393,77 @@ static void apply_volume_hw(void)
     custom_dlna_notify_rcs();
 }
 
+/* ── 按模式切配置：音乐源检测 + 模式切换 ── */
+
+/* 不区分大小写的子串搜索 */
+static bool str_has(const char *s, const char *sub)
+{
+    if (!s || !sub) return false;
+    size_t slen = strlen(s), sublen = strlen(sub);
+    if (sublen > slen) return false;
+    for (size_t i = 0; i <= slen - sublen; i++) {
+        if (strncasecmp(&s[i], sub, sublen) == 0) return true;
+    }
+    return false;
+}
+
+/* 从 URI + User-Agent + 签名检测音乐源，设置模式并切换 UI */
+static void detect_and_apply_music_source(const char *uri)
+{
+    music_source_t src = MUSIC_SRC_NETEASE;  /* 默认网易云配置 */
+    bool was_speaker = s_xiaomi_speaker_mode;
+
+    if (uri && strstr(uri, ":8090")) {
+        /* 小米音箱模式：HyperAll REMOTE_SUBMIX 流走 8090 端口 */
+        src = MUSIC_SRC_SPEAKER;
+        if (!was_speaker) {
+            ESP_LOGI(TAG, "=== 小米音箱模式 ACTIVATED ===");
+            lvgl_port_lock();
+            lvgl_port_ui_set_speaker_mode(true);
+            lvgl_port_unlock();
+        }
+        s_xiaomi_speaker_mode = true;
+    } else {
+        /* 非音箱模式，检测来源 */
+        if (was_speaker) {
+            ESP_LOGI(TAG, "=== 小米音箱模式 DEACTIVATED ===");
+            lvgl_port_lock();
+            lvgl_port_ui_set_speaker_mode(false);
+            lvgl_port_unlock();
+        }
+        s_xiaomi_speaker_mode = false;
+
+        /* 音乐指纹检测 — 参考反编译项目 FUN_000c74dc（User-Agent 链式匹配）
+         * QQ系列: qqmusic / qqmusic.qq.com / aqqmusic.tc.qq.com / music.tc.qq.com / qq_music / qq_realtime
+         * 网易云: cloudmusic / netease / netease_music
+         * B站: bilibili / b23.tv
+         * 酷狗: kugou / kugou.com
+         * 酷我: kuwo / kuwo.cn
+         * 喜马拉雅: ximalaya / ximalaya.com */
+        const char *ua = custom_dlna_get_user_agent();
+        if (str_has(uri, "qqmusic") || str_has(uri, "qq_music") || str_has(uri, "qq_realtime") ||
+            str_has(uri, "tc.qq.com") ||
+            str_has(ua, "qqmusic") || str_has(ua, "aqqmusic") || str_has(ua, "qq music")) {
+            src = MUSIC_SRC_QQ;
+            ESP_LOGI(TAG, "Music source: QQ (uri=%s ua=%s)", uri ? uri : "", ua ? ua : "");
+        } else if (str_has(ua, "bilibili") || str_has(uri, "bilibili") || str_has(uri, "b23.tv")) {
+            src = MUSIC_SRC_BILIBILI;
+            ESP_LOGI(TAG, "Music source: Bilibili (ua=%s)", ua ? ua : "");
+        } else if (str_has(ua, "kugou") || str_has(uri, "kugou.com") || str_has(uri, "kugou")) {
+            src = MUSIC_SRC_KUGOU;
+            ESP_LOGI(TAG, "Music source: Kugou (ua=%s)", ua ? ua : "");
+        } else if (str_has(ua, "kuwo") || str_has(uri, "kuwo.cn") || str_has(uri, "kuwo")) {
+            src = MUSIC_SRC_KUWO;
+            ESP_LOGI(TAG, "Music source: Kuwo (ua=%s)", ua ? ua : "");
+        } else if (str_has(ua, "ximalaya") || str_has(uri, "ximalaya.com") || str_has(uri, "ximalaya")) {
+            src = MUSIC_SRC_XIMALAYA;
+            ESP_LOGI(TAG, "Music source: Ximalaya (ua=%s)", ua ? ua : "");
+        }
+    }
+
+    custom_dlna_set_music_source(src);
+}
+
 static void cb_set_uri(const char *uri)
 {
     s_finish_notify_spawned = false;
@@ -396,27 +474,18 @@ static void cb_set_uri(const char *uri)
         return;
     }
 
-    /* 小米音箱模式检测：HyperAll REMOTE_SUBMIX 流走 8090 端口 */
-    if (uri && strstr(uri, ":8090")) {
-        if (!s_xiaomi_speaker_mode) {
-            s_xiaomi_speaker_mode = true;
-            ESP_LOGI(TAG, "=== 小米音箱模式 ACTIVATED === URI: %s", uri);
-            lvgl_port_lock();
-            lvgl_port_ui_set_speaker_mode(true);
-            lvgl_port_unlock();
-        }
-    } else if (s_xiaomi_speaker_mode) {
-        /* 非 8090 端口的新 URI → 普网易云模式，清除小米音箱模式 */
-        s_xiaomi_speaker_mode = false;
-        ESP_LOGI(TAG, "=== 小米音箱模式 DEACTIVATED (new URI) ===");
-        lvgl_port_lock();
-        lvgl_port_ui_set_speaker_mode(false);
-        lvgl_port_unlock();
-    }
+    /* 按模式切配置：检测音乐源 + 设置模式 */
+    detect_and_apply_music_source(uri);
 
     if (s_state_mux) xSemaphoreTake(s_state_mux, portMAX_DELAY);
-    /* 新 URI 时保存当前播放位置（直接读 s_state，避免 get_state() 递归锁） */
-    if (s_state == PS_PLAYING && s_play_start_us > 0) {
+    /* 新 URI 时保存当前播放位置（直接读 s_state，避免 get_state() 递归锁）
+     * QQ 音乐切歌时重置进度为 0（QQ 音乐不需要断点续播，且旧进度会导致屏幕显示错误）
+     * 网易云保持原逻辑（断点续播 + 歌词同步依赖连续位置） */
+    music_source_t cur_src = custom_dlna_get_music_source();
+    bool uri_changed = s_track_uri && uri && strcmp(s_track_uri, uri) != 0;
+    if (uri_changed && cur_src == MUSIC_SRC_QQ) {
+        s_saved_pos_sec = 0;
+    } else if (s_state == PS_PLAYING && s_play_start_us > 0) {
         s_saved_pos_sec = (s_accumulated_ms + (int)((esp_timer_get_time() - s_play_start_us) / 1000LL)) / 1000;
     } else if (s_state == PS_PAUSED) {
         s_saved_pos_sec = s_accumulated_ms / 1000;
@@ -462,6 +531,18 @@ static void _do_play(const char *uri, int seek_sec)
     s_near_end_count = 0;
     if (!s_pipe || !uri) return;
 
+    /* &amp; → & 解码：XML 实体只在送入 HTTP 管线时解码，
+     * s_uri（GENA 通知用）保持原始 XML 编码不变 */
+    char decoded_uri[2048];
+    const char *p = uri;
+    char *w = decoded_uri;
+    while (*p && w < decoded_uri + sizeof(decoded_uri) - 2) {
+        if (strncmp(p, "&amp;", 5) == 0) { *w++ = '&'; p += 5; }
+        else { *w++ = *p++; }
+    }
+    *w = '\0';
+    uri = decoded_uri;
+
     /* 重置 I2S 跟踪，确保新歌重新配置 */
     s_last_i2s_rate = 0;
     s_last_i2s_bits = 0;
@@ -469,6 +550,25 @@ static void _do_play(const char *uri, int seek_sec)
 
     /* 如果管线已被 stop（如切歌），重置元素状态为 INITIALIZED 才能重新注册 job */
     esp_gmf_pipeline_reset(s_pipe);
+
+    /* ── 按音乐源设置 HTTP User-Agent ──
+     * QQ 音乐 CDN 拒绝默认的 "ESP32 HTTP Client/1.0"，返回 403。
+     * 参考 miair-next：用浏览器 UA 防止远端拒绝。
+     * 网易云和其他源保持默认，一个萝卜一个坑。 */
+    esp_gmf_io_handle_t http_io = NULL;
+    esp_gmf_pipeline_get_in(s_pipe, &http_io);
+    if (http_io) {
+        music_source_t src = custom_dlna_get_music_source();
+        if (src == MUSIC_SRC_QQ) {
+            esp_gmf_io_http_set_user_agent(http_io,
+                "Mozilla/5.0 (Linux; Android 12) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Mobile Safari/537.36");
+        } else {
+            esp_gmf_io_http_set_user_agent(http_io, NULL);
+        }
+    }
+
     esp_gmf_pipeline_set_in_uri(s_pipe, uri);
     esp_gmf_pipeline_loading_jobs(s_pipe);
     esp_gmf_err_t err = esp_gmf_pipeline_run(s_pipe);
@@ -592,6 +692,7 @@ static void cb_stop(void)
         lvgl_port_lock();
         lvgl_port_ui_set_speaker_mode(false);
         lvgl_port_unlock();
+        custom_dlna_set_music_source(MUSIC_SRC_NETEASE);
     }
 
     /* 冻结累计播放时间 */
@@ -851,12 +952,17 @@ static void cb_set_metadata(const char *metadata)
     if (music_id) s_music_id = music_id;
 
     if (album_art[0]) {
-        /* 没有参数时追加 ?param=200y200 让 CDN 返回小图，节省内存 */
-        if (!strchr(album_art, '?')) {
-            strncat(album_art, "?param=300y300", sizeof(album_art) - strlen(album_art) - 1);
+        /* 按模式处理封面下载 */
+        music_source_t src = custom_dlna_get_music_source();
+        if (src == MUSIC_SRC_NETEASE) {
+            /* 网易云 CDN 用 ?param=300y300 请求小图 */
+            if (!strchr(album_art, '?')) {
+                strncat(album_art, "?param=300y300", sizeof(album_art) - strlen(album_art) - 1);
+            }
+            ESP_LOGI(TAG, "AlbumArt URL: %s", album_art);
+            fetch_album_art_async(album_art);
         }
-        ESP_LOGI(TAG, "AlbumArt URL: %s", album_art);
-        fetch_album_art_async(album_art);
+        /* QQ 音乐等其他源：不下载封面（封面是网易云模式的东西） */
     }
 
     if (title[0] && (strcmp(title, s_cur_title) != 0 || strcmp(artist, s_cur_artist) != 0)) {
@@ -867,8 +973,11 @@ static void cb_set_metadata(const char *metadata)
         lvgl_port_ui_set_title(s_cur_title);
         lvgl_port_ui_set_artist(s_cur_artist);
         lvgl_port_unlock();
-        ESP_LOGI(TAG, "Calling lyrics_fetch_async for: %s - %s (songId=%d)", s_cur_title, s_cur_artist, music_id);
-        lyrics_fetch_async(s_cur_title, s_cur_artist, music_id);
+        /* 歌词只对网易云模式拉取（歌词源是网易云 API） */
+        if (custom_dlna_get_music_source() == MUSIC_SRC_NETEASE) {
+            ESP_LOGI(TAG, "Calling lyrics_fetch_async for: %s - %s (songId=%d)", s_cur_title, s_cur_artist, music_id);
+            lyrics_fetch_async(s_cur_title, s_cur_artist, music_id);
+        }
     }
 }
 
@@ -987,33 +1096,34 @@ static int simple_http_get(const char *url, uint8_t **out_data, int *out_len)
 
 static void album_art_task(void *arg)
 {
-    const char *url = (const char *)arg;
-    if (!url) { free(arg); vTaskDelete(NULL); return; }
-    int my_gen = s_album_art_gen;
+    (void)arg;
+    char *url = NULL;
+    while (1) {
+        if (xQueueReceive(s_album_art_queue, &url, portMAX_DELAY) != pdTRUE) continue;
+        if (!url) continue;
+        int my_gen = s_album_art_gen;
 
-    /* 等音频管线稳定（1 秒足够首帧解码 + I2S 配置） */
-    vTaskDelay(pdMS_TO_TICKS(1000));
+        /* 等音频管线稳定（1 秒足够首帧解码 + I2S 配置） */
+        vTaskDelay(pdMS_TO_TICKS(1000));
 
-    /* 切歌后新任务已启动，放弃本次下载 */
-    if (s_album_art_gen != my_gen) {
-        ESP_LOGI(TAG, "Cover task cancelled (gen mismatch)");
-        free(arg); vTaskDelete(NULL); return;
-    }
+        /* 切歌后 gen 变化，放弃本次下载 */
+        if (s_album_art_gen != my_gen) {
+            ESP_LOGI(TAG, "Cover task cancelled (gen mismatch)");
+            free(url); continue;
+        }
 
-    uint8_t *img_data = NULL;
-    int img_len = 0;
-    if (simple_http_get(url, &img_data, &img_len) != 0) {
-        ESP_LOGW(TAG, "Cover download failed");
-        free(arg);
-        vTaskDelete(NULL);
-        return;
-    }
+        uint8_t *img_data = NULL;
+        int img_len = 0;
+        if (simple_http_get(url, &img_data, &img_len) != 0) {
+            ESP_LOGW(TAG, "Cover download failed");
+            free(url); continue;
+        }
 
-    /* 再次检查：下载期间可能切歌了 */
-    if (s_album_art_gen != my_gen) {
-        ESP_LOGI(TAG, "Cover task cancelled after download");
-        heap_caps_free(img_data); free(arg); vTaskDelete(NULL); return;
-    }
+        /* 再次检查：下载期间可能切歌了 */
+        if (s_album_art_gen != my_gen) {
+            ESP_LOGI(TAG, "Cover task cancelled after download");
+            heap_caps_free(img_data); free(url); continue;
+        }
 
     /* 检测图片格式并解码 */
     ESP_LOGI(TAG, "Image data: len=%d, first4=%02X %02X %02X %02X",
@@ -1030,7 +1140,7 @@ static void album_art_task(void *arg)
         jpeg_error_t jerr = jpeg_dec_open(&dec_cfg, &jpeg_dec);
         if (jerr != JPEG_ERR_OK) {
             ESP_LOGW(TAG, "JPEG open failed: %d", jerr);
-            heap_caps_free(img_data); free(arg); vTaskDelete(NULL); return;
+            heap_caps_free(img_data); free(url); continue;
         }
 
         /* 直接解码全尺寸（DEFAULT_JPEG_DEC_CONFIG 已禁用 scale） */
@@ -1041,7 +1151,7 @@ static void album_art_task(void *arg)
         if (jerr != JPEG_ERR_OK) {
             ESP_LOGW(TAG, "JPEG header parse failed: %d", jerr);
             jpeg_dec_close(jpeg_dec);
-            heap_caps_free(img_data); free(arg); vTaskDelete(NULL); return;
+            heap_caps_free(img_data); free(url); continue;
         }
         out_w = info.width;
         out_h = info.height;
@@ -1052,7 +1162,7 @@ static void album_art_task(void *arg)
         if (!raw_buf) {
             ESP_LOGW(TAG, "JPEG outbuf alloc failed (%d)", outbuf_len);
             jpeg_dec_close(jpeg_dec);
-            heap_caps_free(img_data); free(arg); vTaskDelete(NULL); return;
+            heap_caps_free(img_data); free(url); continue;
         }
 
         /* 关键：parse_header 已消费头部字节，inbuf_remain 是剩余未用字节。
@@ -1067,7 +1177,7 @@ static void album_art_task(void *arg)
         if (jerr != JPEG_ERR_OK) {
             ESP_LOGW(TAG, "JPEG decode failed: %d", jerr);
             jpeg_free_align(raw_buf);
-            heap_caps_free(img_data); free(arg); vTaskDelete(NULL); return;
+            heap_caps_free(img_data); free(url); continue;
         }
 
         /* BGR565_BE + 中心裁剪 + 双线性缩放到 48x48 */
@@ -1081,7 +1191,7 @@ static void album_art_task(void *arg)
         if (!resized) {
             ESP_LOGW(TAG, "JPEG resize alloc failed");
             jpeg_free_align(raw_buf);
-            heap_caps_free(img_data); free(arg); vTaskDelete(NULL); return;
+            heap_caps_free(img_data); free(url); continue;
         }
         uint16_t *src = (uint16_t *)raw_buf;
         for (int y = 0; y < sh; y++) {
@@ -1124,9 +1234,8 @@ static void album_art_task(void *arg)
         if (err) {
             ESP_LOGW(TAG, "PNG decode failed: %u (%s), w=%u h=%u", err, lodepng_error_text(err), png_w, png_h);
             heap_caps_free(img_data);
-            free(arg);
-            vTaskDelete(NULL);
-            return;
+            free(url);
+            continue;
         }
         /* 下载缓冲区已无用，立即释放 */
         heap_caps_free(img_data);
@@ -1145,9 +1254,8 @@ static void album_art_task(void *arg)
         if (!out_buf) {
             ESP_LOGW(TAG, "PNG out_buf alloc failed (%zu)", out_buf_size);
             free(png_rgb);
-            free(arg);
-            vTaskDelete(NULL);
-            return;
+            free(url);
+            continue;
         }
         /* 双线性缩放 + RGB888→BGR565 */
         for (int y = 0; y < sh; y++) {
@@ -1177,9 +1285,8 @@ static void album_art_task(void *arg)
         ESP_LOGW(TAG, "Unknown format: %02X %02X %02X %02X",
                  img_data[0], img_data[1], img_data[2], img_data[3]);
         heap_caps_free(img_data);
-        free(arg);
-        vTaskDelete(NULL);
-        return;
+        free(url);
+        continue;
     }
 
     /* 显示封面（数据通过 memcpy 到内部 RAM 静态缓冲区，无缓存问题） */
@@ -1191,23 +1298,37 @@ static void album_art_task(void *arg)
     if (jpeg_aligned) jpeg_free_align(out_buf);
     else heap_caps_free(out_buf);
     heap_caps_free(img_data);
-    free(arg);
-    vTaskDelete(NULL);
+    free(url);
+    }
 }
 
 static void fetch_album_art_async(const char *url)
 {
+    if (!url || !s_album_art_queue) return;
     char *url_copy = strdup(url);
     if (!url_copy) return;
-    s_album_art_gen++;  /* 递增代次，旧任务会自行退出 */
-    /* Core 1: 与 WiFi (Core 0) 完全隔离，避免争抢内部 RAM */
-    BaseType_t ret = xTaskCreatePinnedToCore(album_art_task, "album_art",
-        8 * 1024, url_copy, 1, NULL, 1);
-    if (ret != pdPASS) {
-        ESP_LOGW(TAG, "album_art task create failed: %d", ret);
-        free(url_copy);
+    s_album_art_gen++;  /* 递增代次，worker 检测到 gen 变化会放弃旧请求 */
+    /* 覆盖式发送：队列长度 1，新请求直接替换旧请求 */
+    xQueueOverwrite(s_album_art_queue, &url_copy);
+}
+
+/* 创建封面 worker 任务：PSRAM 栈，避免内部 SRAM 碎片导致创建失败 */
+static void album_art_worker_init(void)
+{
+    s_album_art_queue = xQueueCreate(ALBUM_ART_QUEUE_LEN, sizeof(char *));
+    s_album_art_stack = heap_caps_malloc(8 * 1024, MALLOC_CAP_SPIRAM);
+    if (!s_album_art_queue || !s_album_art_stack) {
+        ESP_LOGW(TAG, "album_art worker init failed");
+        return;
+    }
+    TaskHandle_t handle = xTaskCreateStaticPinnedToCore(
+        album_art_task, "album_art", 8 * 1024 / sizeof(StackType_t),
+        NULL, 1, s_album_art_stack, &s_album_art_tcb, 1);
+    if (!handle) {
+        ESP_LOGW(TAG, "album_art worker create failed");
     }
 }
+
 
 /* ─────────────────────── Audio player init (GMF) ─────────────────────── */
 static void audio_player_init(void)
@@ -1261,7 +1382,7 @@ static void audio_player_init(void)
     /* 注意：不在 init 时 loading_jobs！否则首次 pipeline_run 会跑旧 job（无 URI）导致卡死。
      * 每次 _do_play 中 reset + set_in_uri + loading_jobs + run 即可。 */
 
-    /* ── 7. 设置事件回调 ── */
+    /* ── 7. 设置管线事件回调 ── */
     esp_gmf_pipeline_set_event(s_pipe, pipeline_event_cb, NULL);
 
     /* ── 8. 起手音量 ── */
@@ -1671,6 +1792,9 @@ void app_main(void)
 
     /* ── mDNS 服务发现（WiFi 已连接）── */
     mdns_service_init();
+
+    /* ── 封面 worker 任务（PSRAM 栈，先于音频创建） ── */
+    album_art_worker_init();
 
     /* ── 音频播放 ── */
     audio_player_init();

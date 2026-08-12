@@ -27,6 +27,7 @@ static const char *TAG = "CUSTOM_DLNA";
 #define SUPPORTED_PROTOCOLS \
     "http-get:*:audio/mpeg:*," \
     "http-get:*:audio/mp3:*," \
+    "http-get:*:audio/x-mpeg:*," \
     "http-get:*:audio/mp4:*," \
     "http-get:*:audio/ogg:*," \
     "http-get:*:audio/flac:*," \
@@ -40,6 +41,8 @@ static const char *TAG = "CUSTOM_DLNA";
     "http-get:*:audio/L16:*," \
     "http-get:*:audio/vnd.dlna.adts:*," \
     "http-get:*:audio/ape:*," \
+    "http-get:*:audio/pcm:*," \
+    "http-get:*:audio/opus:*," \
     "http-get:*:audio/*:*"
 
 /* ── Internal state ── */
@@ -47,6 +50,12 @@ static const custom_dlna_config_t *s_cfg = NULL;
 static httpd_handle_t s_server = NULL;
 static char s_uri[2048] = {0};
 static char s_metadata[16384] = {0};  /* 当前曲目 DIDL-Lite 元数据（网易云可能 >4KB） */
+static char s_next_uri[2048] = {0};   /* 下一曲 URI（SetNextAVTransportURI 设置） */
+static char s_next_metadata[2048] = {0};
+
+/* ── 按模式切配置 ── */
+static music_source_t s_music_source = MUSIC_SRC_NETEASE;  /* 默认网易云配置 */
+static char s_user_agent[128] = {0};  /* 最近一次 SetAVTransportURI 的 User-Agent */
 
 /* GENA 通知互斥锁：pos_notify_task 与 gena_task 并发调用 gena_notify，
  * 同时操作 s_subs[i].client 会 use-after-free 导致 Cache error。 */
@@ -59,7 +68,24 @@ void custom_dlna_update_uri(const char *uri, const char *metadata)
     else s_uri[0] = '\0';
     if (metadata) strncpy(s_metadata, metadata, sizeof(s_metadata) - 1);
     else s_metadata[0] = '\0';
+    /* 新曲目上播，清空 next */
+    s_next_uri[0] = '\0';
+    s_next_metadata[0] = '\0';
 }
+
+/* ── 按模式切配置 ── */
+void custom_dlna_set_music_source(music_source_t src)
+{
+    if (src >= MUSIC_SRC_MAX) return;
+    if (s_music_source != src) {
+        ESP_LOGI(TAG, "Music source: %d → %d", s_music_source, src);
+        s_music_source = src;
+    }
+}
+
+music_source_t custom_dlna_get_music_source(void) { return s_music_source; }
+
+const char* custom_dlna_get_user_agent(void) { return s_user_agent; }
 static int  s_volume_cache = 50;   /* cached volume for fast SOAP response */
 static int  s_mute_cache   = 0;    /* cached mute for fast SOAP response */
 
@@ -74,7 +100,6 @@ typedef struct {
     char sid[96];
     int64_t expiry_time;  /* esp_timer_get_time() + timeout */
     int seq;
-    esp_http_client_handle_t client;  /* 持久 HTTP 连接，复用 TCP */
 } gena_subscriber_t;
 static gena_subscriber_t s_subs[MAX_SUBSCRIBERS];
 static int  s_sub_count = 0;
@@ -154,6 +179,8 @@ static const char *get_soap_action(httpd_req_t *req, char *buf, int buf_sz)
 }
 
 /* ── XML value extraction ── */
+/* 解码 XML 实体：&amp; → &，&lt; → <，&gt; >，&quot; → " */
+
 static int xml_get(const char *xml, const char *tag, char *out, int out_max)
 {
     /* Try <u:Tag> first (CyberGarage may namespace-prefix), then <Tag> */
@@ -338,78 +365,84 @@ static void send_media_info(httpd_req_t *req)
     free(resp);
 }
 
-/* ── GENA notify — 持久连接复用（参考 miair-next session 模式） ── */
+/* ── GENA notify — 用原始 socket 发送 HTTP NOTIFY（避免 esp_http_client use-after-free） ── */
 static void gena_notify(const char *xml_body, const char *service_type)
 {
     (void)service_type;
-    /* 加锁：pos_notify_task 与 gena_task 并发调用本函数，
-     * 同时操作 s_subs[i].client 会 use-after-free 导致 Cache error。 */
     if (s_gena_mutex) xSemaphoreTake(s_gena_mutex, portMAX_DELAY);
-    int64_t now = esp_timer_get_time() / 1000000;  /* seconds */
+    int64_t now = esp_timer_get_time() / 1000000;
     for (int i = 0; i < MAX_SUBSCRIBERS; i++) {
         if (s_subs[i].url[0] == '\0') continue;
-        /* Skip expired subscriptions */
         if (s_subs[i].expiry_time > 0 && now > s_subs[i].expiry_time) {
             ESP_LOGI(TAG, "Subscription expired: SID=%s", s_subs[i].sid);
-            if (s_subs[i].client) {
-                esp_http_client_cleanup(s_subs[i].client);
-                s_subs[i].client = NULL;
-            }
             s_subs[i].url[0] = '\0';
             continue;
         }
 
-        /* 复用已有连接，首次时创建 */
-        if (!s_subs[i].client) {
-            esp_http_client_config_t cfg = {
-                .url = s_subs[i].url,
-                .method = HTTP_METHOD_NOTIFY,
-                .timeout_ms = 3000,
-                .keep_alive_enable = true,
-                .keep_alive_idle = 30,
-                .keep_alive_interval = 10,
-                .keep_alive_count = 3,
-            };
-            s_subs[i].client = esp_http_client_init(&cfg);
-            if (!s_subs[i].client) continue;
-            esp_http_client_set_header(s_subs[i].client, "CONTENT-TYPE",
-                                       "text/xml; charset=\"utf-8\"");
+        /* 解析 URL: http://host[:port]/path */
+        const char *p = s_subs[i].url;
+        if (strncmp(p, "http://", 7) != 0) { ESP_LOGW(TAG, "Bad URL: %s", p); continue; }
+        p += 7;
+        char host[128] = "";
+        int port = 80;
+        const char *path = "/";
+        int hi = 0;
+        while (*p && *p != '/' && *p != ':' && hi < 127) host[hi++] = *p++;
+        host[hi] = '\0';
+        if (*p == ':') { p++; port = atoi(p); while (*p && *p != '/') p++; }
+        if (*p == '/') path = p;
+
+        /* 创建 socket */
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) { ESP_LOGW(TAG, "GENA socket create failed: %d", errno); continue; }
+        struct timeval tv = { .tv_sec = 2 };
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+        struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(port) };
+        inet_pton(AF_INET, host, &addr.sin_addr);
+        if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+            ESP_LOGW(TAG, "GENA connect %s:%d failed: %d", host, port, errno);
+            close(sock); continue;
         }
 
-        esp_http_client_handle_t c = s_subs[i].client;
-        esp_http_client_set_header(c, "NT", "upnp:event");
-        esp_http_client_set_header(c, "NTS", "upnp:propchange");
-        esp_http_client_set_header(c, "SID", s_subs[i].sid);
+        /* 构建 HTTP NOTIFY 请求 */
         char seq_str[16];
         snprintf(seq_str, sizeof(seq_str), "%d", s_subs[i].seq++);
-        esp_http_client_set_header(c, "SEQ", seq_str);
-        esp_http_client_set_post_field(c, xml_body, strlen(xml_body));
+        char req[4096];
+        int req_len = snprintf(req, sizeof(req),
+            "NOTIFY %s HTTP/1.1\r\n"
+            "HOST: %s:%d\r\n"
+            "CONTENT-TYPE: text/xml; charset=\"utf-8\"\r\n"
+            "NT: upnp:event\r\n"
+            "NTS: upnp:propchange\r\n"
+            "SID: %s\r\n"
+            "SEQ: %s\r\n"
+            "CONTENT-LENGTH: %d\r\n"
+            "\r\n"
+            "%s",
+            path, host, port, s_subs[i].sid, seq_str,
+            (int)strlen(xml_body), xml_body);
 
-        esp_err_t err = esp_http_client_perform(c);
-        if (err != ESP_OK) {
-            /* 连接失败：只清理 TCP，保留下次重连（参考 miair-next 失败静默重试）。
-             * 绝不删除订阅 URL —— 否则歌曲播完的 STOPPED 事件发不出去，
-             * controller 收不到就无法推下一首 → 不切歌。 */
-            ESP_LOGW(TAG, "GENA notify SID=%s failed: %s, will reconnect",
-                     s_subs[i].sid, esp_err_to_name(err));
-            esp_http_client_cleanup(s_subs[i].client);
-            s_subs[i].client = NULL;
-            s_subs[i].seq--;  /* 回退 seq，下次重连后重发 */
-        } else {
-            int status = esp_http_client_get_status_code(c);
-            if (status >= 400) {
-                /* 同样保留订阅 URL，只清连接。
-                 * 订阅者会自然过期（expiry_time），或被 controller renew 时重置。
-                 * 之前这里清空 url 是 10 分钟不切歌的根因。 */
-                ESP_LOGW(TAG, "GENA HTTP %d for SID=%s, will reconnect",
-                         status, s_subs[i].sid);
-                esp_http_client_cleanup(s_subs[i].client);
-                s_subs[i].client = NULL;
-                s_subs[i].seq--;
-            } else {
-                ESP_LOGI(TAG, "GENA OK SID=%s SEQ=%s", s_subs[i].sid, seq_str);
+        if (req_len > 0 && req_len < (int)sizeof(req)) {
+            int sent = send(sock, req, req_len, 0);
+            if (sent < 0) {
+                ESP_LOGW(TAG, "GENA send to %s:%d failed: %d", host, port, errno);
+            }
+            /* 读响应 */
+            char resp[256];
+            int rlen = recv(sock, resp, sizeof(resp) - 1, 0);
+            if (rlen > 0) {
+                resp[rlen] = '\0';
+                /* 检查非 200 响应 */
+                if (strstr(resp, "200") == NULL) {
+                    ESP_LOGW(TAG, "GENA NOTIFY resp from %s: %.80s", host, resp);
+                }
+            } else if (rlen < 0) {
+                ESP_LOGW(TAG, "GENA recv from %s:%d failed: %d", host, port, errno);
             }
         }
+        close(sock);
     }
     if (s_gena_mutex) xSemaphoreGive(s_gena_mutex);
 }
@@ -441,10 +474,6 @@ static void cleanup_stale_subscriptions(void)
         if (s_subs[i].url[0] == '\0') continue;
         if (s_subs[i].expiry_time > 0 && now > s_subs[i].expiry_time) {
             ESP_LOGI(TAG, "Subscription expired: SID=%s", s_subs[i].sid);
-            if (s_subs[i].client) {
-                esp_http_client_cleanup(s_subs[i].client);
-                s_subs[i].client = NULL;
-            }
             s_subs[i].url[0] = '\0';
         } else {
             valid++;
@@ -477,29 +506,75 @@ void custom_dlna_notify_transport_state(void)
     cleanup_stale_subscriptions();
 
     const char *state = s_cfg->get_transport_state ? s_cfg->get_transport_state() : DLNA_STATE_STOPPED;
+    const char *uri = s_uri[0] ? s_uri : "";
+    const char *meta = s_metadata[0] ? s_metadata : "";
 
-    /* Allocate large buffers on heap to keep task stack small */
-    char *buf = malloc(1024);
+    /* 动态分配：metadata 可能很大 */
+    int meta_len = strlen(meta);
+    int buf_size = 2048 + meta_len * 4;  /* XML entity encoding expands ~4x */
+    char *buf = malloc(buf_size);
     if (!buf) { ESP_LOGW(TAG, "OOM for AVT notify"); return; }
 
-    /* Build escaped XML directly into buf — no intermediate stack buffers.
-     * 精简事件（对齐 miair-next）：只发 TransportState。
-     * 不夹带 CurrentTrackDuration/CurrentTrackURI 等值 —— 播放中
-     * esp_audio_duration_get 返回错误值会导致 controller 处理异常。 */
-    int n = snprintf(buf, 1024,
-        "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
-        "<e:propertyset xmlns:e=\"urn:schemas-upnp-org:event-1-0\">"
-        "<e:property><LastChange>"
-        "&lt;Event xmlns=&quot;urn:schemas-upnp-org:metadata-1-0/AVT/&quot;&gt;"
-        "&lt;InstanceID val=&quot;0&quot;&gt;"
-        "&lt;TransportState val=&quot;%s&quot;/&gt;"
-        "&lt;/InstanceID&gt;"
-        "&lt;/Event&gt;"
-        "</LastChange></e:property>"
-        "</e:propertyset>",
-        state);
+    /* QQ 音乐需要扩展 LastChange 字段（TransportStatus=OK 等），
+     * 网易云 3.4 用简单格式，多了反而不同步
+     * 参考 Sparrow 逆向：完整 15 字段模板 */
+    int n;
+    if (s_music_source == MUSIC_SRC_QQ) {
+        /* 格式化时长和位置 */
+        int dur_sec = s_cfg->get_duration_sec ? s_cfg->get_duration_sec() : 0;
+        int pos_sec = s_cfg->get_position_sec ? s_cfg->get_position_sec() : 0;
+        char dur_str[16], pos_str[16];
+        fmt_time(dur_sec, dur_str, sizeof(dur_str));
+        fmt_time(pos_sec, pos_str, sizeof(pos_str));
 
-    if (n <= 0 || n >= 1024) { free(buf); return; }
+        n = snprintf(buf, buf_size,
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+            "<e:propertyset xmlns:e=\"urn:schemas-upnp-org:event-1-0\">"
+            "<e:property><LastChange>"
+            "&lt;Event xmlns=&quot;urn:schemas-upnp-org:metadata-1-0/AVT/&quot;&gt;"
+            "&lt;InstanceID val=&quot;0&quot;&gt;"
+            "&lt;TransportState val=&quot;%s&quot;/&gt;"
+            "&lt;TransportStatus val=&quot;OK&quot;/&gt;"
+            "&lt;TransportPlaySpeed val=&quot;1&quot;/&gt;"
+            "&lt;NumberOfTracks val=&quot;1&quot;/&gt;"
+            "&lt;CurrentTrack val=&quot;1&quot;/&gt;"
+            "&lt;CurrentTrackDuration val=&quot;%s&quot;/&gt;"
+            "&lt;CurrentMediaDuration val=&quot;%s&quot;/&gt;"
+            "&lt;CurrentTrackMetaData val=&quot;%s&quot;/&gt;"
+            "&lt;CurrentTrackURI val=&quot;%s&quot;/&gt;"
+            "&lt;AVTransportURI val=&quot;%s&quot;/&gt;"
+            "&lt;AVTransportURIMetaData val=&quot;%s&quot;/&gt;"
+            "&lt;NextAVTransportURI val=&quot;%s&quot;/&gt;"
+            "&lt;NextAVTransportURIMetaData val=&quot;%s&quot;/&gt;"
+            "&lt;RelativeTimePosition val=&quot;%s&quot;/&gt;"
+            "&lt;AbsoluteTimePosition val=&quot;%s&quot;/&gt;"
+            "&lt;CurrentTransportActions val=&quot;PLAY,STOP,PAUSE,SEEK&quot;/&gt;"
+            "&lt;/InstanceID&gt;"
+            "&lt;/Event&gt;"
+            "</LastChange></e:property>"
+            "</e:propertyset>",
+            state,
+            dur_str, dur_str,
+            meta, uri, uri, meta,
+            s_next_uri, s_next_metadata,
+            pos_str, pos_str);
+    } else {
+        /* 网易云 3.4：简单格式，只通知状态变化 */
+        n = snprintf(buf, buf_size,
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+            "<e:propertyset xmlns:e=\"urn:schemas-upnp-org:event-1-0\">"
+            "<e:property><LastChange>"
+            "&lt;Event xmlns=&quot;urn:schemas-upnp-org:metadata-1-0/AVT/&quot;&gt;"
+            "&lt;InstanceID val=&quot;0&quot;&gt;"
+            "&lt;TransportState val=&quot;%s&quot;/&gt;"
+            "&lt;/InstanceID&gt;"
+            "&lt;/Event&gt;"
+            "</LastChange></e:property>"
+            "</e:propertyset>",
+            state);
+    }
+
+    if (n <= 0 || n >= buf_size) { free(buf); return; }
 
     gena_notify(buf, NULL);
     free(buf);
@@ -618,6 +693,8 @@ static void handle_avt_control(httpd_req_t *req)
     /* ── SetAVTransportURI ── */
     if (strcmp(action, "SetAVTransportURI") == 0) {
         char uri[2048] = {0};
+        /* 记录 User-Agent 用于音乐源检测 */
+        httpd_req_get_hdr_value_str(req, "User-Agent", s_user_agent, sizeof(s_user_agent));
         if (xml_get(body, "CurrentURI", uri, sizeof(uri)) >= 0 && uri[0]) {
             snprintf(s_uri, sizeof(s_uri), "%s", uri);
             /* 保存元数据（歌词/封面依赖此数据） */
@@ -683,6 +760,8 @@ static void handle_avt_control(httpd_req_t *req)
         char next_meta[2048] = {0};
         xml_get(body, "NextURI", next_uri, sizeof(next_uri));
         xml_get(body, "NextURIMetaData", next_meta, sizeof(next_meta));
+        snprintf(s_next_uri, sizeof(s_next_uri), "%s", next_uri);
+        snprintf(s_next_metadata, sizeof(s_next_metadata), "%s", next_meta);
         if (s_cfg->on_set_next_uri) s_cfg->on_set_next_uri(next_uri, next_meta);
         soap_response(req, "AVTransport", "SetNextAVTransportURI", NULL);
 
@@ -1009,10 +1088,6 @@ static esp_err_t event_handler(httpd_req_t *req)
             int idx = find_sub_by_sid(sid);
             if (idx >= 0) {
                 ESP_LOGI(TAG, "UNSUBSCRIBE: SID=%s (slot %d)", sid, idx);
-                if (s_subs[idx].client) {
-                    esp_http_client_cleanup(s_subs[idx].client);
-                    s_subs[idx].client = NULL;
-                }
                 s_subs[idx].url[0] = '\0';
             }
         }
