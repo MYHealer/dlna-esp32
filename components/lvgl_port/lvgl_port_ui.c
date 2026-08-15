@@ -736,6 +736,17 @@ void lvgl_port_ui_set_cover(const uint16_t *pixels, int w, int h) {
     s_cover_prev = dsc;
 }
 
+void lvgl_port_ui_clear_cover(void) {
+    if (!s_cover_img) return;
+    s_cover_ready = false;
+    lv_anim_del(s_cover_img, _cover_anim_cb);
+    lv_img_set_src(s_cover_img, &ui_img_haibao_png);
+    lv_img_set_zoom(s_cover_img, 132);
+    lv_img_set_pivot(s_cover_img, 46, 46);
+    lv_obj_set_pos(s_cover_img, -22, -22);
+    if (s_cover_prev) { lv_mem_free(s_cover_prev); s_cover_prev = NULL; }
+}
+
 /* ── 旋钮控制按钮回调注册 ── */
 void lvgl_port_ui_register_btn_prev_cb(lvgl_btn_cb_t cb) { s_cb_btn_prev = cb; }
 void lvgl_port_ui_register_btn_play_cb(lvgl_btn_cb_t cb) { s_cb_btn_play = cb; }

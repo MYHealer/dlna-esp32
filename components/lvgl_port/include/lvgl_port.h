@@ -55,6 +55,7 @@ void lvgl_port_ui_lyrics_karaoke(int byte_idx);
 void lvgl_port_ui_lyrics_scroll_to_end(int line_duration_ms);
 void lvgl_port_ui_lyrics_tick_scroll(void);
 void lvgl_port_ui_set_cover(const uint16_t *pixels, int w, int h);
+void lvgl_port_ui_clear_cover(void);
 void lvgl_port_ui_lyrics_create(void);
 void lvgl_port_ui_toggle_lyrics(void);
 bool lvgl_port_ui_lyrics_is_visible(void);

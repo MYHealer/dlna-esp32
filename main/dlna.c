@@ -49,10 +49,11 @@ static const char *TAG = "DLNA_APP";
 
 /* ─────────────────────── 播放状态机 ─────────────────────── */
 typedef enum {
-    PS_NO_MEDIA = -1,
-    PS_STOPPED  = 0,
-    PS_PLAYING  = 1,
-    PS_PAUSED   = 2,
+    PS_NO_MEDIA      = -1,
+    PS_STOPPED       = 0,
+    PS_PLAYING       = 1,
+    PS_PAUSED        = 2,
+    PS_TRANSITIONING = 3,
 } play_state_t;
 
 /* GMF 音频管线 */
@@ -98,8 +99,8 @@ static int            s_accumulated_ms    = 0;   /* 累计已播放 ms（暂停/
 static char          *s_playing_uri       = NULL; /* 当前音频管道实际加载的 URI，用于检测暂停时切歌 */
 /* 主动播完检测（参考 miair-next _check_play_status）：
  * 软件位置接近曲末但底层未触发 FINISHED 时的兜底，避免控制器等不到 STOPPED 不切歌 */
-static int            s_near_end_count    = 0;   /* 连续接近曲末的 tick 数 */
-static bool           s_finish_notify_spawned = false; /* 防重复触发播完处理 */
+static int             s_near_end_count    = 0;   /* 连续接近曲末的 tick 数 */
+static volatile int    s_media_generation  = 0;   /* 媒体代数：每次新 URI +1，异步任务校验 */
 static volatile int   s_album_art_gen = 0;  /* 封面任务代次，切歌时递增取消旧任务 */
 /* 封面 worker 任务：队列驱动 + PSRAM 栈（避免内部 SRAM 碎片导致任务创建失败） */
 #define ALBUM_ART_QUEUE_LEN 1
@@ -112,10 +113,11 @@ static StackType_t   *s_album_art_stack = NULL;
 static const char *state_str(play_state_t s)
 {
     switch (s) {
-        case PS_PLAYING:  return "PLAYING";
-        case PS_PAUSED:   return "PAUSED_PLAYBACK";
-        case PS_NO_MEDIA: return "NO_MEDIA_PRESENT";
-        default:          return "STOPPED";
+        case PS_PLAYING:       return "PLAYING";
+        case PS_PAUSED:        return "PAUSED_PLAYBACK";
+        case PS_NO_MEDIA:      return "NO_MEDIA_PRESENT";
+        case PS_TRANSITIONING: return "TRANSITIONING";
+        default:               return "STOPPED";
     }
 }
 
@@ -144,6 +146,7 @@ static play_state_t get_state(void)
 }
 
 /* ── Delayed STOPPED notification (forward decl) ── */
+typedef struct { int generation; } finish_arg_t;
 static void delayed_stop_notify(void *arg);
 static void cb_play(void);
 static void cb_next(void);
@@ -189,7 +192,9 @@ static esp_gmf_err_t pipeline_event_cb(esp_gmf_event_pkt_t *event, void *ctx)
                     lvgl_port_unlock();
                     custom_dlna_set_music_source(MUSIC_SRC_NETEASE);
                 }
-                xTaskCreatePinnedToCore(delayed_stop_notify, "stop_dly", 3072, NULL, 5, NULL, 1);
+                finish_arg_t *fa = malloc(sizeof(finish_arg_t));
+                if (fa) { fa->generation = s_media_generation; }
+                xTaskCreatePinnedToCore(delayed_stop_notify, "stop_dly", 3072, fa, 5, NULL, 1);
                 break;
             case ESP_GMF_EVENT_STATE_ERROR:
                 if (esp_timer_get_time() < s_grace_until) {
@@ -467,7 +472,7 @@ static void detect_and_apply_music_source(const char *uri)
 
 static void cb_set_uri(const char *uri)
 {
-    s_finish_notify_spawned = false;
+    s_media_generation++;
     s_near_end_count = 0;
     /* 视频过滤 */
     if (uri && is_video_uri(uri)) {
@@ -479,18 +484,8 @@ static void cb_set_uri(const char *uri)
     detect_and_apply_music_source(uri);
 
     if (s_state_mux) xSemaphoreTake(s_state_mux, portMAX_DELAY);
-    /* 新 URI 时保存当前播放位置（直接读 s_state，避免 get_state() 递归锁）
-     * QQ 音乐切歌时重置进度为 0（QQ 音乐不需要断点续播，且旧进度会导致屏幕显示错误）
-     * 网易云保持原逻辑（断点续播 + 歌词同步依赖连续位置） */
-    music_source_t cur_src = custom_dlna_get_music_source();
-    bool uri_changed = s_track_uri && uri && strcmp(s_track_uri, uri) != 0;
-    if (uri_changed && cur_src == MUSIC_SRC_QQ) {
-        s_saved_pos_sec = 0;
-    } else if (s_state == PS_PLAYING && s_play_start_us > 0) {
-        s_saved_pos_sec = (s_accumulated_ms + (int)((esp_timer_get_time() - s_play_start_us) / 1000LL)) / 1000;
-    } else if (s_state == PS_PAUSED) {
-        s_saved_pos_sec = s_accumulated_ms / 1000;
-    }
+    /* 新 URI 不管是否同一首，进度都归零（新歌从头播，同首歌重播也从0开始） */
+    s_saved_pos_sec = 0;
     free(s_track_uri);
     s_track_uri = uri ? strdup(uri) : NULL;
     /* 新 URI → 重置时长缓存 + 歌词 */
@@ -506,22 +501,29 @@ static void cb_set_uri(const char *uri)
     s_user_stopped = 0;
     if (s_state_mux) xSemaphoreGive(s_state_mux);
     ESP_LOGI(TAG, "SetURI: %s", s_track_uri ? s_track_uri : "(null)");
-    /* 网易云切歌流程：Stop → SetAVTransportURI（不发 Play）。
-     * 如果不自动播放，设备会卡在 STOPPED 状态。
-     * 标准 DLNA 行为：设置新 URI 后自动开始播放。 */
-    if (s_track_uri && s_pipe && (get_state() == PS_STOPPED)) {
-        ESP_LOGI(TAG, "Auto-play on SetURI (state=STOPPED)");
-        cb_play();
+    /* 新 URI → 自动播放（不管当前是 STOPPED、PAUSED 还是 TRANSITIONING，新歌都要播） */
+    if (s_track_uri && s_pipe) {
+        play_state_t st = get_state();
+        if (st == PS_STOPPED || st == PS_PAUSED || st == PS_TRANSITIONING) {
+            ESP_LOGI(TAG, "Auto-play on SetURI (state=%d)", st);
+            cb_play();
+        }
     }
 }
 
 /* ── 播完处理（参考 miair-next next_track()）──
- * FINISHED 事件 → 冻结位置 → 转交给 cb_next() 统一处理 */
+ * FINISHED 事件 → 冻结位置 → 转交给 cb_next() 统一处理
+ * 携带 generation 快照：新 URI 到来后旧任务自动失效 */
 static void delayed_stop_notify(void *arg)
 {
-    (void)arg;
-    if (s_finish_notify_spawned) { vTaskDelete(NULL); return; }
-    s_finish_notify_spawned = true;
+    finish_arg_t *fa = (finish_arg_t *)arg;
+    int gen = fa ? fa->generation : -1;
+    free(fa);
+
+    if (gen != s_media_generation) {
+        ESP_LOGI(TAG, "Finish notify stale (gen=%d, current=%d)", gen, s_media_generation);
+        vTaskDelete(NULL); return;
+    }
 
     /* 冻结最终位置 */
     if (s_play_start_us > 0) {
@@ -535,7 +537,7 @@ static void delayed_stop_notify(void *arg)
 
 static void _do_play(const char *uri, int seek_sec)
 {
-    s_finish_notify_spawned = false;
+    s_media_generation++;
     s_near_end_count = 0;
     if (!s_pipe || !uri) return;
 
@@ -689,7 +691,7 @@ static void cb_play_toggle(void)
 
 static void cb_stop(void)
 {
-    s_finish_notify_spawned = false;
+    s_media_generation++;
     s_near_end_count = 0;
     ESP_LOGI(TAG, "Stop");
 
@@ -725,7 +727,7 @@ static void cb_stop(void)
 /* ── Seek：拖动进度条 ── */
 static void cb_seek(int seconds)
 {
-    s_finish_notify_spawned = false;
+    s_media_generation++;
     s_near_end_count = 0;
     ESP_LOGI(TAG, "Seek %d s (dur=%d)", seconds, s_dur_cache_sec);
     if (!s_pipe) return;
@@ -819,7 +821,7 @@ static void cb_next(void) {
     s_saved_pos_sec = 0;
     free(s_saved_uri); s_saved_uri = NULL;
     s_near_end_count = 0;
-    s_finish_notify_spawned = false;
+    s_media_generation++;
 
     if (s_next_uri && s_next_uri[0]) {
         /* ── 有 next_uri：stop → sleep 1.0s → promote → play ── */
@@ -846,26 +848,63 @@ static void cb_next(void) {
         custom_dlna_update_uri(s_track_uri, next_meta);
         free(next_meta);
     } else {
-        /* ── 无 next_uri：stop → sleep 0.5s → 位置设到曲末 → STOPPED ── */
-        /* 同样抑制中间 STOPPED 事件 */
+        /* ── 无 next_uri：TRANSITIONING 等待手机下发 SetNextAVTransportURI ──
+         * QQ 音乐切歌前会先发 SetNextAVTransportURI，但可能延迟。
+         * 设 TRANSITIONING 触发 UPnP 事件唤醒手机，最多等 10s。 */
         s_grace_until = esp_timer_get_time() + 1000000LL;
         if (s_pipe) {
             esp_gmf_pipeline_stop(s_pipe);
         }
-        /* 短暂延迟，确保完全停止播放（对齐参考项目 0.5s） */
         vTaskDelay(pdMS_TO_TICKS(500));
 
-        if (s_dur_cache_sec > 0) {
-            s_accumulated_ms = s_dur_cache_sec * 1000;  /* 位置=曲末 */
+        set_state(PS_TRANSITIONING);
+        custom_dlna_notify_transport_state_async();
+        ESP_LOGI(TAG, "TRANSITIONING: waiting for next URI (max 10s)...");
+
+        int gen = s_media_generation;
+        int waited = 0;
+        while (waited < 10000) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            waited += 500;
+            /* 新 URI 到来（SetNextAVTransportURI 已写入 s_next_uri） */
+            if (s_next_uri && s_next_uri[0]) {
+                ESP_LOGI(TAG, "TRANSITIONING: got next URI after %dms", waited);
+                break;
+            }
+            /* 检测是否有新媒体介入（generation 变了） */
+            if (gen != s_media_generation) {
+                ESP_LOGI(TAG, "TRANSITIONING: generation changed, abort");
+                return;
+            }
         }
-        s_play_start_us = 0;
-        set_state(PS_STOPPED);
-        custom_dlna_update_uri(NULL, NULL);
+
+        if (s_next_uri && s_next_uri[0]) {
+            /* 收到下一曲 → 播放 */
+            free(s_track_uri);
+            s_track_uri = s_next_uri;
+            s_next_uri = NULL;
+            char *next_meta = s_next_metadata;
+            s_next_metadata = NULL;
+            if (s_pipe) {
+                _do_play(s_track_uri, 0);
+            }
+            custom_dlna_update_uri(s_track_uri, next_meta);
+            free(next_meta);
+        } else {
+            /* 超时无下一曲 → 模拟自然播完 */
+            if (s_dur_cache_sec > 0) {
+                s_accumulated_ms = s_dur_cache_sec * 1000;
+            }
+            s_play_start_us = 0;
+            set_state(PS_STOPPED);
+            custom_dlna_update_uri(NULL, NULL);
+            ESP_LOGI(TAG, "TRANSITIONING: timeout, stopped");
+        }
     }
     custom_dlna_notify_transport_state_async();
 }
 static void cb_previous(void) {
-    s_finish_notify_spawned = false;
+    s_media_generation++;
     s_near_end_count = 0;
     ESP_LOGI(TAG, "Previous");
     s_user_stopped = 0;
@@ -978,6 +1017,7 @@ static void cb_set_metadata(const char *metadata)
         decode_html_entities(s_cur_artist, sizeof(s_cur_artist), artist);
         ESP_LOGI(TAG, "Song: %s - %s", s_cur_title, s_cur_artist);
         lvgl_port_lock();
+        lvgl_port_ui_clear_cover();   /* 新歌先清旧封面 */
         lvgl_port_ui_set_title(s_cur_title);
         lvgl_port_ui_set_artist(s_cur_artist);
         lvgl_port_unlock();
@@ -991,35 +1031,90 @@ static void cb_set_metadata(const char *metadata)
 
 /* ─────────────────────── 专辑封面下载与解码 ─────────────────────── */
 
+/* ── HTTPS 封面下载（esp_http_client 支持 TLS）── */
+static int https_get_cover(const char *url, uint8_t **out_data, int *out_len)
+{
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .timeout_ms = 15000,
+        .buffer_size = 4096,
+        .buffer_size_tx = 1024,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) return -1;
+
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "HTTPS open failed: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        return -1;
+    }
+    int content_length = esp_http_client_fetch_headers(client);
+    int status = esp_http_client_get_status_code(client);
+    if (status != 200) {
+        ESP_LOGW(TAG, "HTTPS status %d", status);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return -1;
+    }
+
+    /* 分配 PSRAM 缓冲区读取响应 */
+    int cap = (content_length > 0) ? content_length + 256 : 256 * 1024;
+    uint8_t *buf = heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
+    if (!buf) {
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return -1;
+    }
+    int total = 0;
+    int r;
+    while ((r = esp_http_client_read(client, (char *)buf + total, cap - total)) > 0) {
+        total += r;
+        if (total > cap - 4096) {
+            int new_cap = cap + 128 * 1024;
+            uint8_t *new_buf = heap_caps_realloc(buf, new_cap, MALLOC_CAP_SPIRAM);
+            if (!new_buf) break;
+            buf = new_buf;
+            cap = new_cap;
+        }
+    }
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    if (total < 16) {
+        ESP_LOGW(TAG, "HTTPS too small: %d bytes", total);
+        heap_caps_free(buf);
+        return -1;
+    }
+
+    *out_data = buf;
+    *out_len = total;
+    ESP_LOGI(TAG, "HTTPS cover downloaded: %d bytes", total);
+    return 0;
+}
+
 /* ── 用原始 socket 下载封面，全部走 PSRAM，避免 esp_http_client 争抢内部 RAM ── */
 static int simple_http_get(const char *url, uint8_t **out_data, int *out_len)
 {
-    /* 解析 URL: http://host[:port]/path（支持 https:// 降级为 http://） */
+    /* 解析 URL: http://host[:port]/path */
     const char *p = url;
-    bool is_https = (strncmp(p, "https://", 8) == 0);
     if (strncmp(p, "http://", 7) == 0) {
         p += 7;
-    } else if (is_https) {
-        ESP_LOGW(TAG, "HTTPS cover, downgrading to HTTP");
-        p += 8;
+    } else if (strncmp(p, "https://", 8) == 0) {
+        /* HTTPS → 委托给 esp_http_client（支持 TLS） */
+        return https_get_cover(url, out_data, out_len);
     } else {
         ESP_LOGW(TAG, "Only http/https supported"); return -1;
     }
 
     char host[128] = "";
-    int port = is_https ? 443 : 80;
+    int port = 80;
     const char *path = "/";
-    /* 提取 host */
     int i = 0;
     while (*p && *p != '/' && *p != ':' && i < 127) host[i++] = *p++;
     host[i] = '\0';
     if (*p == ':') { p++; port = atoi(p); while (*p && *p != '/') p++; }
     if (*p == '/') path = p;
-
-    if (is_https) {
-        /* HTTPS 降级为 HTTP 下载（CDN 通常支持） */
-        port = 80;
-    }
 
     /* DNS 解析 */
     struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
@@ -1123,7 +1218,10 @@ static void album_art_task(void *arg)
         uint8_t *img_data = NULL;
         int img_len = 0;
         if (simple_http_get(url, &img_data, &img_len) != 0) {
-            ESP_LOGW(TAG, "Cover download failed");
+            ESP_LOGW(TAG, "Cover download failed: %s", url);
+            lvgl_port_lock();
+            lvgl_port_ui_clear_cover();
+            lvgl_port_unlock();
             free(url); continue;
         }
 
@@ -1649,7 +1747,7 @@ static void ui_update_task(void *arg)
         /* ── 主动播完检测（参考 miair-next _check_play_status）──
          * 软件位置接近曲末但底层未触发 FINISHED 时的兜底。
          * 对齐参考项目：剩余 <1.0s，连续 2 次检测（≈2s 窗口，25Hz 下 50 tick）。 */
-        if (get_state() == PS_PLAYING && s_dur_cache_sec > 0 && !s_finish_notify_spawned) {
+        if (get_state() == PS_PLAYING && s_dur_cache_sec > 0) {
             int remain_ms = s_dur_cache_sec * 1000 - get_position_ms();
             if (remain_ms <= 0) {
                 /* remain_ms <= 0 说明已到曲末或时长被下一首覆盖，跳过 */
@@ -1658,7 +1756,9 @@ static void ui_update_task(void *arg)
                 if (++s_near_end_count >= 50) {
                     s_near_end_count = 0;
                     ESP_LOGI(TAG, "Software near-end detected (remain=%d), forcing completion", remain_ms);
-                    xTaskCreatePinnedToCore(delayed_stop_notify, "stop_dly", 3072, NULL, 5, NULL, 1);
+                    finish_arg_t *fa = malloc(sizeof(finish_arg_t));
+                    if (fa) { fa->generation = s_media_generation; }
+                    xTaskCreatePinnedToCore(delayed_stop_notify, "stop_dly", 3072, fa, 5, NULL, 1);
                 }
             } else {
                 s_near_end_count = 0;
