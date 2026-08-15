@@ -629,8 +629,15 @@ static void parse_klyric(const char *klyric_text)
                             is_yrc = true;
                             word_time = line_start;
                         }
+                        /* dur<=0 时兜底（对齐 LyricOn: dur==0 → end-start，
+                         * 保证每个字至少有点时长，karaoke 不会瞬间跳过） */
+                        int end = a + b;
+                        if (b <= 0) {
+                            if (end > a) b = end - a;
+                            else { b = 1; end = a + 1; }
+                        }
                         s_klyric_start[s_klyric_count] = a;
-                        s_klyric_end[s_klyric_count] = a + b;
+                        s_klyric_end[s_klyric_count] = end;
                         s_klyric_count++;
                         rp = strchr(rp, ')');
                         if (!rp) break;
@@ -640,6 +647,11 @@ static void parse_klyric(const char *klyric_text)
                         /* klyric 格式: (offset,dur) — offset 相对前一字末尾 */
                         if (!is_yrc) {
                             word_time += a;
+                            int end = word_time + b;
+                            if (b <= 0) {   /* dur<=0 兜底，避免 0 时长字 */
+                                if (end > word_time) b = end - word_time;
+                                else { b = 1; end = word_time + 1; }
+                            }
                             s_klyric_start[s_klyric_count] = word_time;
                             s_klyric_end[s_klyric_count] = word_time + b;
                             s_klyric_count++;
