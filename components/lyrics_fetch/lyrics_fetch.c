@@ -436,7 +436,25 @@ static void generate_pseudo_klyric(const lyric_data_t *data)
         if (!text[0]) continue;
 
         int line_start = data->lines[i].time_ms;
-        int line_end = (i + 1 < data->count) ? data->lines[i + 1].time_ms : line_start + 5000;
+        /* 末句无下句时，按可唱字符数估算时长（参考 MeloX min/max 0.32s/字, 2~8s）
+         * 避免短末句固定5秒长时间空滚 */
+        int line_end;
+        if (i + 1 < data->count) {
+            line_end = data->lines[i + 1].time_ms;
+        } else {
+            int sung_chars = 0;
+            const char *st = text;
+            while (*st) {
+                unsigned char c = (unsigned char)*st;
+                if (c >= 0xE0) { sung_chars++; st += 3; }
+                else if (c >= 0xC0) { sung_chars++; st += 2; }
+                else { sung_chars++; st++; }
+            }
+            int est_ms = (int)(sung_chars * 320.0f);   /* 0.32s/字 */
+            if (est_ms < 2000) est_ms = 2000;          /* 下限 2s */
+            if (est_ms > 8000) est_ms = 8000;          /* 上限 8s */
+            line_end = line_start + est_ms;
+        }
         int line_dur = line_end - line_start;
         if (line_dur <= 0) line_dur = 3000;
 
@@ -898,38 +916,20 @@ int lyrics_get_karaoke_byte_idx(int line_idx, const char *line_text, int pos_ms)
         return -1;
     }
 
-    /* 二分查找当前所处的字 */
-    int lo = first, hi = last - 1, found = -1;
-    while (lo <= hi) {
-        int mid = (lo + hi) / 2;
-        if (s_klyric_end[mid] <= pos_ms) {
-            lo = mid + 1;
+    /* 移植 MeloX 语义：不用百分比二次映射，直接看逐字时间戳决定"已唱到第几个字"。
+     * 每个字独立的 [start,end]，pos_ms 进入该字区间即点亮该字。
+     * 已唱字数 = 处于或越过本行第几个字。 */
+    int sung_words;
+    int found = -1;
+    for (int k = first; k < last; k++) {
+        if (pos_ms >= s_klyric_start[k]) {
+            found = k;
         } else {
-            found = mid;
-            hi = mid - 1;
+            break;
         }
     }
-
-    /* 计算百分比进度（0-100），与 v2.4 方案一致 */
-    int progress;
-    if (found < 0) {
-        progress = 100;
-    } else if (pos_ms < s_klyric_start[found]) {
-        int idx = found - first;
-        progress = (idx > 0) ? idx * 100 / word_count : 0;
-    } else {
-        int idx = found - first;
-        int word_dur = s_klyric_end[found] - s_klyric_start[found];
-        if (word_dur <= 0) {
-            progress = (idx + 1) * 100 / word_count;
-        } else {
-            int sub = (pos_ms - s_klyric_start[found]) * 100 / word_dur;
-            if (sub > 100) sub = 100;
-            progress = (idx * 100 + sub) / word_count;
-        }
-    }
-    if (progress < 0) progress = 0;
-    if (progress > 100) progress = 100;
+    sung_words = (found < 0) ? 0 : (found - first + 1);
+    if (sung_words > word_count) sung_words = word_count;
 
     xSemaphoreGive(s_mutex);
 
@@ -963,8 +963,11 @@ int lyrics_get_karaoke_byte_idx(int line_idx, const char *line_text, int pos_ms)
         t += bytes;
     }
 
-    /* 百分比映射到可唱字符索引，再找字节偏移 */
-    int target_char = total_sung * progress / 100;
+    /* 逐字严格对应：一个字 = 一个可唱字符（klyric 每个括号一个字）。
+     * 已唱字数即已点亮字符数。当前正唱到的字也视为亮起半个取其整，
+     * 让高亮覆盖到"正在唱"的那个字。 */
+    int target_char = sung_words;
+    if (target_char > total_sung) target_char = total_sung;
     const char *p = line_text;
     int char_count = 0;
     while (*p && char_count < target_char) {

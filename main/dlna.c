@@ -145,6 +145,7 @@ static play_state_t get_state(void)
 
 /* ── Delayed STOPPED notification (forward decl) ── */
 static void delayed_stop_notify(void *arg);
+static void cb_play(void);
 static void cb_next(void);
 static void cb_previous(void);
 static void cb_play_toggle(void);
@@ -505,6 +506,13 @@ static void cb_set_uri(const char *uri)
     s_user_stopped = 0;
     if (s_state_mux) xSemaphoreGive(s_state_mux);
     ESP_LOGI(TAG, "SetURI: %s", s_track_uri ? s_track_uri : "(null)");
+    /* 网易云切歌流程：Stop → SetAVTransportURI（不发 Play）。
+     * 如果不自动播放，设备会卡在 STOPPED 状态。
+     * 标准 DLNA 行为：设置新 URI 后自动开始播放。 */
+    if (s_track_uri && s_pipe && (get_state() == PS_STOPPED)) {
+        ESP_LOGI(TAG, "Auto-play on SetURI (state=STOPPED)");
+        cb_play();
+    }
 }
 
 /* ── 播完处理（参考 miair-next next_track()）──
@@ -1534,6 +1542,19 @@ static int utf8_char_count(const char *s)
     return count;
 }
 
+/* ── 末句时长估算（移植 MeloX：min(max(可唱字数*0.32s, 2s), 8s)）──
+ * 整首歌末尾那句没有下句时间戳，若用总时长兜底会让滚动/高亮长时间停滞。
+ * 按这句实际可唱字数估算其显示时长，长句给够、短句不白等。 */
+static int estimate_last_line_duration_ms(const char *text)
+{
+    int chars = utf8_char_count(text);
+    if (chars < 1) chars = 1;
+    int est = chars * 320;            /* 0.32 s/字 */
+    if (est < 2000) return 2000;      /* 下限 2s */
+    if (est > 8000) return 8000;      /* 上限 8s */
+    return est;
+}
+
 static void ui_update_task(void *arg)
 {
     (void)arg;
@@ -1571,8 +1592,9 @@ static void ui_update_task(void *arg)
         }
         lvgl_port_ui_set_volume(s_vol);
 
+        /* 歌词界面可见时才更新（不可见时跳过，避免 label 在未加载屏幕上取错宽度） */
         const lyric_data_t *lyr = lyrics_get_data();
-        if (lyr && lyr->loaded && lyr->count > 0) {
+        if (lyr && lyr->loaded && lyr->count > 0 && lvgl_port_ui_lyrics_is_visible()) {
             int cur = lyrics_get_current_line(pos_ms);
             const char *prev = (cur > 0) ? lyr->lines[cur - 1].text : "";
             const char *curr = lyr->lines[cur].text;
@@ -1582,11 +1604,14 @@ static void ui_update_task(void *arg)
             if (cur != last_cur_line) {
                 last_cur_line = cur;
                 lvgl_port_ui_lyrics_update(cur, prev, curr, next);
-                /* 滚动速率与这句歌词时长相绑定 */
+                /* 滚动速率与这句歌词时长相绑定（末句按字数估算，避免滚动停滞） */
                 int line_start = lyr->lines[cur].time_ms;
-                int line_end = (cur + 1 < lyr->count)
-                    ? lyr->lines[cur + 1].time_ms
-                    : s_dur_cache_sec * 1000;
+                int line_end;
+                if (cur + 1 < lyr->count) {
+                    line_end = lyr->lines[cur + 1].time_ms;
+                } else {
+                    line_end = line_start + estimate_last_line_duration_ms(curr);
+                }
                 if (line_end <= line_start) line_end = line_start + 5000;
                 lvgl_port_ui_lyrics_scroll_to_end(line_end - line_start);
             }
@@ -1599,9 +1624,12 @@ static void ui_update_task(void *arg)
                     /* 回退到百分比估算 */
                     int total_chars = utf8_char_count(curr);
                     int line_start = lyr->lines[cur].time_ms;
-                    int line_end = (cur + 1 < lyr->count)
-                        ? lyr->lines[cur + 1].time_ms
-                        : s_dur_cache_sec * 1000;
+                    int line_end;
+                    if (cur + 1 < lyr->count) {
+                        line_end = lyr->lines[cur + 1].time_ms;
+                    } else {
+                        line_end = line_start + estimate_last_line_duration_ms(curr);
+                    }
                     if (line_end <= line_start) line_end = line_start + 5000;
                     int line_dur = line_end - line_start;
                     int est_sing = line_dur * 80 / 100;
@@ -1614,7 +1642,7 @@ static void ui_update_task(void *arg)
                 }
                 lvgl_port_ui_lyrics_karaoke(byte_idx);
             }
-        } else {
+        } else if (!lyr || !lyr->loaded || lyr->count <= 0) {
             last_cur_line = -1;
         }
 

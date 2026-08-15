@@ -3,9 +3,6 @@
  * SPDX-License-Identifier: LicenseRef-Espressif-Modified-MIT
  *
  * See LICENSE file for details.
- *
- * NOTE: 移除了 CONFIG_AUDIO_SIMPLE_DEC_* 的 #ifdef 守卫。
- * 原因同 audio_decoder_reg.c：Kconfig 不被 IDF 发现，强制注册全部。
  */
 
 #include "sdkconfig.h"
@@ -14,17 +11,39 @@
 esp_audio_err_t esp_audio_simple_dec_register_default(void)
 {
     esp_audio_err_t ret = ESP_AUDIO_ERR_OK;
+#ifdef CONFIG_AUDIO_SIMPLE_DEC_WAV_SUPPORT
     ret |= esp_wav_dec_register();
+#endif /* CONFIG_AUDIO_SIMPLE_DEC_WAV_SUPPORT */
+
+#ifdef CONFIG_AUDIO_SIMPLE_DEC_M4A_SUPPORT
     ret |= esp_m4a_dec_register();
+#endif /* CONFIG_AUDIO_SIMPLE_DEC_M4A_SUPPORT */
+
+#ifdef CONFIG_AUDIO_SIMPLE_DEC_TS_SUPPORT
     ret |= esp_ts_dec_register();
+#endif /* CONFIG_AUDIO_SIMPLE_DEC_TS_SUPPORT */
+
+#ifdef CONFIG_AUDIO_SIMPLE_DEC_OGG_SUPPORT
     ret |= esp_ogg_dec_register();
+#endif /* CONFIG_AUDIO_SIMPLE_DEC_OGG_SUPPORT */
     return ret;
 }
 
 void esp_audio_simple_dec_unregister_default(void)
 {
+#ifdef CONFIG_AUDIO_SIMPLE_DEC_WAV_SUPPORT
     esp_wav_dec_unregister();
+#endif /* CONFIG_AUDIO_SIMPLE_DEC_WAV_SUPPORT */
+
+#ifdef CONFIG_AUDIO_SIMPLE_DEC_M4A_SUPPORT
     esp_m4a_dec_unregister();
+#endif /* CONFIG_AUDIO_SIMPLE_DEC_M4A_SUPPORT */
+
+#ifdef CONFIG_AUDIO_SIMPLE_DEC_TS_SUPPORT
     esp_ts_dec_unregister();
+#endif /* CONFIG_AUDIO_SIMPLE_DEC_TS_SUPPORT */
+
+#ifdef CONFIG_AUDIO_SIMPLE_DEC_OGG_SUPPORT
     esp_ogg_dec_unregister();
+#endif /* CONFIG_AUDIO_SIMPLE_DEC_OGG_SUPPORT */
 }

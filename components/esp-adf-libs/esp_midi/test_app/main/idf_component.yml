@@ -1,4 +1,0 @@
-dependencies:
-  espressif/esp_midi:
-    version: "*"
-    override_path: "../.."
