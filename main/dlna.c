@@ -34,6 +34,7 @@
 #include "tft_display.h"
 #include "lvgl_port.h"
 #include "lyrics_fetch.h"
+#include "miplay.h"
 #include "esp_http_client.h"
 #include "esp_jpeg_dec.h"
 #include "lwip/sockets.h"
@@ -1882,6 +1883,27 @@ static void mdns_service_init(void)
     ESP_LOGI(TAG, "mDNS: esp32-dlna.local._dlna._tcp:8080 registered");
 }
 
+/* MiPlay 连接状态回调：暂停/恢复 DLNA SSDP + 停止音频管线 */
+static void dlna_on_miplay_connected(bool connected)
+{
+    custom_dlna_set_ssdp_suppressed(connected);
+    if (connected) {
+        ESP_LOGI(TAG, "=== MiPlay connected → stopping DLNA pipeline ===");
+        /* 停止 DLNA GMF 音频管线（释放 I2S + 内存） */
+        if (s_pipe) {
+            esp_gmf_pipeline_stop(s_pipe);
+            ESP_LOGI(TAG, "DLNA pipeline stopped");
+        }
+        /* 打印内存状态 */
+        ESP_LOGI(TAG, "Heap: %lu free, %lu min_free, PSRAM: %lu free",
+                 (unsigned long)esp_get_free_heap_size(),
+                 (unsigned long)esp_get_minimum_free_heap_size(),
+                 (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    } else {
+        ESP_LOGI(TAG, "=== MiPlay disconnected → DLNA resumed ===");
+    }
+}
+
 /* ─────────────────────── Entry point ─────────────────────── */
 void app_main(void)
 {
@@ -1938,6 +1960,11 @@ void app_main(void)
     /* ── TFT 显示 + LVGL ── */
     tft_init();
     lvgl_port_init(5);
+
+    /* ── MiPlay 小米妙播（LVGL 之后，确保显示任务先分配堆内存）── */
+    miplay_init();
+    /* MiPlay 连接时暂停 DLNA SSDP，断开后恢复，避免手机混淆 */
+    miplay_set_connected_cb(dlna_on_miplay_connected);
 
     /* 旋钮焦点框选 → 播放控制 */
     lvgl_port_ui_register_btn_prev_cb(cb_previous);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -115,6 +116,11 @@ music_source_t custom_dlna_get_music_source(void);
  *        用于应用层做音乐源检测。
  */
 const char* custom_dlna_get_user_agent(void);
+
+/**
+ * @brief 暂停/恢复 SSDP 响应（MiPlay 模式下暂停 DLNA 发现）
+ */
+void custom_dlna_set_ssdp_suppressed(bool suppressed);
 
 #ifdef __cplusplus
 }

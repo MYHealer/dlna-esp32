@@ -21,4 +21,5 @@ idf_component_register(SRCS "dlna.c"
                         esp_mm
                         esp_netif
                         esp_wifi
-                        espressif__mdns)
+                        espressif__mdns
+                        miplay)

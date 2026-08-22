@@ -88,6 +88,13 @@ music_source_t custom_dlna_get_music_source(void) { return s_music_source; }
 const char* custom_dlna_get_user_agent(void) { return s_user_agent; }
 static int  s_volume_cache = 50;   /* cached volume for fast SOAP response */
 static int  s_mute_cache   = 0;    /* cached mute for fast SOAP response */
+static volatile bool s_ssdp_suppressed = false;  /* MiPlay 活跃时暂停 SSDP */
+
+void custom_dlna_set_ssdp_suppressed(bool suppressed)
+{
+    s_ssdp_suppressed = suppressed;
+    ESP_LOGI(TAG, "SSDP %s", suppressed ? "suppressed (MiPlay active)" : "resumed");
+}
 
 /* Forward declaration: SOAP ok stub used by dispatch */
 static void soap_ok_stub(httpd_req_t *req, const char *service, const char *action);
@@ -1278,8 +1285,14 @@ static void ssdp_task(void *arg)
         if (n > 0) {
             buf[n] = '\0';
             if (!strstr(buf, "M-SEARCH")) continue;
+            if (s_ssdp_suppressed) continue;  /* MiPlay 模式下不响应 SSDP */
             ESP_LOGI(TAG, "SSDP M-SEARCH from %s:%d (%d bytes)",
                      inet_ntoa(from.sin_addr), ntohs(from.sin_port), n);
+            /* Replace \r\n with spaces for single-line logging */
+            for (int j = 0; j < n; j++) {
+                if (buf[j] == '\r' || buf[j] == '\n') buf[j] = '|';
+            }
+            ESP_LOGI(TAG, "  RAW: %.200s", buf);
             char *st = strstr(buf, "ST:");
             if (!st) continue;
             st += 3;
@@ -1289,6 +1302,7 @@ static void ssdp_task(void *arg)
             while (st[i] != '\r' && st[i] != '\n' && st[i] && i < 127) {
                 stv[i] = st[i]; i++;
             }
+            ESP_LOGI(TAG, "  ST='%s'", stv);
             bool all = !!strstr(stv, "ssdp:all");
             /* 随机延迟 0~1 秒响应（避免多设备同时响应造成网络风暴） */
             vTaskDelay(pdMS_TO_TICKS(esp_random() % 1000));
