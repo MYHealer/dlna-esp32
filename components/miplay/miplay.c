@@ -16,6 +16,7 @@
 #include "esp_err.h"
 #include "esp_mac.h"
 #include "esp_timer.h"
+#include <sys/time.h>
 #include "esp_netif.h"
 #include "mbedtls/md5.h"
 #include "mbedtls/sha1.h"
@@ -38,9 +39,9 @@
 static const char *TAG = "miplay";
 
 /* ── mDNS 服务名 ── */
-#define MIPLAY_LYRA_SERVICE     "_lyra-mdns"
+#define MIPLAY_LYRA_SERVICE     "lyra-mdns"
 #define MIPLAY_LYRA_PROTO       "_udp"
-#define MIPLAY_MICON_SERVICE    "_mi-connect"
+#define MIPLAY_MICON_SERVICE    "mi-connect"
 #define MIPLAY_MICON_PROTO      "_udp"
 #define MIPLAY_LAN_SERVICE      "_miplay_lan"
 #define MIPLAY_LAN_PROTO        "_tcp"
@@ -380,7 +381,11 @@ static esp_err_t register_mdns_services(void)
             snprintf(debug_info, sizeof(debug_info), "{msg:reply, ifname:STA, v4:%u.%s.%s.%u}",
                      (unsigned)ip[0], enc1, enc2, (unsigned)ip[3]);
         }
-        snprintf(ts_str, sizeof(ts_str), "%lld", (long long)(esp_timer_get_time()/1000));
+        /* TS = Unix epoch milliseconds（FusionPlay 用 SystemTime::now()） */
+        struct timeval tv_now;
+        gettimeofday(&tv_now, NULL);
+        long long ts_ms = (long long)tv_now.tv_sec * 1000LL + tv_now.tv_usec / 1000;
+        snprintf(ts_str, sizeof(ts_str), "%lld", ts_ms);
         snprintf(ch_str, sizeof(ch_str), "%d", channel);
 
         mdns_txt_item_t lyra_txt[] = {
@@ -621,7 +626,16 @@ static void miplay_lan_task(void *arg)
         socklen_t srclen = sizeof(src);
         int n = recvfrom(s_lan_sock, rx_buf, sizeof(rx_buf), 0,
                          (struct sockaddr *)&src, &srclen);
-        if (n < (int)SERVICE_QNAME_LEN) continue;
+        if (n <= 0) continue;
+        if (n < (int)SERVICE_QNAME_LEN) {
+            ESP_LOGI(TAG, "LAN recv %d bytes from %u.%u.%u.%u:%u (too short)",
+                     n, (unsigned)(src.sin_addr.s_addr & 0xFF),
+                     (unsigned)((src.sin_addr.s_addr >> 8) & 0xFF),
+                     (unsigned)((src.sin_addr.s_addr >> 16) & 0xFF),
+                     (unsigned)((src.sin_addr.s_addr >> 24) & 0xFF),
+                     (unsigned)ntohs(src.sin_port));
+            continue;
+        }
 
         /* 检查报文是否含 _miplay_lan._tcp 服务名 */
         int found = 0;
@@ -1267,6 +1281,14 @@ static int rtsp_read_msg(int sock, char *headers, size_t hdr_max,
             if (n <= 0) {
                 ESP_LOGW(TAG, "[RTSP-recv] n=%d errno=%d used=%u",
                          n, errno, (unsigned)s_rtsp_buf_used);
+                if (s_rtsp_buf_used > 0) {
+                    /* 打印缓冲区内容帮助诊断 */
+                    char hex[128];
+                    int hlen = 0;
+                    for (size_t i = 0; i < s_rtsp_buf_used && i < 40; i++)
+                        hlen += snprintf(hex + hlen, sizeof(hex) - hlen, "%02X ", (uint8_t)s_rtsp_buf[i]);
+                    ESP_LOGW(TAG, "[RTSP-recv] buf[%u]: %s", (unsigned)s_rtsp_buf_used, hex);
+                }
                 return n == 0 ? 0 : -1;
             }
             s_rtsp_buf_used += n;
@@ -1590,7 +1612,7 @@ static void media_receive_task(void *arg)
         vTaskDelete(NULL); return;
     }
 
-    struct timeval tv = { .tv_sec = 5 };
+    struct timeval tv = { .tv_sec = 10 };
     setsockopt(media_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     uint32_t pkt_count = 0, rtp_total = 0, pcm_total = 0;
@@ -1604,6 +1626,7 @@ static void media_receive_task(void *arg)
             int n = recv(media_sock, hdr + got, 4 - got, 0);
             if (n <= 0) {
                 if (!s_running) break;
+                if (n == 0) { ESP_LOGI(TAG, "[MEDIA] Socket closed"); goto m_cleanup; }
                 if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
                 ESP_LOGW(TAG, "[MEDIA] recv error: %d", errno);
                 goto m_cleanup;
@@ -1797,15 +1820,20 @@ static void miplay_rtsp_run(const char *host, int port, int client_sock)
     int cseq = 1;
     int sent_options = 0;
     int rtsp_state = 0;  /* 0=handshake, 1=setup_sent, 2=playing */
+    int cseq_of_options = 0;   /* 我们 OPTIONS 请求的 cseq */
+    int cseq_of_getparam = 0;  /* 我们 GET_PARAMETER 请求的 cseq */
+    int cseq_of_setup = 0;     /* 我们 SETUP 请求的 cseq */
+    int cseq_of_play = 0;      /* 我们 PLAY 请求的 cseq */
 
-    /* 阻塞超时（30秒，等手机发消息） */
-    struct timeval tv30 = { .tv_sec = 30 };
-    setsockopt(rtsp_sock, SOL_SOCKET, SO_RCVTIMEO, &tv30, sizeof(tv30));
+    /* 阻塞超时（2秒，等手机发消息，与 Rust 500ms 接近） */
+    struct timeval tv2 = { .tv_sec = 2 };
+    setsockopt(rtsp_sock, SOL_SOCKET, SO_RCVTIMEO, &tv2, sizeof(tv2));
 
     /* 重置持久缓冲区（清除上次会话残留数据） */
     rtsp_read_msg_reset();
 
     while (s_running && rtsp_state < 2) {
+        ESP_LOGI(TAG, "[RTSP] Waiting for msg (state=%d)...", rtsp_state);
         int ret = rtsp_read_msg(rtsp_sock, headers, RTSP_BUF_SIZE,
                                  body, RTSP_BUF_SIZE, &body_len);
         if (ret <= 0) {
@@ -1813,29 +1841,39 @@ static void miplay_rtsp_run(const char *host, int port, int client_sock)
             else ESP_LOGW(TAG, "[RTSP] Read error (errno=%d)", errno);
             break;
         }
+        ESP_LOGI(TAG, "[RTSP] Got msg (%d bytes)", ret);
 
         int peer_cseq = rtsp_get_cseq(headers);
         int is_resp = (strncmp(headers, "RTSP/1.0 ", 9) == 0);
 
         if (is_resp) {
             /* ── 处理我们发出的请求的响应 ── */
-            if (peer_cseq == 1 && strstr(headers, "200")) {
+            ESP_LOGI(TAG, "[RTSP] ← resp cseq=%d: %.120s", peer_cseq, headers);
+            if (peer_cseq == cseq_of_options && strstr(headers, "200")) {
                 ESP_LOGI(TAG, "[RTSP] ← OPTIONS resp 200");
             }
-            else if (peer_cseq == 2 && strstr(headers, "200")) {
+            else if (peer_cseq == cseq_of_getparam && strstr(headers, "200")) {
+                ESP_LOGI(TAG, "[RTSP] ← GET_PARAMETER resp (body=%d bytes)", body_len);
+                if (body_len > 0) ESP_LOGI(TAG, "[RTSP] GET_PARAMETER resp body: %.200s", body);
+            }
+            else if (peer_cseq == cseq_of_setup && strstr(headers, "200")) {
                 /* SETUP 响应 — 提取 session，立即发 PLAY（与 Python v7 一致） */
                 rtsp_get_session(headers, session_id, sizeof(session_id));
                 ESP_LOGI(TAG, "[RTSP] ← SETUP resp 200, session=%s", session_id);
                 char play_extra[64];
                 snprintf(play_extra, sizeof(play_extra), "Session: %s\r\n", session_id);
+                cseq_of_setup = 0;  /* 清除 */
                 rtsp_send_req(rtsp_sock, "PLAY", pres_url, play_extra, cseq);
                 ESP_LOGI(TAG, "[RTSP] → PLAY (session=%s, cseq=%d)", session_id, cseq);
+                cseq_of_play = cseq;
                 cseq++;
             }
-            else if (peer_cseq == 3 && strstr(headers, "200")) {
-                /* PLAY 响应 — 流已启动 */
+            else if (peer_cseq == cseq_of_play && strstr(headers, "200")) {
                 ESP_LOGI(TAG, "[RTSP] ← PLAY resp 200 === STREAM STARTED ===");
                 rtsp_state = 2;
+            }
+            else if (strstr(headers, "200")) {
+                ESP_LOGI(TAG, "[RTSP] ← resp 200 (cseq=%d, ignored)", peer_cseq);
             }
             continue;
         }
@@ -1846,18 +1884,100 @@ static void miplay_rtsp_run(const char *host, int port, int client_sock)
         ESP_LOGI(TAG, "[RTSP] ← %s (cseq=%d)", method, peer_cseq);
 
         if (strcmp(method, "OPTIONS") == 0) {
-            /* 响应手机的 OPTIONS（使用专用 OPTIONS 响应函数，Public 在 headers 区） */
-            rtsp_send_options_resp(rtsp_sock, peer_cseq, NULL);
+            ESP_LOGI(TAG, "[RTSP] OPTIONS headers(%d): %.200s", (int)strlen(headers), headers);
+            /* 解析 wfd_timer_server_port */
+            char *tsp = strstr(headers, "wfd_timer_server_port:");
+            if (tsp) {
+                uint32_t tip = 0; int tport = 0;
+                sscanf(tsp, "wfd_timer_server_port:%lu:%d", &tip, &tport);
+                ESP_LOGI(TAG, "[RTSP] Timer server: %lu.%lu.%lu.%u:%d",
+                         (unsigned long)(tip & 0xFF), (unsigned long)((tip >> 8) & 0xFF),
+                         (unsigned long)((tip >> 16) & 0xFF), (unsigned)((tip >> 24) & 0xFF), tport);
+            }
+            /* ── OPTIONS 响应：有 auth 时带 HMAC，无 auth 时不带 ── */
+            {
+                char auth_ack_hex[65] = {0};
+                char *phone_auth = strstr(headers, "authMsg:");
+                if (phone_auth && s_has_mirror_auth_key) {
+                    phone_auth += 8;
+                    while (*phone_auth == ' ' || *phone_auth == '\t' ||
+                           *phone_auth == '\r' || *phone_auth == '\n') phone_auth++;
+                    uint8_t hash[32];
+                    hmac_sha256((const uint8_t *)s_mirror_auth_key, 16,
+                                (const uint8_t *)phone_auth, 16, hash);
+                    hex_to_lower(hash, 32, auth_ack_hex);
+                    ESP_LOGI(TAG, "[RTSP] authMsg=%.16s → ack=%.16s...", phone_auth, auth_ack_hex);
+                }
+                char resp[512];
+                int rlen;
+                if (auth_ack_hex[0]) {
+                    rlen = snprintf(resp, sizeof(resp),
+                        "RTSP/1.0 200 OK\r\n"
+                        "User-Agent: stagefright/1.1 (Linux;Android 4.1)\r\n"
+                        "CSeq: %d\r\n"
+                        "Public: org.wfa.wfd1.0, GET_PARAMETER, SET_PARAMETER\r\n"
+                        "authKeyType:2\r\n"
+                        "authAlgorithmVal:4\r\n"
+                        "authMsgAck:%s\r\n"
+                        "\r\n",
+                        peer_cseq, auth_ack_hex);
+                } else {
+                    rlen = snprintf(resp, sizeof(resp),
+                        "RTSP/1.0 200 OK\r\n"
+                        "User-Agent: stagefright/1.1 (Linux;Android 4.1)\r\n"
+                        "CSeq: %d\r\n"
+                        "Public: org.wfa.wfd1.0, GET_PARAMETER, SET_PARAMETER\r\n"
+                        "\r\n",
+                        peer_cseq);
+                }
+                send(rtsp_sock, resp, rlen, 0);
+            }
             ESP_LOGI(TAG, "[RTSP] → OPTIONS resp (cseq=%d)", peer_cseq);
-            /* 再发我们自己的 OPTIONS（无 authMsg，与 Python v7 一致） */
+            /* 发我们自己的 OPTIONS（带独立随机 challenge） */
             if (!sent_options) {
-                rtsp_send_req(rtsp_sock, "OPTIONS", "*",
+                char rtsp_chal[33] = {0};
+                uint8_t rb[16];
+                for (int i = 0; i < 16; i += 4) {
+                    uint32_t r = esp_random();
+                    memcpy(rb + i, &r, 4);
+                }
+                hex_to_lower(rb, 16, rtsp_chal);
+                char extra[128];
+                snprintf(extra, sizeof(extra),
                     "Require: org.wfa.wfd1.0\r\n"
-                    "lib_version: audio-display-release2.1 2.1.5071614\r\n",
-                    cseq);
-                ESP_LOGI(TAG, "[RTSP] → OPTIONS req (cseq=%d)", cseq);
+                    "lib_version: audio-display-release2.1 2.1.5071614\r\n"
+                    "authMsg:%s\r\n",
+                    rtsp_chal);
+                rtsp_send_req(rtsp_sock, "OPTIONS", "*", extra, cseq);
+                ESP_LOGI(TAG, "[RTSP] → OPTIONS req (cseq=%d, authMsg=%.16s)", cseq, rtsp_chal);
+                cseq_of_options = cseq;
                 cseq++;
                 sent_options = 1;
+            }
+        }
+        else if (strcmp(method, "rtp_ports") == 0) {
+            /* rtp_ports 有两种情况：
+             * 1. 手机对我们 GET_PARAMETER 的响应 → 不回复
+             * 2. 手机主动发的请求 → 回复 capabilities */
+            if (peer_cseq == cseq_of_getparam) {
+                ESP_LOGI(TAG, "[RTSP] rtp_ports is resp to our GET_PARAMETER (cseq=%d), ack", peer_cseq);
+                cseq_of_getparam = 0;
+            } else {
+                const char *cap =
+                "wfd_audio_codecs_v2: 15 3 3\r\n"
+                "wfd_video_formats: none\r\n"
+                "wfd_video_enctype: none\r\n"
+                "wfd_video_gamuttype: none\r\n"
+                "wfd_video_bitrate: none\r\n"
+                "wfd_current_video_info: none\r\n"
+                "wfd_client_rtp_ports: RTP/AVP/TCP;interleaved mode=play\r\n"
+                "miplay_support_image: none\r\n"
+                "wfd_standby_resume_capability: supported\r\n"
+                "wfd_content_SP_protection: 4 1 256 3 1 1 0 0\r\n"
+                "wfd_support_secure_win:enable\r\n"
+                "device_info: -1 -1 -1 -1 -1 -1 -1\r\n";
+                rtsp_send_resp(rtsp_sock, peer_cseq, cap);
+                ESP_LOGI(TAG, "[RTSP] → rtp_ports resp (caps, cseq=%d)", peer_cseq);
             }
         }
         else if (strcmp(method, "GET_PARAMETER") == 0) {
@@ -1949,6 +2069,7 @@ static void miplay_rtsp_run(const char *host, int port, int client_sock)
                 }
                 rtsp_send_req(rtsp_sock, "SETUP", pres_url, extra, cseq);
                 ESP_LOGI(TAG, "[RTSP] → SETUP (cseq=%d)", cseq);
+                cseq_of_setup = cseq;
                 cseq++;
                 rtsp_state = 1;
             }
@@ -1965,7 +2086,9 @@ static void miplay_rtsp_run(const char *host, int port, int client_sock)
             break;
         }
         else {
-            ESP_LOGW(TAG, "[RTSP] unhandled: %s", method);
+            ESP_LOGW(TAG, "[RTSP] unhandled: %s (cseq=%d, body_len=%d)",
+                     method, peer_cseq, body_len);
+            if (body_len > 0) ESP_LOGW(TAG, "[RTSP] body: %.120s", body);
             rtsp_send_resp(rtsp_sock, peer_cseq, NULL);
         }
     }
@@ -1991,19 +2114,53 @@ static void miplay_rtsp_run(const char *host, int port, int client_sock)
             if (s_media_stack) {
                 th = xTaskCreateStaticPinnedToCore(
                     media_receive_task, "media_rx",
-                    MEDIA_TASK_STACK_SIZE, marg, 4,
+                    MEDIA_TASK_STACK_SIZE, marg, 8,
                     s_media_stack, &s_media_tcb, 1);
             }
             if (th) {
-                ESP_LOGI(TAG, "[MEDIA] Task launched, returning to ctrl loop");
-                free(headers); free(body);
+                ESP_LOGI(TAG, "[MEDIA] Task launched, continuing RTSP loop for keepalive");
                 s_image_sock = -1; s_multi_sock = -1;
-                return;
+                /* 不 return！继续维护 RTSP 控制连接，响应手机的 GET_PARAMETER keepalive */
+            } else {
+                ESP_LOGE(TAG, "[MEDIA] Task creation failed (no PSRAM stack?)");
+                free(marg);
             }
-            ESP_LOGE(TAG, "[MEDIA] Task creation failed (no PSRAM stack?)");
-            free(marg);
         }
-        ESP_LOGE(TAG, "[MEDIA] Cannot start media task — no inline fallback (blocks heartbeat)");
+    }
+
+    /* ── PLAY 后继续维护 RTSP 连接（响应 GET_PARAMETER / TEARDOWN）── */
+    if (rtsp_state >= 2) {
+        ESP_LOGI(TAG, "[RTSP] Entering keepalive loop...");
+        while (s_running) {
+            int ret = rtsp_read_msg(rtsp_sock, headers, RTSP_BUF_SIZE,
+                                     body, RTSP_BUF_SIZE, &body_len);
+            if (ret <= 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) continue;  /* 2秒超时，继续 */
+                if (ret == 0) ESP_LOGI(TAG, "[RTSP] Phone disconnected");
+                else ESP_LOGW(TAG, "[RTSP] Read error (errno=%d)", errno);
+                break;
+            }
+            int peer_cseq = rtsp_get_cseq(headers);
+            int is_resp = (strncmp(headers, "RTSP/1.0 ", 9) == 0);
+            if (is_resp) {
+                ESP_LOGI(TAG, "[RTSP] ← resp cseq=%d (keepalive)", peer_cseq);
+                continue;
+            }
+            char method[32] = {0};
+            sscanf(headers, "%31s", method);
+            ESP_LOGI(TAG, "[RTSP] ← %s (cseq=%d, keepalive)", method, peer_cseq);
+            if (strcmp(method, "GET_PARAMETER") == 0) {
+                /* 手机发来的 keepalive — 回复空 body */
+                rtsp_send_resp(rtsp_sock, peer_cseq, NULL);
+            } else if (strcmp(method, "TEARDOWN") == 0) {
+                rtsp_send_resp(rtsp_sock, peer_cseq, NULL);
+                ESP_LOGI(TAG, "[RTSP] ← TEARDOWN, stopping");
+                s_running = false;
+                break;
+            } else {
+                rtsp_send_resp(rtsp_sock, peer_cseq, NULL);
+            }
+        }
     }
     /* 任务创建失败或 RTSP 连接失败：清理资源并返回 */
 rtsp_cleanup:
@@ -2794,6 +2951,7 @@ esp_err_t miplay_init(void)
     xTaskCreatePinnedToCore(miplay_scan_task, "miplay_scan", 3072, NULL, 3, &s_scan_task, 1);
     xTaskCreatePinnedToCore(miplay_lan_task, "miplay_lan", 4096, NULL, 3, &s_lan_task, 0);
     ESP_LOGI(TAG, "MiPlay initialized (TCP+LAN+Scan)");
+    ESP_LOGI(TAG, "TCP 8899 listening for MiPlay");
     return ESP_OK;
 }
 
@@ -2804,8 +2962,8 @@ void miplay_stop(void)
     if (s_lan_sock >= 0) { close(s_lan_sock); s_lan_sock = -1; }
     if (s_listen_sock >= 0) { close(s_listen_sock); s_listen_sock = -1; }
     for (int i = 0; i < 50 && (s_tcp_task != NULL || s_lan_task != NULL); i++) vTaskDelay(pdMS_TO_TICKS(100));
-    mdns_service_remove_for_host(s_inst_name, MIPLAY_MICON_SERVICE, MIPLAY_MICON_PROTO, s_device_id);
-    mdns_service_remove_for_host(s_device_id, MIPLAY_LYRA_SERVICE, MIPLAY_LYRA_PROTO, s_device_id);
+    mdns_service_remove(MIPLAY_MICON_SERVICE, MIPLAY_MICON_PROTO);
+    mdns_service_remove(MIPLAY_LYRA_SERVICE, MIPLAY_LYRA_PROTO);
     rtsp_read_msg_reset();  /* 释放持久缓冲区 */
     if (s_rtsp_stack) { free(s_rtsp_stack); s_rtsp_stack = NULL; }
     if (s_media_stack) { free(s_media_stack); s_media_stack = NULL; }

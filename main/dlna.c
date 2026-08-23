@@ -1876,11 +1876,10 @@ static void mdns_service_init(void)
         ESP_LOGE(TAG, "mdns_init failed: %s", esp_err_to_name(err));
         return;
     }
-    mdns_hostname_set("esp32-dlna");
+    /* hostname 由 miplay_init() 统一设置为 device_id，这里不覆盖 */
     mdns_instance_name_set("MS01B");
-    /* 注册 DLNA 服务，HyperAll 可通过 _dlna._tcp 快速发现（1-3秒） */
     mdns_service_add(NULL, "_dlna", "_tcp", 8080, NULL, 0);
-    ESP_LOGI(TAG, "mDNS: esp32-dlna.local._dlna._tcp:8080 registered");
+    ESP_LOGI(TAG, "mDNS: _dlna._tcp:8080 registered");
 }
 
 /* MiPlay 连接状态回调：暂停/恢复 DLNA SSDP + 停止音频管线 */

@@ -81,8 +81,10 @@ esp_err_t lvgl_port_init(int task_priority)
     lvgl_port_ui_create();
 
     /* 创建 LVGL 处理任务 */
-    xTaskCreatePinnedToCore(lvgl_tick_task, "lvgl_tick", 4096, NULL,
+    BaseType_t ret = xTaskCreatePinnedToCore(lvgl_tick_task, "lvgl_tick", 4096, NULL,
                             task_priority, NULL, 0);
+    if (ret != pdPASS) ESP_LOGE(TAG, "lvgl_tick_task create FAILED (heap=%d)", esp_get_free_heap_size());
+    else ESP_LOGI(TAG, "lvgl_tick_task created OK");
 
     ESP_LOGI(TAG, "LVGL ready (%dx%d, %dKB static DMA buffers)", TFT_W, TFT_H,
              (int)(2 * sizeof(s_buf1_data) / 1024));
