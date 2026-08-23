@@ -38,10 +38,10 @@
 
 static const char *TAG = "miplay";
 
-/* ── mDNS 服务名 ── */
-#define MIPLAY_LYRA_SERVICE     "lyra-mdns"
+/* ── mDNS 服务名（ESP-IDF 不自动加下划线，必须手动包含 _）── */
+#define MIPLAY_LYRA_SERVICE     "_lyra-mdns"
 #define MIPLAY_LYRA_PROTO       "_udp"
-#define MIPLAY_MICON_SERVICE    "mi-connect"
+#define MIPLAY_MICON_SERVICE    "_mi-connect"
 #define MIPLAY_MICON_PROTO      "_udp"
 #define MIPLAY_LAN_SERVICE      "_miplay_lan"
 #define MIPLAY_LAN_PROTO        "_tcp"
@@ -2928,6 +2928,184 @@ static void miplay_scan_task(void *arg)
     s_scan_task = NULL; vTaskDelete(NULL);
 }
 
+/* ── mDNS unsolicited announcement（startup_burst + periodic cache_refresh）
+ *    FusionPlay 1.1.6: 注册服务后主动广播 PTR+SRV+TXT+A，cold cache 手机可立即发现。
+ *    之后每 30 秒刷新一次，防止手机侧 mDNS 缓存过期。 ── */
+
+#define MDNS_ANNOUNCE_INTERVAL_SEC  30
+#define MDNS_MULTICAST_ADDR         "224.0.0.251"
+#define MDNS_PORT                   5353
+
+/* 构建单个 mDNS 服务的 unsolicited 响应包（ANCOUNT=1 PTR + ARCOUNT=3 SRV+TXT+A）*/
+static size_t build_mdns_announce(uint8_t *p, size_t p_size,
+                                   const uint8_t *svc_qname, size_t svc_qname_len,
+                                   const char *instance, uint16_t port,
+                                   const mdns_txt_item_t *txt, size_t txt_count,
+                                   uint32_t ip)
+{
+    size_t o = 0;
+    /* Header */
+    dns_push_u16(p, &o, 0x0000);
+    dns_push_u16(p, &o, 0x8400);
+    dns_push_u16(p, &o, 0);    /* QDCOUNT */
+    dns_push_u16(p, &o, 1);    /* ANCOUNT */
+    dns_push_u16(p, &o, 0);
+    dns_push_u16(p, &o, 3);    /* ARCOUNT */
+    /* PTR answer */
+    uint16_t svc_off = (uint16_t)o;
+    memcpy(p + o, svc_qname, svc_qname_len);
+    o += svc_qname_len;
+    dns_push_u16(p, &o, 12);   /* PTR */
+    dns_push_u16(p, &o, 0x8001);
+    dns_push_u32(p, &o, 120);  /* TTL */
+    size_t inst_len = strlen(instance);
+    dns_push_u16(p, &o, (uint16_t)(inst_len + 3));
+    uint16_t inst_off = (uint16_t)o;
+    dns_push_label(p, &o, instance);
+    dns_push_ptr(p, &o, svc_off);
+    /* SRV */
+    dns_push_ptr(p, &o, inst_off);
+    dns_push_u16(p, &o, 33);
+    dns_push_u16(p, &o, 0x8001);
+    dns_push_u32(p, &o, 120);
+    size_t srv_len_pos = o;
+    dns_push_u16(p, &o, 0);
+    size_t srv_start = o;
+    dns_push_u16(p, &o, 0);
+    dns_push_u16(p, &o, 0);
+    dns_push_u16(p, &o, port);
+    uint16_t host_off = (uint16_t)o;
+    dns_push_label(p, &o, s_device_id);
+    p[o++] = 0x05; memcpy(p + o, "local", 5); o += 5;
+    p[o++] = 0x00;
+    uint16_t srv_len = (uint16_t)(o - srv_start);
+    p[srv_len_pos] = (uint8_t)(srv_len >> 8);
+    p[srv_len_pos + 1] = (uint8_t)(srv_len & 0xFF);
+    /* TXT — 每条 key=value 作为独立的 length-prefixed string */
+    dns_push_ptr(p, &o, inst_off);
+    dns_push_u16(p, &o, 16);
+    dns_push_u16(p, &o, 0x8001);
+    dns_push_u32(p, &o, 120);
+    size_t txt_rdlen_pos = o;
+    dns_push_u16(p, &o, 0);
+    size_t txt_rdlen_start = o;
+    for (size_t i = 0; i < txt_count; i++) {
+        size_t kl = strlen(txt[i].key);
+        const char *val = txt[i].value ? txt[i].value : "";
+        size_t vl = strlen(val);
+        uint8_t slen = (uint8_t)(kl + 1 + vl);
+        if (o + 1 + slen > p_size - 64) break;
+        p[o++] = slen;
+        memcpy(p + o, txt[i].key, kl); o += kl;
+        p[o++] = '=';
+        memcpy(p + o, val, vl); o += vl;
+    }
+    uint16_t txt_rdlen = (uint16_t)(o - txt_rdlen_start);
+    p[txt_rdlen_pos] = (uint8_t)(txt_rdlen >> 8);
+    p[txt_rdlen_pos + 1] = (uint8_t)(txt_rdlen & 0xFF);
+    /* A */
+    dns_push_ptr(p, &o, host_off);
+    dns_push_u16(p, &o, 1);
+    dns_push_u16(p, &o, 0x8001);
+    dns_push_u32(p, &o, 120);
+    dns_push_u16(p, &o, 4);
+    p[o++] = (uint8_t)(ip & 0xFF);
+    p[o++] = (uint8_t)((ip >> 8) & 0xFF);
+    p[o++] = (uint8_t)((ip >> 16) & 0xFF);
+    p[o++] = (uint8_t)((ip >> 24) & 0xFF);
+    return o;
+}
+
+static TaskHandle_t s_announce_task = NULL;
+
+static void mdns_announce_task(void *arg)
+{
+    (void)arg;
+    /* 延迟 2 秒等待 mDNS 组件完全就绪 */
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (sock < 0) { ESP_LOGE(TAG, "announce socket failed: %d", errno); s_announce_task = NULL; vTaskDelete(NULL); return; }
+    int ttl = 255;
+    setsockopt(sock, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
+
+    struct sockaddr_in dest = {
+        .sin_family = AF_INET,
+        .sin_port = htons(MDNS_PORT),
+        .sin_addr.s_addr = inet_addr(MDNS_MULTICAST_ADDR),
+    };
+
+    uint32_t ip = get_my_ipv4();
+    uint8_t pkt[768];
+
+    /* TXT for _mi-connect */
+    mdns_txt_item_t micon_txt[] = {
+        {"version", MIPLAY_VERSION}, {"apps","[5]"}, {"flags","CgE="},
+        {"name","ESP32-DLNA"}, {"idHash",s_idhash}, {"dev",MIPLAY_DEV},
+        {"sec",MIPLAY_SEC}, {"appsData",s_appsdata}, {"mac",s_mac_b64},
+    };
+    /* TXT for _lyra-mdns */
+    struct timeval tv_now; gettimeofday(&tv_now, NULL);
+    long long ts_ms = (long long)tv_now.tv_sec * 1000LL + tv_now.tv_usec / 1000;
+    char ts_str[24]; snprintf(ts_str, sizeof(ts_str), "%lld", ts_ms);
+    char debug_info[128];
+    {
+        uint8_t a[4] = { ip&0xFF, (ip>>8)&0xFF, (ip>>16)&0xFF, (ip>>24)&0xFF };
+        char e1[8]={0}, e2[8]={0};
+        char t[4]; int oi;
+        snprintf(t, sizeof(t), "%u", a[1]); oi=0;
+        for (int c=0; t[c]; c++) e1[oi++] = (t[c]>='0'&&t[c]<='9') ? '#'+(t[c]-'0') : t[c];
+        snprintf(t, sizeof(t), "%u", a[2]); oi=0;
+        for (int c=0; t[c]; c++) e2[oi++] = (t[c]>='0'&&t[c]<='9') ? '#'+(t[c]-'0') : t[c];
+        snprintf(debug_info, sizeof(debug_info), "{msg:announcement, ifname:STA, v4:%u.%s.%s.%u}",
+                 (unsigned)a[0], e1, e2, (unsigned)a[3]);
+    }
+    mdns_txt_item_t lyra_txt[] = {
+        {"AppData",s_lyra_appdata},{"MediumType","8192"},{"CH","0"},
+        {"DebugInfo",debug_info},{"TS",ts_str},
+    };
+
+    /* service QNAME 字节 */
+    static const uint8_t lyra_qname[] = { 0x0a,'_','l','y','r','a','-','m','d','n','s', 0x04,'_','u','d','p', 0x05,'l','o','c','a','l', 0x00 };
+    static const uint8_t micon_qname[] = { 0x0b,'_','m','i','-','c','o','n','n','e','c','t', 0x04,'_','u','d','p', 0x05,'l','o','c','a','l', 0x00 };
+
+    /* startup_burst: 3 轮，180ms 间隔 */
+    for (int round = 1; round <= 3 && s_running; round++) {
+        size_t len1 = build_mdns_announce(pkt, sizeof(pkt), lyra_qname, sizeof(lyra_qname),
+                                           s_device_id, 5353, lyra_txt, 5, ip);
+        sendto(sock, pkt, len1, 0, (struct sockaddr *)&dest, sizeof(dest));
+        size_t len2 = build_mdns_announce(pkt, sizeof(pkt), micon_qname, sizeof(micon_qname),
+                                           s_inst_name, MIPLAY_COAP_PORT, micon_txt, 9, ip);
+        sendto(sock, pkt, len2, 0, (struct sockaddr *)&dest, sizeof(dest));
+        ESP_LOGI(TAG, "mDNS announce burst %d/3 (lyra=%uB micon=%uB)", round, (unsigned)len1, (unsigned)len2);
+        if (round < 3) vTaskDelay(pdMS_TO_TICKS(180));
+    }
+
+    /* periodic cache_refresh */
+    while (s_running) {
+        for (int i = 0; i < MDNS_ANNOUNCE_INTERVAL_SEC * 10 && s_running; i++)
+            vTaskDelay(pdMS_TO_TICKS(100));
+        if (!s_running) break;
+
+        /* 更新时间戳 */
+        gettimeofday(&tv_now, NULL);
+        ts_ms = (long long)tv_now.tv_sec * 1000LL + tv_now.tv_usec / 1000;
+        snprintf(ts_str, sizeof(ts_str), "%lld", ts_ms);
+        lyra_txt[4].value = ts_str;
+
+        size_t len1 = build_mdns_announce(pkt, sizeof(pkt), lyra_qname, sizeof(lyra_qname),
+                                           s_device_id, 5353, lyra_txt, 5, ip);
+        sendto(sock, pkt, len1, 0, (struct sockaddr *)&dest, sizeof(dest));
+        size_t len2 = build_mdns_announce(pkt, sizeof(pkt), micon_qname, sizeof(micon_qname),
+                                           s_inst_name, MIPLAY_COAP_PORT, micon_txt, 9, ip);
+        sendto(sock, pkt, len2, 0, (struct sockaddr *)&dest, sizeof(dest));
+        ESP_LOGD(TAG, "mDNS announce refresh (lyra=%uB micon=%uB)", (unsigned)len1, (unsigned)len2);
+    }
+    close(sock);
+    s_announce_task = NULL;
+    vTaskDelete(NULL);
+}
+
 /* ── 连接状态回调 ── */
 void miplay_set_connected_cb(miplay_connected_cb_t cb)
 {
@@ -2950,6 +3128,7 @@ esp_err_t miplay_init(void)
     if (ret != pdPASS) { ESP_LOGE(TAG, "TCP task failed"); s_running = false; return ESP_FAIL; }
     xTaskCreatePinnedToCore(miplay_scan_task, "miplay_scan", 3072, NULL, 3, &s_scan_task, 1);
     xTaskCreatePinnedToCore(miplay_lan_task, "miplay_lan", 4096, NULL, 3, &s_lan_task, 0);
+    xTaskCreatePinnedToCore(mdns_announce_task, "mdns_ann", 4096, NULL, 3, &s_announce_task, 0);
     ESP_LOGI(TAG, "MiPlay initialized (TCP+LAN+Scan)");
     ESP_LOGI(TAG, "TCP 8899 listening for MiPlay");
     return ESP_OK;
