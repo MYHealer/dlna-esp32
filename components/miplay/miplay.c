@@ -162,6 +162,20 @@ static uint8_t s_stream_key[16];    /* streamKey: 16 ASCII bytes → AES key */
 static uint8_t s_stream_iv[16];     /* streamIV: 16 ASCII bytes → initial IV */
 static volatile bool s_has_stream_key = false;
 static char s_mirror_auth_key[33];  /* authKey: 16 ASCII bytes from SetMirrorKey, for RTSP OPTIONS auth */
+
+/* ── 音量状态（控制会话写，音频输出读）── */
+static volatile uint32_t s_volume_percent = 50;
+
+/* ── 活跃控制会话（供 receiver-control 等外部 API 使用）── */
+static volatile int s_active_client_sock = -1;
+static volatile int s_notify_seq = 8;
+
+/* ── 媒体元数据（SetMediaInfo 接收，GetMediaInfo 返回）── */
+static char s_media_title[128];
+static char s_media_artist[64];
+static char s_media_album[64];
+static uint32_t s_media_duration;  /* ms */
+static char s_media_cover_url[256];
 static volatile bool s_has_mirror_auth_key = false;
 
 /* ── 基础工具 ── */
@@ -1718,6 +1732,15 @@ static void media_receive_task(void *arg)
                     }
                 }
                 size_t bytes_written = 0;
+                /* 应用 MiPlay 音量增益: gain = percent / 100 */
+                uint32_t vol = s_volume_percent;
+                if (vol < 100) {
+                    int16_t *samples = (int16_t *)pcm_buf;
+                    size_t nsamples = out.decoded_size / 2;
+                    for (size_t i = 0; i < nsamples; i++) {
+                        samples[i] = (int16_t)((int32_t)samples[i] * (int32_t)vol / 100);
+                    }
+                }
                 i2s_channel_write(i2s_tx, pcm_buf, out.decoded_size,
                                   &bytes_written, 1000);
                 pcm_total += out.decoded_size;
@@ -1762,7 +1785,7 @@ static void miplay_rtsp_run(const char *host, int port, int client_sock)
     for (int attempt = 0; attempt < 3 && s_running; attempt++) {
         if (attempt > 0) {
             ESP_LOGW(TAG, "[RTSP] Retry attempt %d...", attempt + 1);
-            vTaskDelay(pdMS_TO_TICKS(100));
+            vTaskDelay(pdMS_TO_TICKS(250));
         }
         ESP_LOGI(TAG, "[RTSP] Connecting to %s:%d ...", host, port);
 
@@ -2171,6 +2194,8 @@ rtsp_cleanup:
     if (s_multi_sock >= 0) { close(s_multi_sock); s_multi_sock = -1; }
     s_image_port = s_multi_port = 0;
     ESP_LOGI(TAG, "[RTSP] Cleanup done");
+    /* 250ms 错误恢复退避 — 防止快速重连冲击手机端 */
+    vTaskDelay(pdMS_TO_TICKS(250));
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -2194,7 +2219,8 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
 
     /* SafetyAuth 流程状态（PC 原型语义） */
     bool auth_challenge_sent = false;   /* 我方 challenge 已随 SafetyInfoAck 发出 */
-    int notify_seq = 8;                 /* NOTIFY 序列号计数器（递增，避免重复） */
+    s_notify_seq = 8;                   /* NOTIFY 序列号计数器（递增，避免重复） */
+    s_active_client_sock = client_sock; /* 供外部 API 使用 */
     bool pending_ack_valid = false;     /* 对端 0x1402 的 ack 待其 0x1403 验证后补发 */
     char pending_ack_hex[65] = {0};
     uint16_t pending_ack_seq = 0;
@@ -2449,8 +2475,8 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
                             'm', 'T', 'i', 't', 'l', 'e',
                             0x14, 0x00, 0x00, 0x00, 0x00,
                         };
-                        send_encrypted_cmd(client_sock, CMD_NOTIFY, notify_seq++, mi_body, sizeof(mi_body));
-                        ESP_LOGI(TAG, "-> NOTIFY mediaInfoEx (seq=%d)", notify_seq - 1);
+                        send_encrypted_cmd(client_sock, CMD_NOTIFY, s_notify_seq++, mi_body, sizeof(mi_body));
+                        ESP_LOGI(TAG, "-> NOTIFY mediaInfoEx (seq=%d)", s_notify_seq - 1);
                     }
                     /* 启动 RTSP 独立任务（PSRAM 静态栈，不依赖内部 SRAM） */
                     if (rtsp_port > 0) {
@@ -2698,9 +2724,12 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
 
                 /* ── GetVolume (0x000E) ── */
                 if (cmd == CMD_GET_VOLUME) {
-                    ESP_LOGI(TAG, "GetVolume seq=%u", seq);
-                    /* PC: bytes([0]) + u32 BE(50) */
-                    uint8_t vol_body[] = {0x00, 0x00, 0x00, 0x00, 50};
+                    ESP_LOGI(TAG, "GetVolume seq=%u (current=%u%%)", seq, (unsigned)s_volume_percent);
+                    uint8_t vol_body[5] = {0};
+                    vol_body[1] = (uint8_t)((s_volume_percent >> 24) & 0xFF);
+                    vol_body[2] = (uint8_t)((s_volume_percent >> 16) & 0xFF);
+                    vol_body[3] = (uint8_t)((s_volume_percent >> 8) & 0xFF);
+                    vol_body[4] = (uint8_t)(s_volume_percent & 0xFF);
                     send_encrypted_cmd(client_sock, CMD_GET_VOLUME + 1, seq,
                                        vol_body, sizeof(vol_body));
                     break;
@@ -2717,17 +2746,39 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
                 }
 
                 /* ── GetMediaInfo (0x0014, outer=0x00) ──
-                 * PC: 回 NOTIFY(0x22) seq=8 + 空 mediaInfoEx */
+                 * PC: 回 NOTIFY(0x22) + mediaInfoEx 二进制 TLV
+                 * 格式: 0x0B + "mediaInfoEx" + 0x16 + len(4B BE) + subfields...
+                 * 子字段: keyLen(1B) + key + 0x14 + valLen(1B) + value */
                 if (cmd == CMD_GET_MEDIA_INFO && outer_type == 0x00) {
-                    ESP_LOGI(TAG, "GetMediaInfo seq=%u", seq);
-                    uint8_t mi_body[] = {
-                        0x0B, 'm', 'e', 'd', 'i', 'a', 'I', 'n', 'f', 'o', 'E', 'x',
-                        0x16, 0x00, 0x00, 0x00, 0x0C, 0x06,
-                        'm', 'T', 'i', 't', 'l', 'e',
-                        0x14, 0x00, 0x00, 0x00, 0x00,
-                    };
-                    send_encrypted_cmd(client_sock, CMD_NOTIFY, notify_seq++,
-                                       mi_body, sizeof(mi_body));
+                    ESP_LOGI(TAG, "GetMediaInfo seq=%u (title=%.20s)", seq, s_media_title);
+                    uint8_t mi_body[256];
+                    int o = 0;
+                    /* mediaInfoEx 头 */
+                    mi_body[o++] = 0x0B;
+                    memcpy(mi_body + o, "mediaInfoEx", 11); o += 11;
+                    mi_body[o++] = 0x16;
+                    int sub_start = o;
+                    o += 4;  /* 长度占位 */
+                    /* mTitle 子字段（精确对齐 1.1.6 格式）*/
+                    int title_len = (int)strlen(s_media_title);
+                    mi_body[o++] = 0x0C;                    /* entry marker */
+                    mi_body[o++] = 0x06;                    /* key_len = 6 */
+                    memcpy(mi_body + o, "mTitle", 6); o += 6;
+                    mi_body[o++] = 0x14;                    /* value_type = string */
+                    mi_body[o + 0] = (uint8_t)((title_len >> 24) & 0xFF);
+                    mi_body[o + 1] = (uint8_t)((title_len >> 16) & 0xFF);
+                    mi_body[o + 2] = (uint8_t)((title_len >> 8) & 0xFF);
+                    mi_body[o + 3] = (uint8_t)(title_len & 0xFF);
+                    o += 4;
+                    if (title_len > 0) { memcpy(mi_body + o, s_media_title, title_len); o += title_len; }
+                    /* 回填子字段总长度 */
+                    int sub_len = o - sub_start - 4;
+                    mi_body[sub_start + 0] = (uint8_t)((sub_len >> 24) & 0xFF);
+                    mi_body[sub_start + 1] = (uint8_t)((sub_len >> 16) & 0xFF);
+                    mi_body[sub_start + 2] = (uint8_t)((sub_len >> 8) & 0xFF);
+                    mi_body[sub_start + 3] = (uint8_t)(sub_len & 0xFF);
+                    send_encrypted_cmd(client_sock, CMD_NOTIFY, s_notify_seq++,
+                                       mi_body, o);
                     break;
                 }
 
@@ -2740,9 +2791,36 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
                     break;
                 }
 
-                /* ── Pause (0x0004) / Resume (0x0006) / SetVolume (0x000C) / SetPosition (0x0056) ── */
-                if (cmd == CMD_PAUSE || cmd == CMD_RESUME ||
-                    cmd == CMD_SET_VOLUME || cmd == CMD_SET_POSITION) {
+                /* ── SetVolume (0x000C) — 解析音量值 + ACK 回传实际百分比 ── */
+                if (cmd == CMD_SET_VOLUME) {
+                    if (plen >= 4) {
+                        uint32_t vol = ((uint32_t)payload[0] << 24) | ((uint32_t)payload[1] << 16) |
+                                       ((uint32_t)payload[2] << 8) | payload[3];
+                        if (vol <= 100) {
+                            s_volume_percent = vol;
+                            ESP_LOGI(TAG, "Volume set to %u%%", (unsigned)vol);
+                        }
+                    }
+                    uint8_t ack[5] = {0};
+                    ack[1] = (uint8_t)((s_volume_percent >> 24) & 0xFF);
+                    ack[2] = (uint8_t)((s_volume_percent >> 16) & 0xFF);
+                    ack[3] = (uint8_t)((s_volume_percent >> 8) & 0xFF);
+                    ack[4] = (uint8_t)(s_volume_percent & 0xFF);
+                    send_encrypted_cmd(client_sock, CMD_SET_VOLUME + 1, seq, ack, sizeof(ack));
+                    /* sender-volume 通知（二进制 TLV，12 字节）*/
+                    uint8_t vol_notify[] = {
+                        0x06,                                       /* key_len = 6 */
+                        'v', 'o', 'l', 'u', 'm', 'e',             /* key = "volume" */
+                        0x07,                                       /* value_type = 7 (u32 BE) */
+                        0x00, 0x00, 0x00, (uint8_t)s_volume_percent /* percent BE */
+                    };
+                    send_encrypted_cmd(client_sock, CMD_NOTIFY, s_notify_seq++,
+                                       vol_notify, sizeof(vol_notify));
+                    break;
+                }
+
+                /* ── Pause (0x0004) / Resume (0x0006) / SetPosition (0x0056) ── */
+                if (cmd == CMD_PAUSE || cmd == CMD_RESUME || cmd == CMD_SET_POSITION) {
                     ESP_LOGI(TAG, "Media control cmd=0x%04X seq=%u", cmd, seq);
                     send_encrypted_cmd(client_sock, cmd + 1, seq, NULL, 0);
                     break;
@@ -2800,6 +2878,55 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
                 if (cmd == CMD_SET_MEDIA_INFO) {
                     ESP_LOGI(TAG, "[MEDIA-INFO] SetMediaInfo seq=%u payload=%.*s",
                              seq, (int)(plen > 200 ? 200 : plen), payload);
+                    /* 解析 JSON 元数据 */
+                    if (plen > 0) {
+                        const char *p_str = (const char *)payload;
+                        /* 尝试多个可能的字段名（1.1.3 用 mTitle，1.1.6 用 title）*/
+                        static const char *title_keys[] = {"\"mTitle\"", "\"title\"", NULL};
+                        static const char *artist_keys[] = {"\"mArtist\"", "\"artist\"", NULL};
+                        static const char *album_keys[] = {"\"mAlbum\"", "\"album\"", NULL};
+                        static const char *cover_keys[] = {"\"mCoverUrl\"", "\"mArt\"", "\"artwork\"", "\"cover\"", NULL};
+                        for (int k = 0; title_keys[k]; k++) {
+                            const char *t = strstr(p_str, title_keys[k]);
+                            if (t) { t = strchr(t, ':'); if (t) { t++;
+                                while (*t == ' ' || *t == '"') t++;
+                                const char *end = t; while (*end && *end != '"' && *end != ',' && *end != '}') end++;
+                                size_t len = end - t; if (len >= sizeof(s_media_title)) len = sizeof(s_media_title) - 1;
+                                memcpy(s_media_title, t, len); s_media_title[len] = 0; break; }
+                        }}
+                        for (int k = 0; artist_keys[k]; k++) {
+                            const char *t = strstr(p_str, artist_keys[k]);
+                            if (t) { t = strchr(t, ':'); if (t) { t++;
+                                while (*t == ' ' || *t == '"') t++;
+                                const char *end = t; while (*end && *end != '"' && *end != ',' && *end != '}') end++;
+                                size_t len = end - t; if (len >= sizeof(s_media_artist)) len = sizeof(s_media_artist) - 1;
+                                memcpy(s_media_artist, t, len); s_media_artist[len] = 0; break; }
+                        }}
+                        for (int k = 0; album_keys[k]; k++) {
+                            const char *t = strstr(p_str, album_keys[k]);
+                            if (t) { t = strchr(t, ':'); if (t) { t++;
+                                while (*t == ' ' || *t == '"') t++;
+                                const char *end = t; while (*end && *end != '"' && *end != ',' && *end != '}') end++;
+                                size_t len = end - t; if (len >= sizeof(s_media_album)) len = sizeof(s_media_album) - 1;
+                                memcpy(s_media_album, t, len); s_media_album[len] = 0; break; }
+                        }}
+                        for (int k = 0; cover_keys[k]; k++) {
+                            const char *t = strstr(p_str, cover_keys[k]);
+                            if (t) { t = strchr(t, ':'); if (t) { t++;
+                                while (*t == ' ' || *t == '"') t++;
+                                const char *end = t; while (*end && *end != '"' && *end != ',' && *end != '}') end++;
+                                size_t len = end - t; if (len >= sizeof(s_media_cover_url)) len = sizeof(s_media_cover_url) - 1;
+                                memcpy(s_media_cover_url, t, len); s_media_cover_url[len] = 0; break; }
+                        }}
+                        /* duration — 数字字段 */
+                        const char *d = strstr(p_str, "\"mDuration\"");
+                        if (!d) d = strstr(p_str, "\"duration\"");
+                        if (!d) d = strstr(p_str, "\"duration_ms\"");
+                        if (d) { d = strchr(d, ':'); if (d) { d++; while (*d == ' ') d++;
+                            s_media_duration = (uint32_t)atol(d); }}
+                        ESP_LOGI(TAG, "Media: title=%.32s artist=%.24s dur=%ums",
+                                 s_media_title, s_media_artist, (unsigned)s_media_duration);
+                    }
                     send_encrypted_cmd(client_sock, CMD_SET_MEDIA_INFO_ACK, seq, NULL, 0);
                     break;
                 }
@@ -2827,6 +2954,7 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
     } /* while s_running */
 
     free(buf);
+    s_active_client_sock = -1;
     close(client_sock);
     /* 重置全局会话状态（防止新连接使用旧密钥） */
     s_has_session_key = false;
@@ -2874,8 +3002,10 @@ static void miplay_tcp_task(void *arg)
         struct sockaddr_in client_addr;
         socklen_t addr_len = sizeof(client_addr);
         int client_sock = accept(s_listen_sock, (struct sockaddr *)&client_addr, &addr_len);
-        if (client_sock < 0) { if (s_running) ESP_LOGW(TAG, "Accept failed: %d", errno); continue; }
+        if (client_sock < 0) { if (s_running) { ESP_LOGW(TAG, "Accept failed: %d", errno); vTaskDelay(pdMS_TO_TICKS(250)); } continue; }
         handle_client(client_sock, &client_addr);
+        /* 250ms 错误恢复退避 — 防止快速重连冲击手机端 */
+        if (s_running) vTaskDelay(pdMS_TO_TICKS(250));
     }
     close(s_listen_sock); s_listen_sock = -1;
     s_tcp_task = NULL; vTaskDelete(NULL);
@@ -3110,6 +3240,42 @@ static void mdns_announce_task(void *arg)
 void miplay_set_connected_cb(miplay_connected_cb_t cb)
 {
     s_connected_cb = cb;
+}
+
+uint32_t miplay_get_volume(void)
+{
+    return s_volume_percent;
+}
+
+void miplay_send_receiver_control(const char *action, int64_t value)
+{
+    int sock = s_active_client_sock;
+    if (sock < 0 || !s_has_session_key) return;
+
+    /* 二进制 TLV 格式: [key_len(1)] [key_bytes] [value_type(1)] [value_data]
+     * 布尔: value_type=0x00, value=0x01
+     * u64:  value_type=0x09, value=8字节 BE */
+    uint8_t body[20];
+    int o = 0;
+    if (strcmp(action, "seek") == 0) {
+        /* key-seek (8 bytes) + type 0x09 + u64 BE */
+        body[o++] = 8;
+        memcpy(body + o, "key-seek", 8); o += 8;
+        body[o++] = 0x09;
+        for (int i = 7; i >= 0; i--)
+            body[o++] = (uint8_t)((value >> (i * 8)) & 0xFF);
+    } else {
+        /* key-pause / key-resume / key-prev / key-next */
+        char key[16];
+        int klen = snprintf(key, sizeof(key), "key-%s", action);
+        if (klen <= 0 || klen > 15) return;
+        body[o++] = (uint8_t)klen;
+        memcpy(body + o, key, klen); o += klen;
+        body[o++] = 0x00;  /* boolean */
+        body[o++] = 0x01;
+    }
+    send_encrypted_cmd(sock, CMD_NOTIFY, s_notify_seq++, body, o);
+    ESP_LOGI(TAG, "-> receiver-control: %s", action);
 }
 
 /* ── 公共 API ── */

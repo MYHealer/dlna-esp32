@@ -28,6 +28,18 @@ void miplay_stop(void);
 typedef void (*miplay_connected_cb_t)(bool connected);
 void miplay_set_connected_cb(miplay_connected_cb_t cb);
 
+/**
+ * @brief 获取当前 MiPlay 音量百分比 (0-100)
+ */
+uint32_t miplay_get_volume(void);
+
+/**
+ * @brief 向手机发送反向控制通知
+ * @param action "pause", "play", "next", "prev", "seek"
+ * @param value  seek 时为 positionMs，其他为 0
+ */
+void miplay_send_receiver_control(const char *action, int64_t value);
+
 #ifdef __cplusplus
 }
 #endif
