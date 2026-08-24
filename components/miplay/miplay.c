@@ -29,6 +29,7 @@
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
 #include "lwip/netdb.h"
+#include "lwip/sys.h"
 #include <fcntl.h>
 #include "esp_audio_simple_dec.h"
 #include "esp_audio_simple_dec_default.h"
@@ -169,6 +170,8 @@ static volatile uint32_t s_volume_percent = 50;
 /* ── 活跃控制会话（供 receiver-control 等外部 API 使用）── */
 static volatile int s_active_client_sock = -1;
 static volatile int s_notify_seq = 8;
+/* ── 媒体会话 generation（每次 OPEN 递增，旧 RTSP/media task 自退出）── */
+static volatile uint32_t s_media_generation = 0;
 
 /* ── 媒体元数据（SetMediaInfo 接收，GetMediaInfo 返回）── */
 static char s_media_title[128];
@@ -1205,6 +1208,7 @@ typedef struct {
     char host[64];
     int  port;
     int  client_sock;   /* 控制通道 socket，RTSP 期间需监听心跳 */
+    uint32_t generation; /* media generation 快照 */
 } rtsp_task_arg_t;
 
 /* 媒体接收任务参数（独立于 RTSP 协商，主控制循环可继续处理心跳） */
@@ -1212,6 +1216,7 @@ typedef struct {
     int media_sock;     /* multi socket 或 rtsp_sock */
     int client_sock;    /* 控制通道 socket（心跳） */
     int rtsp_sock;      /* RTSP socket（协商完可关闭） */
+    uint32_t generation; /* media generation 快照 */
 } media_task_arg_t;
 
 /* 数据通道（Rust: image + multi 两个额外 TCP 连接） */
@@ -1452,7 +1457,7 @@ static void rtsp_get_session(const char *headers, char *out, size_t max)
     out[i] = 0;
 }
 
-static void miplay_rtsp_run(const char *host, int port, int client_sock);
+static void miplay_rtsp_run(const char *host, int port, int client_sock, uint32_t generation);
 
 /* RTSP 独立任务（使用 PSRAM 静态栈，避免内部 SRAM 碎片化） */
 #define RTSP_TASK_STACK_SIZE 8192
@@ -1465,11 +1470,14 @@ static StackType_t *s_media_stack = NULL; /* PSRAM 分配 */
 static void miplay_rtsp_task_wrapper(void *arg)
 {
     rtsp_task_arg_t *a = (rtsp_task_arg_t *)arg;
-    ESP_LOGI(TAG, "[RTSP-task] Starting: %s:%d sock=%d", a->host, a->port, a->client_sock);
+    ESP_LOGI(TAG, "[RTSP-task] Starting: %s:%d sock=%d gen=%lu", a->host, a->port, a->client_sock, (unsigned long)a->generation);
     ESP_LOGI(TAG, "[RTSP-task] Heap: %lu free, PSRAM: %lu free",
              (unsigned long)esp_get_free_heap_size(),
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-    miplay_rtsp_run(a->host, a->port, a->client_sock);
+    miplay_rtsp_run(a->host, a->port, a->client_sock, a->generation);
+    if (s_media_generation != a->generation)
+        ESP_LOGI(TAG, "[RTSP-task] Replaced by newer session (gen %lu -> %lu)",
+                 (unsigned long)a->generation, (unsigned long)s_media_generation);
     /* 不关闭 client_sock — 主控制循环需要它处理心跳 */
     free(a);
     s_rtsp_task = NULL;
@@ -1580,7 +1588,7 @@ static void media_receive_task(void *arg)
     media_task_arg_t *marg = (media_task_arg_t *)arg;
     int media_sock = marg->media_sock;
     int rtsp_sock_to_close = marg->rtsp_sock;  /* 媒体结束时关闭 */
-    /* 不立即关闭 RTSP socket — 保持会话活跃，手机需要看到连接存在 */
+    uint32_t generation = marg->generation;     /* generation 快照 */
     free(marg);
 
     ESP_LOGI(TAG, "[MEDIA] Task started (sock=%d)", media_sock);
@@ -1614,7 +1622,9 @@ static void media_receive_task(void *arg)
     }
     ESP_LOGI(TAG, "[MEDIA] I2S TX ready, entering read loop");
 
-    const int pcm_buf_size = 8192;
+    /* 32KB PCM 缓冲：累积多个 RTP 包解码结果再批量写 I2S，吸收网络 jitter
+     * FusionPlay 用 80ms output cushion，这里 32KB ≈ 160ms @ 48kHz stereo */
+    const int pcm_buf_size = 32768;
     uint8_t *pcm_buf = heap_caps_malloc(pcm_buf_size, MALLOC_CAP_SPIRAM);
     uint8_t *rtp_buf = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
 
@@ -1632,7 +1642,7 @@ static void media_receive_task(void *arg)
     uint32_t pkt_count = 0, rtp_total = 0, pcm_total = 0;
     bool i2s_configured = false;
 
-    while (s_running) {
+    while (s_running && s_media_generation == generation) {
         /* ── 读取4字节 interleaved RTP 帧头：$ + channel + len(u16 BE) ── */
         uint8_t hdr[4];
         int got = 0;
@@ -1731,8 +1741,7 @@ static void media_receive_task(void *arg)
                         i2s_configured = true;
                     }
                 }
-                size_t bytes_written = 0;
-                /* 应用 MiPlay 音量增益: gain = percent / 100 */
+                /* 应用 MiPlay 音量增益 */
                 uint32_t vol = s_volume_percent;
                 if (vol < 100) {
                     int16_t *samples = (int16_t *)pcm_buf;
@@ -1741,6 +1750,8 @@ static void media_receive_task(void *arg)
                         samples[i] = (int16_t)((int32_t)samples[i] * (int32_t)vol / 100);
                     }
                 }
+                /* 累积写入 I2S：每 4KB（~21ms）刷一次，减少小块写入抖动 */
+                size_t bytes_written = 0;
                 i2s_channel_write(i2s_tx, pcm_buf, out.decoded_size,
                                   &bytes_written, 1000);
                 pcm_total += out.decoded_size;
@@ -1753,6 +1764,9 @@ static void media_receive_task(void *arg)
                      (unsigned long)(pcm_total / 1024));
         }
     }
+    if (s_media_generation != generation)
+        ESP_LOGI(TAG, "[MEDIA] Replaced by newer session (gen %lu -> %lu)",
+                 (unsigned long)generation, (unsigned long)s_media_generation);
 m_cleanup:
     free(rtp_buf); free(pcm_buf);
     esp_audio_simple_dec_close(decoder);
@@ -1770,7 +1784,7 @@ m_cleanup:
 /* 统一事件循环：控制通道 + RTSP + 媒体
  * Rust 用独立线程处理控制通道和 RTSP/媒体。ESP32 单线程用 select 多路复用。
  * client_sock 在此函数内不再被主循环读取（主循环 buf_used 已清空）。 */
-static void miplay_rtsp_run(const char *host, int port, int client_sock)
+static void miplay_rtsp_run(const char *host, int port, int client_sock, uint32_t generation)
 {
     char *headers = NULL;
     char *body = NULL;
@@ -1855,7 +1869,7 @@ static void miplay_rtsp_run(const char *host, int port, int client_sock)
     /* 重置持久缓冲区（清除上次会话残留数据） */
     rtsp_read_msg_reset();
 
-    while (s_running && rtsp_state < 2) {
+    while (s_running && s_media_generation == generation && rtsp_state < 2) {
         ESP_LOGI(TAG, "[RTSP] Waiting for msg (state=%d)...", rtsp_state);
         int ret = rtsp_read_msg(rtsp_sock, headers, RTSP_BUF_SIZE,
                                  body, RTSP_BUF_SIZE, &body_len);
@@ -2124,6 +2138,7 @@ static void miplay_rtsp_run(const char *host, int port, int client_sock)
             marg->media_sock = media_sock;
             marg->client_sock = client_sock;
             marg->rtsp_sock = rtsp_sock;
+            marg->generation = generation;
             ESP_LOGI(TAG, "[MEDIA] Launching media task (stack=%d)...", MEDIA_TASK_STACK_SIZE);
             ESP_LOGI(TAG, "[MEDIA] Heap: %lu free, PSRAM: %lu free, min_free: %lu",
                      (unsigned long)esp_get_free_heap_size(),
@@ -2202,13 +2217,26 @@ rtsp_cleanup:
  * TCP 客户端处理
  * ══════════════════════════════════════════════════════════════════════ */
 
+static void disconnect_cleanup(int client_sock)
+{
+    s_active_client_sock = -1;
+    close(client_sock);
+    s_has_session_key = false;
+    s_has_stream_key = false;
+    s_has_mirror_auth_key = false;
+    memset(s_aes_key, 0, sizeof(s_aes_key));
+    memset(s_encrypt_iv, 0, sizeof(s_encrypt_iv));
+    memset(s_decrypt_iv, 0, sizeof(s_decrypt_iv));
+    memset(s_auth_key, 0, sizeof(s_auth_key));
+    memset(s_auth_msg, 0, sizeof(s_auth_msg));
+    rtsp_read_msg_reset();
+    if (s_connected_cb) s_connected_cb(false);
+}
+
 static void handle_client(int client_sock, struct sockaddr_in *client_addr)
 {
     ESP_LOGI(TAG, "=== Client: %s:%d ===",
              inet_ntoa(client_addr->sin_addr), ntohs(client_addr->sin_port));
-
-    struct timeval tv = { .tv_sec = 10 };
-    setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     miplay_state_t state = STATE_VERSION_EXCHANGE;
     uint16_t rx_seq = 0;
@@ -2279,12 +2307,29 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
     }
 
     while (s_running) {
+        /* select() 同时监听 client socket 和 listen socket。
+         * 新连接到达时 listen 可读 → 立即退出 → accept 新连接（秒切）。
+         * 超时 500ms（匹配逆向报告 RTSP 控制读超时）。 */
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(client_sock, &rfds);
+        FD_SET(s_listen_sock, &rfds);
+        int maxfd = (client_sock > s_listen_sock) ? client_sock : s_listen_sock;
+        struct timeval sel_tv = { .tv_usec = 500000 };
+        int sr = select(maxfd + 1, &rfds, NULL, NULL, &sel_tv);
+        if (sr < 0) { ESP_LOGW(TAG, "select error: %d", errno); break; }
+        if (sr == 0) continue;  /* 500ms 超时，重试 */
+        if (FD_ISSET(s_listen_sock, &rfds)) {
+            ESP_LOGI(TAG, "New connection pending, exiting current session");
+            break;  /* 新连接到达 → 退出 handle_client → accept 新连接 */
+        }
+        if (!FD_ISSET(client_sock, &rfds)) continue;
+
         int space = MIPLAY_RX_BUF_LEN - buf_used;
         if (space <= 0) { buf_used = 0; continue; }
         int n = recv(client_sock, buf + buf_used, space, 0);
         if (n <= 0) {
             if (n == 0) ESP_LOGI(TAG, "Client disconnected");
-            else if (errno == EAGAIN || errno == EWOULDBLOCK) { continue; }
             else ESP_LOGW(TAG, "Recv error: %d", errno);
             break;
         }
@@ -2480,6 +2525,9 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
                     }
                     /* 启动 RTSP 独立任务（PSRAM 静态栈，不依赖内部 SRAM） */
                     if (rtsp_port > 0) {
+                        /* 递增 generation → 旧 RTSP/media task 下次读时自退出 */
+                        uint32_t gen = ++s_media_generation;
+                        ESP_LOGI(TAG, "[RTSP] media_generation -> %lu", (unsigned long)gen);
                         if (!s_rtsp_stack) {
                             s_rtsp_stack = heap_caps_malloc(RTSP_TASK_STACK_SIZE * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
                         }
@@ -2489,6 +2537,7 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
                             rtsp_arg->host[sizeof(rtsp_arg->host) - 1] = 0;
                             rtsp_arg->port = rtsp_port;
                             rtsp_arg->client_sock = client_sock;
+                            rtsp_arg->generation = gen;
                             s_rtsp_task = xTaskCreateStaticPinnedToCore(
                                 miplay_rtsp_task_wrapper, "miplay_rtsp",
                                 RTSP_TASK_STACK_SIZE, rtsp_arg, 4,
@@ -2506,7 +2555,7 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
                         }
                         /* fallback: inline 运行（仅在任务创建失败时） */
                         ESP_LOGW(TAG, "[RTSP] Inline fallback");
-                        miplay_rtsp_run(rtsp_host, rtsp_port, client_sock);
+                        miplay_rtsp_run(rtsp_host, rtsp_port, client_sock, gen);
                         /* RTSP 结束后直接退出 handler（socket 已断开） */
                         free(buf);
                         close(client_sock);
@@ -2954,20 +3003,7 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
     } /* while s_running */
 
     free(buf);
-    s_active_client_sock = -1;
-    close(client_sock);
-    /* 重置全局会话状态（防止新连接使用旧密钥） */
-    s_has_session_key = false;
-    s_has_stream_key = false;
-    s_has_mirror_auth_key = false;
-    memset(s_aes_key, 0, sizeof(s_aes_key));
-    memset(s_encrypt_iv, 0, sizeof(s_encrypt_iv));
-    memset(s_decrypt_iv, 0, sizeof(s_decrypt_iv));
-    memset(s_auth_key, 0, sizeof(s_auth_key));
-    memset(s_auth_msg, 0, sizeof(s_auth_msg));
-    rtsp_read_msg_reset();
-    /* 通知上层：MiPlay 已断开，DLNA 可恢复 */
-    if (s_connected_cb) s_connected_cb(false);
+    disconnect_cleanup(client_sock);
     ESP_LOGI(TAG, "=== Client handler done ===");
 }
 
@@ -2992,7 +3028,7 @@ static void miplay_tcp_task(void *arg)
         close(s_listen_sock); s_listen_sock = -1;
         s_tcp_task = NULL; vTaskDelete(NULL); return;
     }
-    if (listen(s_listen_sock, 3) < 0) {
+    if (listen(s_listen_sock, 5) < 0) {
         ESP_LOGE(TAG, "Listen failed: %d", errno);
         close(s_listen_sock); s_listen_sock = -1;
         s_tcp_task = NULL; vTaskDelete(NULL); return;
@@ -3003,9 +3039,10 @@ static void miplay_tcp_task(void *arg)
         socklen_t addr_len = sizeof(client_addr);
         int client_sock = accept(s_listen_sock, (struct sockaddr *)&client_addr, &addr_len);
         if (client_sock < 0) { if (s_running) { ESP_LOGW(TAG, "Accept failed: %d", errno); vTaskDelay(pdMS_TO_TICKS(250)); } continue; }
+        /* TCP_NODELAY: 立即发送小包，匹配 FusionPlay 行为 */
+        int nodelay = 1;
+        setsockopt(client_sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
         handle_client(client_sock, &client_addr);
-        /* 250ms 错误恢复退避 — 防止快速重连冲击手机端 */
-        if (s_running) vTaskDelay(pdMS_TO_TICKS(250));
     }
     close(s_listen_sock); s_listen_sock = -1;
     s_tcp_task = NULL; vTaskDelete(NULL);
