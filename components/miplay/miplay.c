@@ -1325,25 +1325,32 @@ static int rtsp_read_msg(int sock, char *headers, size_t hdr_max,
         if (!cl) cl = strstr(s_rtsp_buf, "content-length:");
         if (cl) content_len = atoi(cl + 15);
 
-        /* 等待完整 body */
-        while ((int)(s_rtsp_buf_used - hdr_len) < content_len &&
-               s_rtsp_buf_used < RTSP_BUF_SIZE - 1) {
-            int n2 = recv(sock, s_rtsp_buf + s_rtsp_buf_used,
-                          RTSP_BUF_SIZE - 1 - s_rtsp_buf_used, 0);
+        /* 等待完整 body — 先检查 buffer，数据够就不 recv */
+        size_t body_have = s_rtsp_buf_used - hdr_len;
+        while ((int)body_have < content_len && s_rtsp_buf_used < RTSP_BUF_SIZE - 1) {
+            size_t need = (size_t)content_len - body_have;
+            size_t space = RTSP_BUF_SIZE - 1 - s_rtsp_buf_used;
+            if (need > space) need = space;
+            int n2 = recv(sock, s_rtsp_buf + s_rtsp_buf_used, need, 0);
             if (n2 <= 0) break;
             s_rtsp_buf_used += n2;
             s_rtsp_buf[s_rtsp_buf_used] = 0;
+            body_have = s_rtsp_buf_used - hdr_len;
         }
 
         size_t copy = (size_t)content_len < body_max - 1 ? (size_t)content_len : body_max - 1;
-        size_t body_have = s_rtsp_buf_used - hdr_len;
+        body_have = s_rtsp_buf_used - hdr_len;
         if (copy > body_have) copy = body_have;
         memcpy(body, s_rtsp_buf + hdr_len, copy);
         body[copy] = 0;
         *body_len = (int)copy;
 
-        /* 消费掉这条消息，保留后续数据 */
-        size_t total = hdr_len + copy;
+        /* 消费掉这条消息，保留后续数据。
+         * 当 body_have > content_len 时不消费 body — 手机的 OPTIONS200
+         * Content-Length 只覆盖自己的 body，紧跟的 GET_PARAMETER 消息
+         * 被当作 body 的一部分。保留完整数据让解析器正常处理。 */
+        size_t consumed_body = (body_have > (size_t)content_len) ? 0 : copy;
+        size_t total = hdr_len + consumed_body;
         memmove(s_rtsp_buf, s_rtsp_buf + total, s_rtsp_buf_used - total);
         s_rtsp_buf_used -= total;
         s_rtsp_buf[s_rtsp_buf_used] = 0;
