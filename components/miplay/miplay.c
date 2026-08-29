@@ -1938,19 +1938,26 @@ static void miplay_rtsp_run(const char *host, int port, int client_sock, uint32_
                          (unsigned long)(tip & 0xFF), (unsigned long)((tip >> 8) & 0xFF),
                          (unsigned long)((tip >> 16) & 0xFF), (unsigned)((tip >> 24) & 0xFF), tport);
             }
-            /* ── OPTIONS 响应：有 auth 时带 HMAC，无 auth 时不带 ── */
+            /* ── OPTIONS 响应：有 auth 时带 HMAC，无 auth 时不带 ──
+             * FusionPlay: hmac_sha256_hex(keys.auth_key, challenge_bytes)
+             * auth_key = 32-char hex string from control protocol key derivation */
             {
                 char auth_ack_hex[65] = {0};
                 char *phone_auth = strstr(headers, "authMsg:");
-                if (phone_auth && s_has_mirror_auth_key) {
+                if (phone_auth && s_has_session_key) {
                     phone_auth += 8;
                     while (*phone_auth == ' ' || *phone_auth == '\t' ||
                            *phone_auth == '\r' || *phone_auth == '\n') phone_auth++;
+                    /* 截断尾部空白 */
+                    int chal_len = strlen(phone_auth);
+                    while (chal_len > 0 && (phone_auth[chal_len-1] == '\r' ||
+                           phone_auth[chal_len-1] == '\n' || phone_auth[chal_len-1] == ' '))
+                        chal_len--;
                     uint8_t hash[32];
-                    hmac_sha256((const uint8_t *)s_mirror_auth_key, 16,
-                                (const uint8_t *)phone_auth, 16, hash);
+                    hmac_sha256((const uint8_t *)s_auth_key, 32,
+                                (const uint8_t *)phone_auth, chal_len, hash);
                     hex_to_lower(hash, 32, auth_ack_hex);
-                    ESP_LOGI(TAG, "[RTSP] authMsg=%.16s → ack=%.16s...", phone_auth, auth_ack_hex);
+                    ESP_LOGI(TAG, "[RTSP] authMsg=%.*s → ack=%.16s...", chal_len, phone_auth, auth_ack_hex);
                 }
                 char resp[512];
                 int rlen;
