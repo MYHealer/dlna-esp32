@@ -17,6 +17,7 @@
 #include "esp_gmf_pool.h"
 #include "esp_gmf_io_http.h"
 #include "esp_gmf_io_codec_dev.h"
+#include "esp_gmf_io_miplay.h"
 #include "esp_gmf_audio_dec.h"
 #include "esp_gmf_alc.h"
 #include "esp_gmf_event.h"
@@ -64,6 +65,12 @@ static esp_codec_dev_handle_t    s_codec_dev   = NULL;
 static esp_gmf_element_handle_t  s_dec_el     = NULL;
 static esp_gmf_element_handle_t  s_alc_el     = NULL;
 static esp_gmf_pool_handle_t     s_pool       = NULL;
+
+/* MiPlay GMF 管线：io_miplay → aud_dec → aud_alc → io_codec_dev */
+static esp_gmf_pipeline_handle_t s_miplay_pipe    = NULL;
+static esp_gmf_task_handle_t     s_miplay_task    = NULL;
+static esp_gmf_element_handle_t  s_miplay_alc_el  = NULL;
+static RingbufHandle_t           s_ts_ringbuf     = NULL;
 
 static SemaphoreHandle_t s_state_mux     = NULL;
 static play_state_t  s_state             = PS_STOPPED;
@@ -1498,6 +1505,172 @@ static void audio_player_init(void)
     ESP_LOGI(TAG, "GMF audio pipeline ready (io_http → aud_dec → aud_alc → ch_cvt → bit_cvt → io_codec_dev)");
 }
 
+/* ─────────────────────── MiPlay GMF 管线 ─────────────────────── */
+static esp_gmf_err_t miplay_pipeline_event_cb(esp_gmf_event_pkt_t *event, void *ctx)
+{
+    (void)ctx;
+    if (!event) return ESP_GMF_ERR_OK;
+
+    if (event->type == ESP_GMF_EVT_TYPE_CHANGE_STATE) {
+        esp_gmf_event_state_t st = (esp_gmf_event_state_t)event->sub;
+        switch (st) {
+            case ESP_GMF_EVENT_STATE_RUNNING:
+                ESP_LOGI(TAG, "[MiPlay] Pipeline running");
+                break;
+            case ESP_GMF_EVENT_STATE_FINISHED:
+                ESP_LOGI(TAG, "[MiPlay] Pipeline finished");
+                break;
+            case ESP_GMF_EVENT_STATE_STOPPED:
+                ESP_LOGI(TAG, "[MiPlay] Pipeline stopped");
+                break;
+            case ESP_GMF_EVENT_STATE_ERROR:
+                ESP_LOGE(TAG, "[MiPlay] Pipeline error");
+                break;
+            default:
+                break;
+        }
+    } else if (event->type == ESP_GMF_EVT_TYPE_REPORT_INFO
+               && event->sub == ESP_GMF_INFO_SOUND) {
+        if (event->payload && event->payload_size >= sizeof(esp_gmf_info_sound_t)) {
+            esp_gmf_info_sound_t info;
+            memcpy(&info, event->payload, sizeof(info));
+            int rate = info.sample_rates;
+            int bits = info.bits;
+            int ch   = info.channels;
+            if (rate <= 0) rate = 48000;
+            if (bits != 16 && bits != 24 && bits != 32) bits = 16;
+            if (ch <= 0 || ch > 2) ch = 2;
+            ESP_LOGI(TAG, "[MiPlay] Audio info: %d Hz, %d ch, %d bit", rate, ch, bits);
+            audio_out_set_clk(NULL, rate, ch, bits);
+        }
+    }
+    return ESP_GMF_ERR_OK;
+}
+
+/* Forward declarations for MiPlay pipeline callbacks */
+static esp_gmf_err_t miplay_pipeline_event_cb(esp_gmf_event_pkt_t *event, void *ctx);
+static void on_miplay_vol_changed(uint32_t vol_percent);
+static void on_miplay_media_start(bool start);
+
+static void miplay_pipeline_init(void)
+{
+    if (!s_codec_dev) {
+        s_codec_dev = audio_out_init();
+    }
+
+    /* 先创建 ring buffer，后面注入管线要用 */
+    s_ts_ringbuf = xRingbufferCreate(32 * 1024, RINGBUF_TYPE_BYTEBUF);
+    if (!s_ts_ringbuf) {
+        ESP_LOGE(TAG, "TS ring buffer create failed");
+        return;
+    }
+    miplay_set_ts_ringbuf(s_ts_ringbuf);
+
+    /* 注册 io_miplay 到共享 pool */
+    miplay_io_cfg_t miplay_cfg = ESP_GMF_IO_MIPLAY_CFG_DEFAULT();
+    miplay_cfg.dir = ESP_GMF_IO_DIR_READER;
+    esp_gmf_io_handle_t miplay_io = NULL;
+    esp_gmf_err_t ret = esp_gmf_io_miplay_init(&miplay_cfg, &miplay_io);
+    if (ret != ESP_GMF_ERR_OK || !miplay_io) {
+        ESP_LOGE(TAG, "esp_gmf_io_miplay_init failed: %d", ret);
+        return;
+    }
+    esp_gmf_pool_register_io(s_pool, miplay_io, "io_miplay");
+
+    /* 管线：io_miplay → aud_dec → aud_alc → io_codec_dev */
+    const char *name[] = {"aud_dec", "aud_alc"};
+    ret = esp_gmf_pool_new_pipeline(s_pool,
+        "io_miplay", name, sizeof(name) / sizeof(char *), "io_codec_dev", &s_miplay_pipe);
+    if (ret != ESP_GMF_ERR_OK) {
+        ESP_LOGE(TAG, "MiPlay pipeline create failed: %d", ret);
+        return;
+    }
+
+    esp_gmf_io_codec_dev_set_dev(ESP_GMF_PIPELINE_GET_OUT_INSTANCE(s_miplay_pipe), s_codec_dev);
+
+    /* 对管线内的 io_miplay 副本注入 ringbuf（pool 复制时 ringbuf=NULL） */
+    esp_gmf_io_miplay_set_ringbuf(ESP_GMF_PIPELINE_GET_IN_INSTANCE(s_miplay_pipe), s_ts_ringbuf);
+
+    esp_gmf_pipeline_get_el_by_name(s_miplay_pipe, "aud_alc", &s_miplay_alc_el);
+
+    /* 创建 GMF 任务 */
+    esp_gmf_task_cfg_t task_cfg = DEFAULT_ESP_GMF_TASK_CONFIG();
+    task_cfg.name = "miplay_audio";
+    task_cfg.thread.stack = 16 * 1024;
+    task_cfg.thread.prio = 8;
+    task_cfg.thread.stack_in_ext = true;
+    ret = esp_gmf_task_init(&task_cfg, &s_miplay_task);
+    if (ret != ESP_GMF_ERR_OK) {
+        ESP_LOGE(TAG, "MiPlay task init failed: %d", ret);
+        return;
+    }
+    esp_gmf_pipeline_bind_task(s_miplay_pipe, s_miplay_task);
+    esp_gmf_task_set_timeout(s_miplay_task, 20000);
+
+    esp_gmf_pipeline_set_event(s_miplay_pipe, miplay_pipeline_event_cb, NULL);
+    miplay_set_vol_changed_cb(on_miplay_vol_changed);
+    miplay_set_media_cb(on_miplay_media_start);
+
+    ESP_LOGI(TAG, "MiPlay GMF pipeline ready (io_miplay → aud_dec → aud_alc → io_codec_dev)");
+}
+
+static void miplay_pipeline_start(void)
+{
+    if (!s_miplay_pipe) { ESP_LOGW(TAG, "[MiPlay] pipeline not initialized!"); return; }
+    ESP_LOGW(TAG, "[MiPlay] >>> Starting GMF pipeline <<<");
+    /* 清空 ring buffer 中残留数据 */
+    size_t dummy;
+    void *item;
+    while ((item = xRingbufferReceive(s_ts_ringbuf, &dummy, 0)) != NULL) {
+        vRingbufferReturnItem(s_ts_ringbuf, item);
+    }
+    esp_gmf_err_t r1 = esp_gmf_pipeline_loading_jobs(s_miplay_pipe);
+    ESP_LOGI(TAG, "[MiPlay] loading_jobs returned %d", r1);
+    esp_gmf_err_t r2 = esp_gmf_pipeline_run(s_miplay_pipe);
+    ESP_LOGI(TAG, "[MiPlay] pipeline_run returned %d", r2);
+}
+
+static void miplay_pipeline_stop(void)
+{
+    if (!s_miplay_pipe) return;
+    ESP_LOGI(TAG, "[MiPlay] Stopping GMF pipeline");
+    esp_gmf_pipeline_stop(s_miplay_pipe);
+    /* 排空 ring buffer */
+    size_t dummy;
+    void *item;
+    while ((item = xRingbufferReceive(s_ts_ringbuf, &dummy, 0)) != NULL) {
+        vRingbufferReturnItem(s_ts_ringbuf, item);
+    }
+}
+
+/* MiPlay 媒体流开始/停止 → 启动/停止 GMF 管线 */
+static void on_miplay_media_start(bool start)
+{
+    if (start) {
+        ESP_LOGW(TAG, "=== MiPlay media started → starting GMF pipeline ===");
+        miplay_pipeline_start();
+    } else {
+        ESP_LOGW(TAG, "=== MiPlay media stopped → stopping GMF pipeline ===");
+        miplay_pipeline_stop();
+    }
+}
+
+/* MiPlay 手机端音量变化 → 同步到 GMF ALC */
+static void on_miplay_vol_changed(uint32_t vol_percent)
+{
+    if (!s_miplay_alc_el) return;
+    int alc_gain;
+    if (vol_percent <= 0) {
+        alc_gain = -64;
+    } else {
+        int diff = 100 - (int)vol_percent;
+        alc_gain = -(diff * diff * 30) / 10000;
+        if (alc_gain < -64) alc_gain = -64;
+    }
+    esp_gmf_alc_set_gain_all(s_miplay_alc_el, (int8_t)alc_gain);
+    ESP_LOGI(TAG, "[MiPlay] Vol %lu%% → ALC gain %d", (unsigned long)vol_percent, alc_gain);
+}
+
 /* ─────────────────────── Rotary encoder ─────────────────────── */
 static void _enc_on_btn(void *arg)
 {
@@ -1605,7 +1778,7 @@ static void start_dlna(void)
         .on_previous       = cb_previous,
     };
     custom_dlna_init(&cfg);
-    ESP_LOGI(TAG, "Custom DLNA started (host=ESP32-S3-DLNA)");
+    ESP_LOGI(TAG, "Custom DLNA started (host=ESP32-MIPLAY)");
 }
 
 /* ─────────────────────── LVGL UI 更新任务 ── */
@@ -1882,24 +2055,13 @@ static void mdns_service_init(void)
     ESP_LOGI(TAG, "mDNS: _dlna._tcp:8080 registered");
 }
 
-/* MiPlay 连接状态回调：暂停/恢复 DLNA SSDP + 停止音频管线 */
+/* MiPlay 连接状态回调：暂停/恢复 DLNA SSDP */
 static void dlna_on_miplay_connected(bool connected)
 {
+    ESP_LOGI(TAG, "=== MiPlay %s ===", connected ? "connected" : "disconnected");
     custom_dlna_set_ssdp_suppressed(connected);
-    if (connected) {
-        ESP_LOGI(TAG, "=== MiPlay connected → stopping DLNA pipeline ===");
-        /* 停止 DLNA GMF 音频管线（释放 I2S + 内存） */
-        if (s_pipe) {
-            esp_gmf_pipeline_stop(s_pipe);
-            ESP_LOGI(TAG, "DLNA pipeline stopped");
-        }
-        /* 打印内存状态 */
-        ESP_LOGI(TAG, "Heap: %lu free, %lu min_free, PSRAM: %lu free",
-                 (unsigned long)esp_get_free_heap_size(),
-                 (unsigned long)esp_get_minimum_free_heap_size(),
-                 (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-    } else {
-        ESP_LOGI(TAG, "=== MiPlay disconnected → DLNA resumed ===");
+    if (!connected) {
+        miplay_pipeline_stop();
     }
 }
 
@@ -1932,7 +2094,7 @@ void app_main(void)
     /* ── 主机名 + WiFi 协议/功耗 ── */
     {
         esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-        if (sta_netif) esp_netif_set_hostname(sta_netif, "ESP32-S3-DLNA");
+        if (sta_netif) esp_netif_set_hostname(sta_netif, "ESP32-MIPLAY");
     }
     esp_wifi_set_ps(WIFI_PS_NONE);
     esp_wifi_set_protocol(ESP_IF_WIFI_STA,
@@ -1947,6 +2109,7 @@ void app_main(void)
 
     /* ── 音频播放 ── */
     audio_player_init();
+    miplay_pipeline_init();
 
         
     /* ── DLNA 服务（SSDP + HTTP + SOAP）── */

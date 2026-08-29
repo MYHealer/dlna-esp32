@@ -17,8 +17,11 @@ else()
     set(io_inc "codec_dev_io")
 endif()
 
+list(APPEND io_srcs "miplay_io/esp_gmf_io_miplay.c")
+list(APPEND io_inc "miplay_io")
+
 idf_component_register(SRCS ${io_srcs}
                        INCLUDE_DIRS ./include ${io_inc} "http_lib/gzip/" "http_lib/gzip/include"
                        PRIV_INCLUDE_DIRS ""
-                       REQUIRES "driver" "esp_http_client" "esp_driver_i2s" "gmf_core" "esp_codec_dev" "i2s_pa"
+                       REQUIRES "driver" "esp_http_client" "esp_driver_i2s" "gmf_core" "esp_codec_dev" "i2s_pa" "esp_ringbuf"
                        PRIV_REQUIRES mbedtls)

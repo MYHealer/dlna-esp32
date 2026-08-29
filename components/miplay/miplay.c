@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/ringbuf.h"
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_mac.h"
@@ -31,10 +32,6 @@
 #include "lwip/netdb.h"
 #include "lwip/sys.h"
 #include <fcntl.h>
-#include "esp_audio_simple_dec.h"
-#include "esp_audio_simple_dec_default.h"
-#include "impl/esp_ts_dec.h"
-#include "board.h"
 #include "miplay.h"
 
 static const char *TAG = "miplay";
@@ -109,6 +106,8 @@ static miplay_connected_cb_t s_connected_cb = NULL;
 
 /* ── TCP 监听 ── */
 static TaskHandle_t s_tcp_task = NULL;
+static StaticTask_t s_tcp_tcb;
+static StackType_t *s_tcp_stack = NULL;
 static TaskHandle_t s_rtsp_task = NULL;
 static volatile bool s_running = false;
 static int s_listen_sock = -1;
@@ -166,6 +165,26 @@ static char s_mirror_auth_key[33];  /* authKey: 16 ASCII bytes from SetMirrorKey
 
 /* ── 音量状态（控制会话写，音频输出读）── */
 static volatile uint32_t s_volume_percent = 50;
+static miplay_vol_changed_cb_t s_vol_changed_cb = NULL;
+
+void miplay_set_vol_changed_cb(miplay_vol_changed_cb_t cb)
+{
+    s_vol_changed_cb = cb;
+}
+
+/* ── GMF ring buffer（media_receive_task → io_miplay → aud_dec）── */
+static RingbufHandle_t s_ts_ringbuf = NULL;
+static miplay_media_cb_t s_media_cb = NULL;
+
+void miplay_set_ts_ringbuf(RingbufHandle_t rb)
+{
+    s_ts_ringbuf = rb;
+}
+
+void miplay_set_media_cb(miplay_media_cb_t cb)
+{
+    s_media_cb = cb;
+}
 
 /* ── 活跃控制会话（供 receiver-control 等外部 API 使用）── */
 static volatile int s_active_client_sock = -1;
@@ -231,7 +250,7 @@ static void init_device_identity(void)
     /* PC 原型: device_id = mac[2..5] 大写hex（后4字节） */
     snprintf(s_device_id, sizeof(s_device_id), "%02X%02X%02X%02X",
              mac[2], mac[3], mac[4], mac[5]);
-    /* inst_name: ESP32-DLNA(idHash前3字符)
+    /* inst_name: ESP32-MIPLAY(idHash前3字符)
      * Rust: idm_identity → SHA256(stable_seed) → base64url → 前3字符 = short_id
      *       idHash = base64_standard(short_id.as_bytes())  ← 关键！
      *       例: short_id="Fn_" → idHash=base64("Fn_")="Rm5f"
@@ -277,7 +296,7 @@ static void init_device_identity(void)
             suffix[i] = b64url[(val >> (18 - bit_offset)) & 63];
         }
         suffix[10] = 0;
-        snprintf(s_inst_name, sizeof(s_inst_name), "ESP32-DLNA(%s)", suffix);
+        snprintf(s_inst_name, sizeof(s_inst_name), "ESP32-MIPLAY(%s)", suffix);
     }
 
     /* UUID */
@@ -321,7 +340,7 @@ static void init_device_identity(void)
     {
         uint8_t appdata[64];
         int adoff = 0;
-        const char *dev_name = "ESP32-DLNA";
+        const char *dev_name = "ESP32-MIPLAY";
         int name_len = strlen(dev_name);
         appdata[adoff++] = 0x00; appdata[adoff++] = 0x40; appdata[adoff++] = 0x15;
         appdata[adoff++] = mac[2]; appdata[adoff++] = mac[3];
@@ -363,7 +382,7 @@ static esp_err_t register_mdns_services(void)
      * flags=CgE= (0x0a,0x01), dev=2, appsData=gQAEBIMiww== */
     mdns_txt_item_t micon_txt[] = {
         {"version", MIPLAY_VERSION}, {"apps","[5]"}, {"flags","CgE="},
-        {"name","ESP32-DLNA"}, {"idHash",s_idhash}, {"dev",MIPLAY_DEV},
+        {"name","ESP32-MIPLAY"}, {"idHash",s_idhash}, {"dev",MIPLAY_DEV},
         {"sec",MIPLAY_SEC}, {"appsData",s_appsdata}, {"mac",s_mac_b64},
     };
     esp_err_t err = mdns_service_add_for_host(s_inst_name, MIPLAY_MICON_SERVICE, MIPLAY_MICON_PROTO,
@@ -1599,46 +1618,11 @@ static void media_receive_task(void *arg)
     free(marg);
 
     ESP_LOGI(TAG, "[MEDIA] Task started (sock=%d)", media_sock);
+    if (s_media_cb) s_media_cb(true);
 
-    /* 使用 TS 解码器：内部处理 TS demux + AAC 解码，直接输出 PCM
-     * 与备份版一致，比手动 TS demux 更可靠 */
-    esp_audio_simple_dec_register_default();
-    esp_ts_dec_cfg_t ts_cfg = { .aac_plus_enable = false };
-    esp_audio_simple_dec_cfg_t dec_cfg = {
-        .dec_type = ESP_AUDIO_SIMPLE_DEC_TYPE_TS,
-        .dec_cfg = &ts_cfg,
-        .cfg_size = sizeof(esp_ts_dec_cfg_t),
-        .use_frame_dec = false,
-    };
-    esp_audio_simple_dec_handle_t decoder = NULL;
-    esp_audio_err_t derr = esp_audio_simple_dec_open(&dec_cfg, &decoder);
-    if (derr != ESP_AUDIO_ERR_OK || !decoder) {
-        ESP_LOGE(TAG, "[MEDIA] TS decoder open failed: %d", derr);
-        close(media_sock);
-        vTaskDelete(NULL); return;
-    }
-    ESP_LOGI(TAG, "[MEDIA] TS decoder opened OK");
-
-    audio_out_init();
-    i2s_chan_handle_t i2s_tx = audio_out_get_tx_handle();
-    if (!i2s_tx) {
-        ESP_LOGE(TAG, "[MEDIA] I2S TX not available");
-        esp_audio_simple_dec_close(decoder);
-        close(media_sock);
-        vTaskDelete(NULL); return;
-    }
-    ESP_LOGI(TAG, "[MEDIA] I2S TX ready, entering read loop");
-
-    /* 32KB PCM 缓冲：累积多个 RTP 包解码结果再批量写 I2S，吸收网络 jitter
-     * FusionPlay 用 80ms output cushion，这里 32KB ≈ 160ms @ 48kHz stereo */
-    const int pcm_buf_size = 32768;
-    uint8_t *pcm_buf = heap_caps_malloc(pcm_buf_size, MALLOC_CAP_SPIRAM);
     uint8_t *rtp_buf = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
-
-    if (!pcm_buf || !rtp_buf) {
+    if (!rtp_buf) {
         ESP_LOGE(TAG, "[MEDIA] alloc failed");
-        free(pcm_buf); free(rtp_buf);
-        esp_audio_simple_dec_close(decoder);
         close(media_sock);
         vTaskDelete(NULL); return;
     }
@@ -1646,8 +1630,7 @@ static void media_receive_task(void *arg)
     struct timeval tv = { .tv_sec = 10 };
     setsockopt(media_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    uint32_t pkt_count = 0, rtp_total = 0, pcm_total = 0;
-    bool i2s_configured = false;
+    uint32_t pkt_count = 0, rtp_total = 0, ts_total = 0;
 
     while (s_running && s_media_generation == generation) {
         /* ── 读取4字节 interleaved RTP 帧头：$ + channel + len(u16 BE) ── */
@@ -1719,72 +1702,31 @@ static void media_receive_task(void *arg)
             decrypt_ts_media(ts_data, ts_len);
         }
 
-        /* ── 直接送 TS 解码器（内部处理 TS demux + AAC decode → PCM）── */
-        esp_audio_simple_dec_raw_t raw = { .buffer = ts_data, .len = ts_len, .eos = false };
-        while (raw.len > 0 && s_running) {
-            esp_audio_simple_dec_out_t out = {
-                .buffer = pcm_buf, .len = pcm_buf_size, .decoded_size = 0
-            };
-            derr = esp_audio_simple_dec_process(decoder, &raw, &out);
-            if (derr == ESP_AUDIO_ERR_BUFF_NOT_ENOUGH) {
-                uint8_t *bigger = realloc(pcm_buf, out.needed_size);
-                if (!bigger) break;
-                pcm_buf = bigger;
-                continue;
-            }
-            if (derr != ESP_AUDIO_ERR_OK) break;
-            raw.buffer += raw.consumed;
-            raw.len -= raw.consumed;
-
-            if (out.decoded_size > 0) {
-                if (!i2s_configured) {
-                    esp_audio_simple_dec_info_t info;
-                    if (esp_audio_simple_dec_get_info(decoder, &info) == ESP_AUDIO_ERR_OK) {
-                        ESP_LOGI(TAG, "[MEDIA] Audio: %luHz %dbit %dch",
-                                 (unsigned long)info.sample_rate,
-                                 info.bits_per_sample, info.channel);
-                        audio_out_set_clk(NULL, info.sample_rate,
-                                          info.channel, info.bits_per_sample);
-                        i2s_configured = true;
-                    }
-                }
-                /* 应用 MiPlay 音量增益 */
-                uint32_t vol = s_volume_percent;
-                if (vol < 100) {
-                    int16_t *samples = (int16_t *)pcm_buf;
-                    size_t nsamples = out.decoded_size / 2;
-                    for (size_t i = 0; i < nsamples; i++) {
-                        samples[i] = (int16_t)((int32_t)samples[i] * (int32_t)vol / 100);
-                    }
-                }
-                /* 累积写入 I2S：每 4KB（~21ms）刷一次，减少小块写入抖动 */
-                size_t bytes_written = 0;
-                i2s_channel_write(i2s_tx, pcm_buf, out.decoded_size,
-                                  &bytes_written, 1000);
-                pcm_total += out.decoded_size;
-            }
+        /* ── 发送到 ring buffer，由 GMF 管线解码 ── */
+        if (s_ts_ringbuf && ts_len > 0) {
+            xRingbufferSend(s_ts_ringbuf, ts_data, ts_len, pdMS_TO_TICKS(100));
+            ts_total += ts_len;
         }
 
         if (pkt_count % 100 == 1) {
-            ESP_LOGI(TAG, "[MEDIA] pkts=%lu rtp=%luKB pcm=%luKB",
+            ESP_LOGI(TAG, "[MEDIA] pkts=%lu rtp=%luKB ts=%luKB",
                      (unsigned long)pkt_count, (unsigned long)(rtp_total / 1024),
-                     (unsigned long)(pcm_total / 1024));
+                     (unsigned long)(ts_total / 1024));
         }
     }
     if (s_media_generation != generation)
         ESP_LOGI(TAG, "[MEDIA] Replaced by newer session (gen %lu -> %lu)",
                  (unsigned long)generation, (unsigned long)s_media_generation);
 m_cleanup:
-    free(rtp_buf); free(pcm_buf);
-    esp_audio_simple_dec_close(decoder);
+    if (s_media_cb) s_media_cb(false);
+    free(rtp_buf);
     close(media_sock);
-    /* RTSP socket 在媒体结束后关闭（之前不关是为了保持会话活跃） */
     if (rtsp_sock_to_close >= 0) close(rtsp_sock_to_close);
     if (s_image_sock >= 0) { close(s_image_sock); s_image_sock = -1; }
     s_image_port = s_multi_port = 0;
-    ESP_LOGI(TAG, "[MEDIA] Task ended, %lu pkts, %luKB rtp, %luKB pcm",
+    ESP_LOGI(TAG, "[MEDIA] Task ended, %lu pkts, %luKB rtp, %luKB ts",
              (unsigned long)pkt_count, (unsigned long)(rtp_total / 1024),
-             (unsigned long)(pcm_total / 1024));
+             (unsigned long)(ts_total / 1024));
     vTaskDelete(NULL);
 }
 
@@ -2862,6 +2804,7 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
                         if (vol <= 100) {
                             s_volume_percent = vol;
                             ESP_LOGI(TAG, "Volume set to %u%%", (unsigned)vol);
+                            if (s_vol_changed_cb) s_vol_changed_cb(vol);
                         }
                     }
                     uint8_t ack[5] = {0};
@@ -3222,7 +3165,7 @@ static void mdns_announce_task(void *arg)
     /* TXT for _mi-connect */
     mdns_txt_item_t micon_txt[] = {
         {"version", MIPLAY_VERSION}, {"apps","[5]"}, {"flags","CgE="},
-        {"name","ESP32-DLNA"}, {"idHash",s_idhash}, {"dev",MIPLAY_DEV},
+        {"name","ESP32-MIPLAY"}, {"idHash",s_idhash}, {"dev",MIPLAY_DEV},
         {"sec",MIPLAY_SEC}, {"appsData",s_appsdata}, {"mac",s_mac_b64},
     };
     /* TXT for _lyra-mdns */
@@ -3341,8 +3284,11 @@ esp_err_t miplay_init(void)
 
     s_running = true;
     build_miplay_lan_response();
-    BaseType_t ret = xTaskCreatePinnedToCore(miplay_tcp_task, "miplay_tcp", 6144, NULL, 5, &s_tcp_task, 1);
-    if (ret != pdPASS) { ESP_LOGE(TAG, "TCP task failed"); s_running = false; return ESP_FAIL; }
+    s_tcp_stack = heap_caps_malloc(6144, MALLOC_CAP_SPIRAM);
+    if (!s_tcp_stack) { ESP_LOGE(TAG, "TCP stack alloc failed"); s_running = false; return ESP_FAIL; }
+    s_tcp_task = xTaskCreateStaticPinnedToCore(miplay_tcp_task, "miplay_tcp", 6144,
+                                                NULL, 5, s_tcp_stack, &s_tcp_tcb, 1);
+    if (!s_tcp_task) { ESP_LOGE(TAG, "TCP task failed"); s_running = false; return ESP_FAIL; }
     xTaskCreatePinnedToCore(miplay_scan_task, "miplay_scan", 3072, NULL, 3, &s_scan_task, 1);
     xTaskCreatePinnedToCore(miplay_lan_task, "miplay_lan", 4096, NULL, 3, &s_lan_task, 0);
     xTaskCreatePinnedToCore(mdns_announce_task, "mdns_ann", 4096, NULL, 3, &s_announce_task, 0);
