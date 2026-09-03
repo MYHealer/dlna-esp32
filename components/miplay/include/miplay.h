@@ -59,6 +59,20 @@ void miplay_set_ts_ringbuf(RingbufHandle_t rb);
 typedef void (*miplay_media_cb_t)(bool start);
 void miplay_set_media_cb(miplay_media_cb_t cb);
 
+/**
+ * @brief MiPlay 反向播放状态回调（手机反控/位置心跳推断）
+ * paused=true 手机端暂停，paused=false 播放中。对齐参考 PLAYER_STATE 事件。
+ */
+typedef void (*miplay_play_state_cb_t)(bool paused);
+void miplay_set_play_state_cb(miplay_play_state_cb_t cb);
+
+/**
+ * @brief MiPlay 位置同步回调（手机 SetPosition 0x0056，大端毫秒）
+ * 对齐参考 opack_u64_be(payload) + MIPLAY_MEDIA_CHANGED_POSITION。
+ */
+typedef void (*miplay_position_cb_t)(int64_t pos_ms);
+void miplay_set_position_cb(miplay_position_cb_t cb);
+
 #ifdef __cplusplus
 }
 #endif

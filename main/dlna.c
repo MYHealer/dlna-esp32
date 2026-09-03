@@ -104,6 +104,13 @@ static int64_t       s_stuck_paused_since = 0;
 static volatile bool s_lyrics_ui_clear_pending = false;
 /* MiPlay 活跃标志：旋钮反向控制用 */
 static volatile bool s_miplay_active = false;
+/* MiPlay 反向播放状态/进度（对齐参考 s_miplay_state/s_miplay_position_*）:
+ * UI task 在 MiPlay 激活时用这组值显示图标和进度, 否则旋钮暂停后
+ * get_state() 恒为 PLAYING, 图标 40ms 内被刷回播放态。 */
+static volatile bool s_miplay_paused = false;
+static volatile int  s_miplay_pos_ms = 0;      /* 手机确认的最近位置 */
+static int64_t       s_miplay_anchor_us = 0;   /* 播放中位置锚点, 0=冻结 */
+static int           s_miplay_accum_ms = 0;    /* 冻结累计 */
 /* 位置追踪：纯软件方案（参考 miair-next） */
 static int64_t        s_play_start_us     = 0;   /* 播放开始时间（esp_timer us），0=未在播放 */
 static int            s_accumulated_ms    = 0;   /* 累计已播放 ms（暂停/停止时冻结） */
@@ -165,6 +172,9 @@ static void cb_previous(void);
 static void cb_play_toggle(void);
 
 /* ── Now Playing 统一元数据层回调（forward decl）── */
+static int get_miplay_display_pos_ms(void);
+static void on_miplay_play_state(bool paused);
+static void on_miplay_position(int64_t pos_ms);
 static void np_on_meta_changed(const np_meta_t *meta);
 static void np_on_cover_url(const char *url);
 static void np_on_source_changed(np_source_t src);
@@ -660,9 +670,24 @@ static void cb_play_toggle(void)
 {
     ESP_LOGI(TAG, "cb_play_toggle: s_miplay_active=%d", (int)s_miplay_active);
     if (s_miplay_active) {
+        /* 对齐参考 cb_pause/cb_play 的 MiPlay 分支: 立即更新本地状态+锚点,
+         * 再发 receiver_control。不更新本地状态会导致 UI 图标 40ms 内被刷回。 */
         play_state_t cur = get_state();
-        ESP_LOGI(TAG, "[MiPlay] -> %s", cur == PS_PLAYING ? "key-pause" : "key-resume");
-        miplay_send_receiver_control(cur == PS_PLAYING ? "pause" : "resume", 0);
+        if (cur == PS_PLAYING) {
+            /* 冻结 MiPlay 显示位置 */
+            s_miplay_accum_ms = get_miplay_display_pos_ms();
+            s_miplay_anchor_us = 0;
+            s_miplay_paused = true;
+            set_state(PS_PAUSED);
+            miplay_send_receiver_control("pause", 0);
+            ESP_LOGI(TAG, "[MiPlay] knob pause at %d ms", s_miplay_accum_ms);
+        } else {
+            s_miplay_paused = false;
+            s_miplay_anchor_us = esp_timer_get_time();
+            set_state(PS_PLAYING);
+            miplay_send_receiver_control("resume", 0);
+            ESP_LOGI(TAG, "[MiPlay] knob resume");
+        }
         return;
     }
     play_state_t cur = get_state();
@@ -1793,6 +1818,8 @@ static void miplay_pipeline_init(void)
     esp_gmf_pipeline_set_event(s_miplay_pipe, miplay_pipeline_event_cb, NULL);
     miplay_set_vol_changed_cb(on_miplay_vol_changed);
     miplay_set_media_cb(on_miplay_media_start);
+    miplay_set_play_state_cb(on_miplay_play_state);
+    miplay_set_position_cb(on_miplay_position);
 
     ESP_LOGI(TAG, "MiPlay GMF pipeline ready (io_miplay → aud_dec → aud_alc → io_codec_dev)");
 }
@@ -1862,6 +1889,46 @@ static void on_miplay_vol_changed(uint32_t vol_percent)
     }
     esp_gmf_alc_set_gain_all(s_miplay_alc_el, (int8_t)alc_gain);
     ESP_LOGI(TAG, "[MiPlay] Vol %lu%% → ALC gain %d", (unsigned long)vol_percent, alc_gain);
+}
+
+/* ── MiPlay 反向播放状态（手机 0x0004 pause / 0x0006 resume）──
+ * 对齐参考 consume_miplay_media_events_locked 的 PLAYER_STATE 分支:
+ * 冻结/重置位置锚点并记录状态, UI task 据此显示图标。 */
+static void on_miplay_play_state(bool paused)
+{
+    s_miplay_paused = paused;
+    if (paused) {
+        if (s_miplay_anchor_us > 0) {
+            s_miplay_accum_ms = s_miplay_pos_ms;  /* 冻结在手机确认位置 */
+            s_miplay_anchor_us = 0;
+        }
+    } else {
+        s_miplay_anchor_us = esp_timer_get_time();
+    }
+    ESP_LOGI(TAG, "[MiPlay] phone %s (pos=%dms)", paused ? "PAUSED" : "PLAYING",
+             s_miplay_pos_ms);
+}
+
+/* ── MiPlay 位置同步（手机 SetPosition 0x0056, 大端毫秒）──
+ * 对齐参考 dlna.c:671-675: 位置写入 + 播放中重置锚点。 */
+static void on_miplay_position(int64_t pos_ms)
+{
+    if (pos_ms < 0) pos_ms = 0;
+    s_miplay_pos_ms = (int)pos_ms;
+    s_miplay_accum_ms = (int)pos_ms;
+    if (!s_miplay_paused && s_miplay_active)
+        s_miplay_anchor_us = esp_timer_get_time();
+    ESP_LOGI(TAG, "[MiPlay] pos sync %lldms (paused=%d)", (long long)pos_ms,
+             (int)s_miplay_paused);
+}
+
+/* MiPlay 激活时的显示位置（对齐参考 get_miplay_position_ms） */
+static int get_miplay_display_pos_ms(void)
+{
+    int64_t pos = s_miplay_accum_ms;
+    if (s_miplay_active && !s_miplay_paused && s_miplay_anchor_us > 0)
+        pos += (esp_timer_get_time() - s_miplay_anchor_us) / 1000LL;
+    return (int)pos;
 }
 
 /* ─────────────────────── Rotary encoder ─────────────────────── */
@@ -2045,11 +2112,28 @@ static void ui_update_task(void *arg)
             last_cur_line = -1;
         }
 
-        int pos_ms = get_position_ms();
-        int pos_sec = pos_ms / 1000;
-        ESP_LOGI(TAG, "UI: pos=%d dur=%d state=%d", pos_sec, s_dur_cache_sec, (int)get_state());
-        lvgl_port_ui_set_progress(pos_sec, s_dur_cache_sec);
-        lvgl_port_ui_set_state((int)get_state());
+        int pos_ms, pos_sec;
+        /* 对齐参考 UI task: MiPlay 激活时状态/进度走 MiPlay 源,
+         * 否则旋钮暂停后图标会被 get_state() 恒 PLAYING 刷回。 */
+        bool miplay_ui = s_miplay_active;
+        play_state_t display_state = miplay_ui
+            ? (s_miplay_paused ? PS_PAUSED : PS_PLAYING)
+            : get_state();
+        if (miplay_ui) {
+            pos_ms = get_miplay_display_pos_ms();
+            pos_sec = pos_ms / 1000;
+            int miplay_dur = (s_dur_cache_sec > 0) ? s_dur_cache_sec : 0;
+            ESP_LOGI(TAG, "UI: pos=%d dur=%d state=%d [miplay]", pos_sec, miplay_dur,
+                     (int)display_state);
+            lvgl_port_ui_set_progress(pos_sec, miplay_dur);
+            lvgl_port_ui_set_state((int)display_state);
+        } else {
+            pos_ms = get_position_ms();
+            pos_sec = pos_ms / 1000;
+            ESP_LOGI(TAG, "UI: pos=%d dur=%d state=%d", pos_sec, s_dur_cache_sec, (int)get_state());
+            lvgl_port_ui_set_progress(pos_sec, s_dur_cache_sec);
+            lvgl_port_ui_set_state((int)get_state());
+        }
         /* 音量变化检测：滑动时 SOAP 排队，这里 40ms 检测一次，只应用最新值 */
         if (s_vol != s_last_applied_vol) {
             int hw = s_mute ? 0 : s_vol;

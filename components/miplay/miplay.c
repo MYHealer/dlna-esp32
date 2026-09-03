@@ -215,6 +215,20 @@ void miplay_set_media_cb(miplay_media_cb_t cb)
     s_media_cb = cb;
 }
 
+/* ── 反向播放状态/位置回调（对齐参考 PLAYER_STATE/POSITION 事件）── */
+static miplay_play_state_cb_t s_play_state_cb = NULL;
+static miplay_position_cb_t  s_position_cb   = NULL;
+
+void miplay_set_play_state_cb(miplay_play_state_cb_t cb)
+{
+    s_play_state_cb = cb;
+}
+
+void miplay_set_position_cb(miplay_position_cb_t cb)
+{
+    s_position_cb = cb;
+}
+
 /* ── 活跃控制会话（供 receiver-control 等外部 API 使用）── */
 static volatile int s_active_client_sock = -1;
 static volatile int s_notify_seq = 8;
@@ -3824,7 +3838,25 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
 
                 /* ── Pause (0x0004) / Resume (0x0006) / SetPosition (0x0056) ── */
                 if (cmd == CMD_PAUSE || cmd == CMD_RESUME || cmd == CMD_SET_POSITION) {
-                    ESP_LOGI(TAG, "Media control cmd=0x%04X seq=%u", cmd, seq);
+                    /* 对齐参考 4650-4677: PAUSE/RESUME 触发 PLAYER_STATE 事件,
+                     * SET_POSITION 解析前 8 字节大端毫秒位置(opack_u64_be 语义)。 */
+                    if (cmd == CMD_PAUSE) {
+                        ESP_LOGI(TAG, "Media control cmd=0x0004 (pause) seq=%u", seq);
+                        if (s_play_state_cb) s_play_state_cb(true);
+                    } else if (cmd == CMD_RESUME) {
+                        ESP_LOGI(TAG, "Media control cmd=0x0006 (resume) seq=%u", seq);
+                        if (s_play_state_cb) s_play_state_cb(false);
+                    } else {
+                        int64_t pos_ms = 0;
+                        if (plen >= 8) {
+                            const uint8_t *p8 = payload;
+                            for (int i = 0; i < 8; i++)
+                                pos_ms = (pos_ms << 8) | (int64_t)p8[i];
+                        }
+                        ESP_LOGI(TAG, "Media control cmd=0x0056 (position) seq=%u pos=%lldms",
+                                 seq, (long long)pos_ms);
+                        if (s_position_cb) s_position_cb(pos_ms);
+                    }
                     send_encrypted_cmd(client_sock, cmd + 1, seq, NULL, 0);
                     break;
                 }
