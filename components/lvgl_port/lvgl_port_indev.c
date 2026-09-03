@@ -44,6 +44,7 @@ static void _on_btn_click(void *arg)
     s_enc_btn = 1;
     s_last_activity_us = esp_timer_get_time();
     s_pending_focus_show = true;
+    ESP_LOGI(TAG, "BTN pressed (ISR)");
 }
 
 /* ── 旋钮读取回调（LVGL 周期性调用）── */
@@ -64,8 +65,13 @@ static void encoder_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
         if (g) {
             lv_obj_t *focused = lv_group_get_focused(g);
             if (focused) {
+                ESP_LOGI(TAG, "BTN consumed -> CLICKED on %p", focused);
                 lv_event_send(focused, LV_EVENT_CLICKED, NULL);
+            } else {
+                ESP_LOGW(TAG, "BTN consumed but no focused obj");
             }
+        } else {
+            ESP_LOGW(TAG, "BTN consumed but no group");
         }
     }
     data->state = LV_INDEV_STATE_RELEASED;

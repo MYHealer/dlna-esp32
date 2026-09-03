@@ -14,6 +14,7 @@
 #include "freertos/task.h"
 #include "freertos/ringbuf.h"
 #include "esp_log.h"
+#include "esp_attr.h"
 #include "esp_err.h"
 #include "esp_mac.h"
 #include "esp_timer.h"
@@ -33,6 +34,7 @@
 #include "lwip/sys.h"
 #include <fcntl.h>
 #include "miplay.h"
+#include "now_playing.h"
 
 static const char *TAG = "miplay";
 
@@ -64,6 +66,7 @@ static const char *TAG = "miplay";
 #define CMD_SET_VOLUME          0x000C
 #define CMD_GET_VOLUME          0x000E
 #define CMD_GET_MEDIA_INFO      0x0014
+#define CMD_GET_MEDIA_INFO_ACK  0x0015   /* 对齐参考: 媒体信息查询应答 */
 #define CMD_GET_STATE           0x001C
 #define CMD_HEARTBEAT           0x001A
 #define CMD_HEARTBEAT_ACK       0x001B
@@ -106,34 +109,55 @@ static miplay_connected_cb_t s_connected_cb = NULL;
 
 /* ── TCP 监听 ── */
 static TaskHandle_t s_tcp_task = NULL;
-static StaticTask_t s_tcp_tcb;
-static StackType_t *s_tcp_stack = NULL;
 static TaskHandle_t s_rtsp_task = NULL;
 static volatile bool s_running = false;
+static volatile bool s_connected = false;  /* SafetyAuth 握手完成后 true，全部断开后 false */
 static int s_listen_sock = -1;
 
-/* 接收缓冲区大小（堆分配，勿再改回栈数组） */
-#define MIPLAY_RX_BUF_LEN  1024
-/* RTSP 任务栈大小（从 PSRAM 分配 stack+TCB） */
-#define MIPLAY_RTSP_STACK_SIZE  (12 * 1024)
+/* 接收缓冲区 */
+#define MIPLAY_MAX_FRAME_PAYLOAD    2048
+#define MIPLAY_RX_BUF_LEN          4096
+#define MIPLAY_MEDIA_INFO_BUFFER_SIZE 8192
+#define MIPLAY_COVER_SOURCE_MAX     49152   /* 48KB, 足够 data:URI base64 封面 */
 
-static char s_device_id[16];
-static char s_inst_name[48];
-static char s_idhash[16];
-static char s_appsdata[160];
-static char s_mac_b64[16];
-static char s_uuid[40];
-static char s_lyra_appdata[96];
+/* PSRAM 堆分配宏：内部 SRAM 碎片化是断联根因，所有大缓冲走 PSRAM */
+#define MIPLAY_MALLOC(sz)  heap_caps_malloc((sz), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+#define MIPLAY_CALLOC(n, sz) heap_caps_calloc((n), (sz), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+#define MIPLAY_FREE(p)     heap_caps_free(p)
+
+/* 对齐参考 miplay_psram_prefer_alloc(): PSRAM 优先，失败回退内部 SRAM。
+ * 元数据/封面解析不能因为 PSRAM 暂时不足就整块丢失。 */
+static void *miplay_psram_prefer_alloc(size_t size)
+{
+    void *ptr = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!ptr) {
+        ESP_LOGW(TAG, "PSRAM alloc %u failed, fallback internal", (unsigned)size);
+        ptr = heap_caps_malloc(size, MALLOC_CAP_8BIT);
+    }
+    if (!ptr) ESP_LOGE(TAG, "alloc %u failed entirely", (unsigned)size);
+    return ptr;
+}
+
+/* RTSP 任务栈大小（从 PSRAM 分配 stack+TCB） */
+#define MIPLAY_RTSP_STACK_SIZE  (48 * 1024)
+
+static EXT_RAM_BSS_ATTR char s_device_id[16];
+static EXT_RAM_BSS_ATTR char s_inst_name[48];
+static EXT_RAM_BSS_ATTR char s_idhash[16];
+static EXT_RAM_BSS_ATTR char s_appsdata[160];
+static EXT_RAM_BSS_ATTR char s_mac_b64[16];
+static EXT_RAM_BSS_ATTR char s_uuid[40];
+static EXT_RAM_BSS_ATTR char s_lyra_appdata[96];
 static uint8_t s_mac[6];
 
 /* ── MiPlay LAN (UDP 5355) 发现应答 ── */
 #define MIPLAY_LAN_DISCOVERY_PORT 5355
 #define MIPLAY_LAN_MDNS_GROUP     "224.0.0.251"
-static uint8_t s_lan_response[512];       /* unicast 应答（带 question） */
+static EXT_RAM_BSS_ATTR uint8_t s_lan_response[512];       /* unicast 应答（带 question） */
 static size_t s_lan_response_len;
-static uint8_t s_lan_announce[512];       /* multicast 宣告（无 question, 0x8001） */
+static EXT_RAM_BSS_ATTR uint8_t s_lan_announce[512];       /* multicast 宣告（无 question, 0x8001） */
 static size_t s_lan_announce_len;
-static char s_lan_hostname[32];
+static EXT_RAM_BSS_ATTR char s_lan_hostname[32];
 static TaskHandle_t s_lan_task = NULL;
 static int s_lan_sock = -1;
 
@@ -189,15 +213,28 @@ void miplay_set_media_cb(miplay_media_cb_t cb)
 /* ── 活跃控制会话（供 receiver-control 等外部 API 使用）── */
 static volatile int s_active_client_sock = -1;
 static volatile int s_notify_seq = 8;
+/* 媒体流收包总数，供 RTSP keepalive 诊断日志判断音频是否在流动 */
+static volatile uint32_t s_media_pkt_total = 0;
+
+/* 发送互斥锁：保护 send_encrypted_cmd 的共享缓冲区(s_encrypt_buf)、
+ * CBC IV 状态(s_encrypt_iv)和序号(s_notify_seq)不被并发破坏。
+ * 参考 esp_miplay-main s_send_mux，20 处 Take/Give。 */
+static SemaphoreHandle_t s_send_mux = NULL;
 /* ── 媒体会话 generation（每次 OPEN 递增，旧 RTSP/media task 自退出）── */
 static volatile uint32_t s_media_generation = 0;
 
 /* ── 媒体元数据（SetMediaInfo 接收，GetMediaInfo 返回）── */
-static char s_media_title[128];
-static char s_media_artist[64];
-static char s_media_album[64];
+static EXT_RAM_BSS_ATTR char s_media_id[64];        /* 对齐参考 */
+static EXT_RAM_BSS_ATTR char s_media_audio_id[64];  /* 对齐参考 */
+static EXT_RAM_BSS_ATTR char s_media_title[128];
+static EXT_RAM_BSS_ATTR char s_media_artist[128];  /* 对齐参考: 64 → 128 */
+static EXT_RAM_BSS_ATTR char s_media_album[128];   /* 对齐参考: 64 → 128 */
 static uint32_t s_media_duration;  /* ms */
-static char s_media_cover_url[256];
+static uint32_t s_media_position;  /* ms */
+static int      s_media_status;    /* 0=stopped, 2=playing, 3=paused */
+/* cover 源：http URL 或 data:...;base64 引用。完整 base64 可能大，经 np_set_cover_url 交给 now_playing 动态 PSRAM，
+ * 本地缓冲只存引用/前缀供 GetMediaInfo 回读。 */
+static EXT_RAM_BSS_ATTR char s_media_cover_url[MIPLAY_COVER_SOURCE_MAX];
 static volatile bool s_has_mirror_auth_key = false;
 
 /* ── 基础工具 ── */
@@ -684,7 +721,7 @@ static void miplay_lan_task(void *arg)
         if (!found) continue;
 
         /* 组装应答：覆盖 TX ID（堆分配避免栈溢出） */
-        uint8_t *reply = malloc(s_lan_response_len);
+        uint8_t *reply = MIPLAY_MALLOC(s_lan_response_len);
         if (!reply) continue;
         memcpy(reply, s_lan_response, s_lan_response_len);
         reply[0] = rx_buf[0];
@@ -692,7 +729,7 @@ static void miplay_lan_task(void *arg)
 
         sendto(s_lan_sock, reply, s_lan_response_len, 0,
                (struct sockaddr *)&src, srclen);
-        free(reply);
+        MIPLAY_FREE(reply);
         ESP_LOGI(TAG, "LAN → _miplay_lan reply %u.%u.%u.%u (%u bytes)",
                  (unsigned)(src.sin_addr.s_addr & 0xFF),
                  (unsigned)((src.sin_addr.s_addr >> 8) & 0xFF),
@@ -757,55 +794,234 @@ static uint32_t safety_integrity(const uint8_t *data, size_t len)
 
 /* ══════════════════════════════════════════════════════════════════════
  * AES-128-CBC 手动实现（SafetyData v1 使用无填充 CBC + 零填充）
+ *
+ * ⚠ 本实现使用纯软件 AES 内核（下方 sw_aes_*），不调用 mbedtls_aes_*。
+ *    原因：CONFIG_MBEDTLS_HARDWARE_AES=y 时 ESP-IDF 把 mbedtls_aes_crypt_ecb
+ *    宏映射到 esp_aes_crypt_ecb（硬件 GDMA 加速），每帧需 heap_caps_malloc
+ *    MALLOC_CAP_DMA 内部缓冲。媒体(GMF)播放后内部 DMA SRAM 被占，控制线程
+ *    decrypt 申请失败 → 所有加密控制帧(含元数据 0x12/0x0418)解密失败被丢弃。
+ *    纯软件内核零 malloc、零 DMA，彻底摆脱该依赖。
  * ══════════════════════════════════════════════════════════════════════ */
 
-/* AES-CBC 加密（无内置填充，调用方负责对齐） */
+/* ── 纯软件 AES-128（FIPS-197，公开域内核，栈分配零堆） ── */
+static const uint8_t sw_aes_sbox[256] = {
+    0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+    0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+    0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+    0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+    0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+    0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+    0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+    0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+    0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+    0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+    0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+    0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+    0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+    0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+    0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+    0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16 };
+
+static const uint8_t sw_aes_rsbox[256] = {
+    0x52,0x09,0x6a,0xd5,0x30,0x36,0xa5,0x38,0xbf,0x40,0xa3,0x9e,0x81,0xf3,0xd7,0xfb,
+    0x7c,0xe3,0x39,0x82,0x9b,0x2f,0xff,0x87,0x34,0x8e,0x43,0x44,0xc4,0xde,0xe9,0xcb,
+    0x54,0x7b,0x94,0x32,0xa6,0xc2,0x23,0x3d,0xee,0x4c,0x95,0x0b,0x42,0xfa,0xc3,0x4e,
+    0x08,0x2e,0xa1,0x66,0x28,0xd9,0x24,0xb2,0x76,0x5b,0xa2,0x49,0x6d,0x8b,0xd1,0x25,
+    0x72,0xf8,0xf6,0x64,0x86,0x68,0x98,0x16,0xd4,0xa4,0x5c,0xcc,0x5d,0x65,0xb6,0x92,
+    0x6c,0x70,0x48,0x50,0xfd,0xed,0xb9,0xda,0x5e,0x15,0x46,0x57,0xa7,0x8d,0x9d,0x84,
+    0x90,0xd8,0xab,0x00,0x8c,0xbc,0xd3,0x0a,0xf7,0xe4,0x58,0x05,0xb8,0xb3,0x45,0x06,
+    0xd0,0x2c,0x1e,0x8f,0xca,0x3f,0x0f,0x02,0xc1,0xaf,0xbd,0x03,0x01,0x13,0x8a,0x6b,
+    0x3a,0x91,0x11,0x41,0x4f,0x67,0xdc,0xea,0x97,0xf2,0xcf,0xce,0xf0,0xb4,0xe6,0x73,
+    0x96,0xac,0x74,0x22,0xe7,0xad,0x35,0x85,0xe2,0xf9,0x37,0xe8,0x1c,0x75,0xdf,0x6e,
+    0x47,0xf1,0x1a,0x71,0x1d,0x29,0xc5,0x89,0x6f,0xb7,0x62,0x0e,0xaa,0x18,0xbe,0x1b,
+    0xfc,0x56,0x3e,0x4b,0xc6,0xd2,0x79,0x20,0x9a,0xdb,0xc0,0xfe,0x78,0xcd,0x5a,0xf4,
+    0x1f,0xdd,0xa8,0x33,0x88,0x07,0xc7,0x31,0xb1,0x12,0x10,0x59,0x27,0x80,0xec,0x5f,
+    0x60,0x51,0x7f,0xa9,0x19,0xb5,0x4a,0x0d,0x2d,0xe5,0x7a,0x9f,0x93,0xc9,0x9c,0xef,
+    0xa0,0xe0,0x3b,0x4d,0xae,0x2a,0xf5,0xb0,0xc8,0xeb,0xbb,0x3c,0x83,0x53,0x99,0x61,
+    0x17,0x2b,0x04,0x7e,0xba,0x77,0xd6,0x26,0xe1,0x69,0x14,0x63,0x55,0x21,0x0c,0x7d };
+
+static const uint8_t sw_aes_rcon[11] = { 0x00,0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,0x1b,0x36 };
+
+/* 轮密钥扩展：nr=10 (AES-128)，rk 需 11*16=176 字节 */
+static void sw_aes_key_expand(const uint8_t *key, uint32_t rk[44])
+{
+    uint32_t i;
+    for (i = 0; i < 4; i++) {
+        rk[i] = ((uint32_t)key[4*i] << 24) | ((uint32_t)key[4*i+1] << 16) |
+                ((uint32_t)key[4*i+2] << 8) |  (uint32_t)key[4*i+3];
+    }
+    for (i = 4; i < 44; i++) {
+        uint32_t t = rk[i - 1];
+        if (i % 4 == 0) {
+            t = (t << 8) | (t >> 24);  /* RotWord */
+            t = (uint32_t)sw_aes_sbox[(t >> 24) & 0xFF] << 24 |
+                (uint32_t)sw_aes_sbox[(t >> 16) & 0xFF] << 16 |
+                (uint32_t)sw_aes_sbox[(t >> 8)  & 0xFF] << 8  |
+                (uint32_t)sw_aes_sbox[(t      ) & 0xFF];
+            t ^= (uint32_t)sw_aes_rcon[i / 4] << 24;
+        }
+        rk[i] = rk[i - 4] ^ t;
+    }
+}
+
+/* GF(2^8) 有限域乘法：a * b（多项式模 0x11B） */
+static uint8_t sw_gfmul(uint8_t a, uint8_t b)
+{
+    uint8_t p = 0;
+    while (b) {
+        if (b & 1) p ^= a;
+        uint8_t hi = a & 0x80;
+        a <<= 1;
+        if (hi) a ^= 0x1B;
+        b >>= 1;
+    }
+    return p;
+}
+
+/* MixColumns / InvMixColumns：用循环矩阵第一行系数 c 乘一列（列主序 x0..x3） */
+static uint32_t sw_aes_mixcol(uint32_t x, const uint8_t c[4])
+{
+    uint8_t x0 = (x >> 24) & 0xFF, x1 = (x >> 16) & 0xFF;
+    uint8_t x2 = (x >> 8) & 0xFF,  x3 = x & 0xFF;
+    uint8_t r0 = sw_gfmul(x0,c[0]) ^ sw_gfmul(x1,c[1]) ^ sw_gfmul(x2,c[2]) ^ sw_gfmul(x3,c[3]);
+    uint8_t r1 = sw_gfmul(x0,c[3]) ^ sw_gfmul(x1,c[0]) ^ sw_gfmul(x2,c[1]) ^ sw_gfmul(x3,c[2]);
+    uint8_t r2 = sw_gfmul(x0,c[2]) ^ sw_gfmul(x1,c[3]) ^ sw_gfmul(x2,c[0]) ^ sw_gfmul(x3,c[1]);
+    uint8_t r3 = sw_gfmul(x0,c[1]) ^ sw_gfmul(x1,c[2]) ^ sw_gfmul(x2,c[3]) ^ sw_gfmul(x3,c[0]);
+    return ((uint32_t)r0 << 24) | ((uint32_t)r1 << 16) | ((uint32_t)r2 << 8) | r3;
+}
+
+static void sw_aes_encrypt_block(const uint8_t in[16], uint8_t out[16], const uint32_t rk[44])
+{
+    uint32_t s[4];
+    int i;
+    for (i = 0; i < 4; i++) {
+        s[i] = ((uint32_t)in[4*i] << 24) | ((uint32_t)in[4*i+1] << 16) |
+               ((uint32_t)in[4*i+2] << 8) |  (uint32_t)in[4*i+3];
+        s[i] ^= rk[i];
+    }
+    for (int round = 1; round <= 10; round++) {
+        /* SubBytes + ShiftRows */
+        uint32_t t[4];
+        for (i = 0; i < 4; i++) {
+            uint8_t s0 = sw_aes_sbox[(s[i] >> 24) & 0xFF];
+            uint8_t s1 = sw_aes_sbox[(s[i] >> 16) & 0xFF];
+            uint8_t s2 = sw_aes_sbox[(s[i] >> 8)  & 0xFF];
+            uint8_t s3 = sw_aes_sbox[s[i] & 0xFF];
+            t[i] = ((uint32_t)s0 << 24) | ((uint32_t)s1 << 16) | ((uint32_t)s2 << 8) | s3;
+        }
+        uint8_t m[4][4];
+        for (i = 0; i < 4; i++) {
+            m[0][i] = (t[i] >> 24) & 0xFF;
+            m[1][i] = (t[i] >> 16) & 0xFF;
+            m[2][i] = (t[i] >> 8)  & 0xFF;
+            m[3][i] = t[i] & 0xFF;
+        }
+        uint8_t sh[4][4];
+        for (int r = 0; r < 4; r++)
+            for (int c = 0; c < 4; c++)
+                sh[r][c] = m[r][(c + r) & 3];
+        for (i = 0; i < 4; i++) {
+            uint32_t v = 0;
+            for (int r = 0; r < 4; r++) v = (v << 8) | sh[r][i];
+            t[i] = v;
+        }
+        if (round < 10) {  /* MixColumns */
+            static const uint8_t mc[4] = { 2, 3, 1, 1 };
+            for (i = 0; i < 4; i++) t[i] = sw_aes_mixcol(t[i], mc);
+        }
+        for (i = 0; i < 4; i++) s[i] = t[i] ^ rk[round * 4 + i];
+    }
+    for (i = 0; i < 4; i++) {
+        out[4*i]   = (s[i] >> 24) & 0xFF;
+        out[4*i+1] = (s[i] >> 16) & 0xFF;
+        out[4*i+2] = (s[i] >> 8)  & 0xFF;
+        out[4*i+3] =  s[i]        & 0xFF;
+    }
+}
+
+/* 解密块：InvShiftRows → InvSubBytes → (InvMixColumns) → AddRoundKey
+ * 用反向轮：先对 s 做逆 S-box 前的逆行移，再逐轮 InvMixColumns */
+static void sw_aes_decrypt_block(const uint8_t in[16], uint8_t out[16], const uint32_t rk[44])
+{
+    uint32_t s[4];
+    int i;
+    for (i = 0; i < 4; i++) {
+        s[i] = ((uint32_t)in[4*i] << 24) | ((uint32_t)in[4*i+1] << 16) |
+               ((uint32_t)in[4*i+2] << 8) |  (uint32_t)in[4*i+3];
+        s[i] ^= rk[40 + i];
+    }
+    for (int round = 9; round >= 0; round--) {
+        uint32_t t[4];
+        /* InvShiftRows: 展开 state（m[r][c] = state[r][c]） */
+        uint8_t m[4][4];
+        for (i = 0; i < 4; i++) {
+            m[0][i] = (s[i] >> 24) & 0xFF;
+            m[1][i] = (s[i] >> 16) & 0xFF;
+            m[2][i] = (s[i] >> 8)  & 0xFF;
+            m[3][i] = s[i] & 0xFF;
+        }
+        /* 逆 ShiftRows = 加密行左移 r 的逆 = 行右移 r：新 state[r][c]=旧 state[r][(c - r) & 3] */
+        uint8_t ish[4][4];
+        for (int r = 0; r < 4; r++)
+            for (int c = 0; c < 4; c++)
+                ish[r][c] = m[r][(c + 4 - r) & 3];
+        for (i = 0; i < 4; i++) {   /* InvSubBytes 按列重组到 t */
+            uint32_t v = 0;
+            for (int r = 0; r < 4; r++) v = (v << 8) | sw_aes_rsbox[ish[r][i]];
+            t[i] = v;
+        }
+        for (i = 0; i < 4; i++) t[i] ^= rk[round * 4 + i];  /* AddRoundKey(正序调度)在 InvMixColumns 之前 */
+        if (round > 0) {  /* InvMixColumns 应用于解密轮 9..1，末轮 round=0 不做 */
+            static const uint8_t imc[4] = { 14, 11, 13, 9 };
+            for (i = 0; i < 4; i++) t[i] = sw_aes_mixcol(t[i], imc);
+        }
+        for (i = 0; i < 4; i++) s[i] = t[i];
+    }
+    for (i = 0; i < 4; i++) {
+        out[4*i]   = (s[i] >> 24) & 0xFF;
+        out[4*i+1] = (s[i] >> 16) & 0xFF;
+        out[4*i+2] = (s[i] >> 8)  & 0xFF;
+        out[4*i+3] =  s[i]        & 0xFF;
+    }
+}
+
+/* AES-CBC 加密（无内置填充，调用方负责对齐；纯软件内核，零 DMA） */
 static bool aes_cbc_encrypt(const uint8_t *key, uint8_t *iv,
                             const uint8_t *input, uint8_t *output, size_t len)
 {
     if (len % AES_BLOCK_LEN != 0) return false;
-    mbedtls_aes_context ctx;
-    mbedtls_aes_init(&ctx);
-    if (mbedtls_aes_setkey_enc(&ctx, key, 128) != 0) {
-        mbedtls_aes_free(&ctx);
-        return false;
-    }
+    uint32_t rk[44];
+    sw_aes_key_expand(key, rk);
     uint8_t iv_copy[AES_BLOCK_LEN];
     memcpy(iv_copy, iv, AES_BLOCK_LEN);
     for (size_t i = 0; i < len; i += AES_BLOCK_LEN) {
         uint8_t block[AES_BLOCK_LEN];
         for (int j = 0; j < AES_BLOCK_LEN; j++)
             block[j] = input[i + j] ^ iv_copy[j];
-        mbedtls_aes_crypt_ecb(&ctx, MBEDTLS_AES_ENCRYPT, block, output + i);
+        sw_aes_encrypt_block(block, output + i, rk);
         memcpy(iv_copy, output + i, AES_BLOCK_LEN);
     }
     memcpy(iv, iv_copy, AES_BLOCK_LEN);
-    mbedtls_aes_free(&ctx);
     return true;
 }
 
-/* AES-CBC 解密 */
+/* AES-CBC 解密（纯软件内核，零 DMA） */
 static bool aes_cbc_decrypt(const uint8_t *key, uint8_t *iv,
                             const uint8_t *input, uint8_t *output, size_t len)
 {
     if (len % AES_BLOCK_LEN != 0) return false;
-    mbedtls_aes_context ctx;
-    mbedtls_aes_init(&ctx);
-    if (mbedtls_aes_setkey_dec(&ctx, key, 128) != 0) {
-        mbedtls_aes_free(&ctx);
-        return false;
-    }
+    uint32_t rk[44];
+    sw_aes_key_expand(key, rk);
     uint8_t iv_copy[AES_BLOCK_LEN];
     memcpy(iv_copy, iv, AES_BLOCK_LEN);
     for (size_t i = 0; i < len; i += AES_BLOCK_LEN) {
         uint8_t block[AES_BLOCK_LEN];
-        mbedtls_aes_crypt_ecb(&ctx, MBEDTLS_AES_DECRYPT, input + i, block);
+        sw_aes_decrypt_block(input + i, block, rk);
         for (int j = 0; j < AES_BLOCK_LEN; j++)
             output[i + j] = block[j] ^ iv_copy[j];
         memcpy(iv_copy, input + i, AES_BLOCK_LEN);
     }
     memcpy(iv, iv_copy, AES_BLOCK_LEN);
-    mbedtls_aes_free(&ctx);
     return true;
 }
 
@@ -826,17 +1042,17 @@ static int safety_encrypt(const uint8_t *plaintext, size_t pt_len,
     size_t padded_len = pt_len + pad_len;
     if (SAFETY_DATA_HDR_LEN + padded_len > out_max) return 0;
 
-    uint8_t *padded = calloc(1, padded_len);
+    uint8_t *padded = MIPLAY_CALLOC(1, padded_len);
     if (!padded) return 0;
     memcpy(padded, plaintext, pt_len);
     /* 剩余已为零 */
 
     uint8_t *ciphertext = out + SAFETY_DATA_HDR_LEN;
     if (!aes_cbc_encrypt(key, iv, padded, ciphertext, padded_len)) {
-        free(padded);
+        MIPLAY_FREE(padded);
         return 0;
     }
-    free(padded);
+    MIPLAY_FREE(padded);
 
     /* 构造9字节头 */
     uint32_t crc = safety_integrity(ciphertext, padded_len);
@@ -899,11 +1115,11 @@ static int safety_decrypt(const uint8_t *data, size_t data_len,
         ESP_LOGI(TAG, "SD ct_len=%d pad=%d pt_len=%d", (int)ct_len, pad_len, (int)pt_len);
     }
 
-    uint8_t *decrypted = malloc(ct_len);
+    uint8_t *decrypted = MIPLAY_MALLOC(ct_len);
     if (!decrypted) return -1;
     if (!aes_cbc_decrypt(key, iv, data + SAFETY_DATA_HDR_LEN, decrypted, ct_len)) {
         ESP_LOGW(TAG, "safety_decrypt: aes_cbc_decrypt failed");
-        free(decrypted);
+        MIPLAY_FREE(decrypted);
         return -1;
     }
 
@@ -918,11 +1134,11 @@ static int safety_decrypt(const uint8_t *data, size_t data_len,
     for (size_t i = pt_len; i < ct_len; i++) {
         if (decrypted[i] != 0) {
             ESP_LOGW(TAG, "safety_decrypt: bad pad at [%d]=0x%02X", (int)i, decrypted[i]);
-            free(decrypted); return -1;
+            MIPLAY_FREE(decrypted); return -1;
         }
     }
     memcpy(out, decrypted, pt_len);
-    free(decrypted);
+    MIPLAY_FREE(decrypted);
     return (int)pt_len;
 }
 
@@ -956,35 +1172,79 @@ static int safety_envelope_encode(bool is_ack, uint8_t value_type,
  * PC 原型语义(send_encrypted): outer=0x00 帧, payload 直接包 SafetyData，
  * 不套 SafetyEnvelope（envelope 仅在 0x14 Safety 阶段使用）。
  * 全部堆分配，避免大栈缓冲区。 */
-/* 静态加密缓冲区（避免频繁 malloc/free 导致内部 SRAM 碎片化）
- * 注意：单客户端场景使用，多客户端并发需改为栈分配 */
-static uint8_t s_encrypt_buf[2064 + SAFETY_DATA_HDR_LEN + AES_BLOCK_LEN];
-static uint8_t s_envelope_buf[9 + 2048]; /* envelope: 1+3+4+1+payload */
+/* 静态加密缓冲区：移入 PSRAM，释放内部 SRAM（参考项目做法） */
+static EXT_RAM_BSS_ATTR uint8_t s_encrypt_buf[2064 + SAFETY_DATA_HDR_LEN + AES_BLOCK_LEN];
+static EXT_RAM_BSS_ATTR uint8_t s_envelope_buf[9 + 2048];
 
 static int send_encrypted_cmd(int sock, uint16_t cmd, uint16_t seq,
                                const uint8_t *payload, uint32_t payload_len)
 {
-    if (payload_len > 2048) return -1;
+    if (payload_len > MIPLAY_MAX_FRAME_PAYLOAD) return -1;
+    if (s_send_mux) xSemaphoreTakeRecursive(s_send_mux, portMAX_DELAY);
     uint32_t sd_cap = sizeof(s_encrypt_buf);
     int sd_len = safety_encrypt(payload, payload_len, s_aes_key, s_encrypt_iv,
                                 s_encrypt_buf, sd_cap);
-    if (sd_len <= 0) return -1;
-    return miplay_send_cmd(sock, cmd, seq, s_encrypt_buf, (uint32_t)sd_len);
+    int ret = -1;
+    if (sd_len > 0) ret = miplay_send_cmd(sock, cmd, seq, s_encrypt_buf, (uint32_t)sd_len);
+    if (s_send_mux) xSemaphoreGiveRecursive(s_send_mux);
+    return ret;
+}
+
+/* 原子分配序号 + 加密发送（对齐参考 send_encrypted_cmd_auto_seq）。
+ * 防止 UI 线程旋钮反控与控制任务 notify 并发时序号和 IV 交错。 */
+static int send_encrypted_cmd_auto_seq(int sock, uint16_t cmd,
+                                       const uint8_t *payload, uint32_t payload_len,
+                                       uint16_t *seq_out)
+{
+    if (seq_out) *seq_out = 0;
+    if (s_send_mux) xSemaphoreTakeRecursive(s_send_mux, portMAX_DELAY);
+    int seq = s_notify_seq;
+    if (seq < 8 || seq > 0xFFFF) seq = 8;
+    s_notify_seq = (seq == 0xFFFF) ? 8 : seq + 1;
+    uint32_t sd_cap = sizeof(s_encrypt_buf);
+    int sd_len = safety_encrypt(payload, payload_len, s_aes_key, s_encrypt_iv,
+                                s_encrypt_buf, sd_cap);
+    int ret = -1;
+    if (sd_len > 0) ret = miplay_send_cmd(sock, cmd, (uint16_t)seq, s_encrypt_buf, (uint32_t)sd_len);
+    if (s_send_mux) xSemaphoreGiveRecursive(s_send_mux);
+    if (seq_out) *seq_out = (uint16_t)seq;
+    return ret;
+}
+
+/* ── 空 mediaInfoEx NOTIFY（引导封面）──
+ * 对齐参考 esp_miplay-main miplay_notify_empty_media_info_ex: HyperOS 在消费
+ * 一条加密的空 mediaInfoEx NOTIFY 时安装 reverse-control / skip-metadata，
+ * 此后手机推送的 SetMediaInfo 才会携带 mCoverUrl/mArt。字节与参考
+ * miplay_build_media_info_ex 一致：0x0B+"mediaInfoEx"+0x16+[len]+空 mTitle。 */
+static const uint8_t s_empty_media_info_ex[29] = {
+    0x0B, 'm', 'e', 'd', 'i', 'a', 'I', 'n', 'f', 'o', 'E', 'x',
+    0x16, 0x00, 0x00, 0x00, 0x0C, 0x06,
+    'm', 'T', 'i', 't', 'l', 'e',
+    0x14, 0x00, 0x00, 0x00, 0x00,
+};
+static int miplay_notify_empty_media_info_ex(int sock, const char *reason)
+{
+    uint16_t mi_seq = 0;
+    int ret = send_encrypted_cmd_auto_seq(sock, CMD_NOTIFY, s_empty_media_info_ex,
+                                          sizeof(s_empty_media_info_ex), &mi_seq);
+    ESP_LOGI(TAG, "-> NOTIFY empty mediaInfoEx (%s) sock=%d seq=%u ret=%d",
+             reason ? reason : "?", sock, mi_seq, ret);
+    return ret;
 }
 
 /* Safety 阶段(0x14 帧)专用发送：envelope 明文（不加密），如 SafetyInfoAck */
 static int send_plain_envelope(int sock, uint16_t cmd16, uint16_t seq,
                                const uint8_t *payload, uint32_t payload_len)
 {
-    if (payload_len > 2048) return -1;
-    uint8_t *envelope = malloc(1 + 3 + 4 + 1 + payload_len);
+    if (payload_len > MIPLAY_MAX_FRAME_PAYLOAD) return -1;
+    uint8_t *envelope = MIPLAY_MALLOC(1 + 3 + 4 + 1 + payload_len);
     if (!envelope) return -1;
     int elen = safety_envelope_encode(true, SAFETY_VALUE_TYPE,
                                       payload, payload_len,
                                       envelope, 1 + 3 + 4 + 1 + payload_len);
-    if (elen <= 0) { free(envelope); return -1; }
+    if (elen <= 0) { MIPLAY_FREE(envelope); return -1; }
     int r = miplay_send_cmd(sock, cmd16, seq, envelope, (uint32_t)elen);
-    free(envelope);
+    MIPLAY_FREE(envelope);
     return r;
 }
 
@@ -994,7 +1254,7 @@ static int send_encrypted_envelope(int sock, uint16_t cmd16, uint16_t seq,
                                    bool is_ack,
                                    const uint8_t *payload, uint32_t payload_len)
 {
-    if (payload_len > 2048) return -1;
+    if (payload_len > MIPLAY_MAX_FRAME_PAYLOAD) return -1;
     int elen = safety_envelope_encode(is_ack, SAFETY_VALUE_TYPE,
                                       payload, payload_len,
                                       s_envelope_buf, sizeof(s_envelope_buf));
@@ -1173,8 +1433,10 @@ static int build_device_info_payload(uint8_t *out, size_t out_max)
         {"canRevCtrl", "1"},
         {"channel", ""},
         {"deviceId", s_device_id},          /* 8 hex 字符 = MAC 后4字节 */
-        {"deviceType", "3"},                /* 3 = TV/bridge 接收端 */
-        {"model", "Windows PC"},
+        {"deviceType", "2"},                /* 对齐参考 esp_miplay-main: MIPLAY_DEV="2"(电视)，
+                                               dev=2 required for HyperOS 下放 base64 WebP 封面。
+                                               旧值"3"(Windows PC)让手机只推空 cover。 */
+        {"model", "Android TV"},
         {"needAblum", "1"},
         {"needLrc", "1"},
         {"needPos", "1"},
@@ -1184,14 +1446,14 @@ static int build_device_info_payload(uint8_t *out, size_t out_max)
     int num_fields = sizeof(fields) / sizeof(fields[0]);
 
     size_t body_cap = 512;
-    uint8_t *body = malloc(body_cap);
+    uint8_t *body = MIPLAY_MALLOC(body_cap);
     if (!body) return -1;
     int body_off = 0;
     for (int i = 0; i < num_fields; i++) {
         size_t klen = strlen(fields[i].key);
         size_t vlen = strlen(fields[i].val);
         if (body_off + 1 + (int)klen + 1 + 2 + (int)vlen > (int)body_cap) {
-            free(body);
+            MIPLAY_FREE(body);
             return -1;
         }
         body[body_off++] = (uint8_t)klen;
@@ -1205,14 +1467,14 @@ static int build_device_info_payload(uint8_t *out, size_t out_max)
     /* 3字节魔术前缀（与 Rust MiPCAudio 一致） */
     int total = 3 + body_off;
     if (total > (int)out_max) {
-        free(body);
+        MIPLAY_FREE(body);
         return -1;
     }
     out[0] = 0x00;
     out[1] = 0x01;
     out[2] = 0x55;
     memcpy(out + 3, body, body_off);
-    free(body);
+    MIPLAY_FREE(body);
     return total;
 }
 
@@ -1248,16 +1510,32 @@ static uint16_t s_multi_port = 0;
 static void image_drain_task(void *arg)
 {
     int sock = (int)(intptr_t)arg;
-    /* 设置 5 秒超时，防止 socket 关闭后无限阻塞 */
-    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+    /* 设置 1 秒超时（对齐参考），防止 socket 关闭后长时间阻塞 */
+    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     uint8_t buf[1024];  /* 降小缓冲区，只需丢弃数据 */
+    uint32_t idle = 0, drained = 0;
+    /* 对齐参考: 空闲（EAGAIN）不等于连接断开。手机在 image 通道上可能
+     * 长时间不发数据，但通道必须保持打开，否则手机认定会话失败并断开 RTSP。
+     * 只有对端 FIN(n=0) 或真实错误才退出。 */
     while (s_running) {
         int n = recv(sock, buf, sizeof(buf), 0);
-        if (n <= 0) break;
+        if (n > 0) { drained += (uint32_t)n; idle = 0; continue; }
+        if (n == 0) break;                                  /* 对端 FIN */
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {      /* 空闲，继续等 */
+            idle++;
+            if (idle % 10 == 1) {
+                ESP_LOGD(TAG, "[RTSP] image_drain idle %lus (drained=%lu)",
+                         (unsigned long)idle, (unsigned long)drained);
+            }
+            continue;
+        }
+        ESP_LOGW(TAG, "[RTSP] image_drain recv err errno=%d", errno);
+        break;
     }
     close(sock);
-    ESP_LOGI(TAG, "[RTSP] image_drain done");
+    ESP_LOGI(TAG, "[RTSP] image_drain done (drained=%lu, idle=%lus)",
+             (unsigned long)drained, (unsigned long)idle);
     vTaskDelete(NULL);
 }
 
@@ -1270,16 +1548,74 @@ static size_t s_rtsp_buf_used = 0;
 
 static void rtsp_read_msg_reset(void)
 {
-    free(s_rtsp_buf);
+    MIPLAY_FREE(s_rtsp_buf);
     s_rtsp_buf = NULL;
     s_rtsp_buf_used = 0;
+}
+
+/* 对齐参考: 在 header 块内查找字段值，遇到空行(消息头结束)立即停止。
+ * 不能扫到 body 或流水线化的下一个消息，否则 OPTIONS 会继承
+ * GET_PARAMETER 的 Content-Length 并吞掉下一个请求。 */
+static const char *rtsp_find_header_value(const char *headers, const char *name)
+{
+    size_t name_len = strlen(name);
+    const char *line = headers;
+    while (line && *line) {
+        const char *line_end = strstr(line, "\r\n");
+        if (!line_end) break;
+        if (line_end == line) break;
+        if ((size_t)(line_end - line) > name_len &&
+            strncasecmp(line, name, name_len) == 0) {
+            const char *colon = line + name_len;
+            while (colon < line_end && (*colon == ' ' || *colon == '\t')) colon++;
+            if (colon < line_end && *colon == ':') {
+                const char *value = colon + 1;
+                while (value < line_end && (*value == ' ' || *value == '\t')) value++;
+                return value;
+            }
+        }
+        line = line_end + 2;
+    }
+    return NULL;
+}
+
+/* 对齐参考: 判断缓冲区是否是合法的 RTSP 起始行（请求方法或响应行）。
+ * 用于跳过 interleaved RTP 数据和残留的非 RTSP body 片段。 */
+static int rtsp_is_message_start(const char *p, size_t n)
+{
+    static const char *const methods[] = {
+        "OPTIONS ", "GET_PARAMETER ", "SET_PARAMETER ",
+        "SETUP ", "PLAY ", "TEARDOWN ", "PAUSE ",
+        "TIME_OFFSET ", "VIDEO_LATENCY ",
+    };
+    if (!p || n == 0) return 0;
+    if (n >= 7 && memcmp(p, "RTSP/1.", 7) == 0) return 1;
+    for (size_t i = 0; i < sizeof(methods) / sizeof(methods[0]); i++) {
+        size_t m = strlen(methods[i]);
+        if (n >= m && memcmp(p, methods[i], m) == 0) return 1;
+    }
+    return 0;
+}
+
+/* 在缓冲区中定位下一个合法 RTSP 消息起点（\r\n 之后）。 */
+static int rtsp_find_message_start(const char *buf, size_t n)
+{
+    if (!buf || n == 0) return -1;
+    if (rtsp_is_message_start(buf, n)) return 0;
+    for (size_t i = 0; i + 2 < n; i++) {
+        if (buf[i] == '\r' && buf[i + 1] == '\n' &&
+            rtsp_is_message_start(buf + i + 2, n - i - 2)) {
+            return (int)(i + 2);
+        }
+    }
+    return -1;
 }
 
 static int rtsp_read_msg(int sock, char *headers, size_t hdr_max,
                           char *body, size_t body_max, int *body_len)
 {
     if (!s_rtsp_buf) {
-        s_rtsp_buf = malloc(RTSP_BUF_SIZE);
+        s_rtsp_buf = MIPLAY_MALLOC(RTSP_BUF_SIZE);
         if (!s_rtsp_buf) return -1;
         s_rtsp_buf_used = 0;
     }
@@ -1310,6 +1646,27 @@ static int rtsp_read_msg(int sock, char *headers, size_t hdr_max,
             continue;
         }
 
+        /* 对齐参考: 缓冲区开头不是合法 RTSP 起始行时定位下一个消息起点。
+         * 手机 GET_PARAMETER 的 body 残留(如 "session_enable\r\n")不是合法
+         * 起始行，没有 \r\n\r\n 时旧解析器会一直等手机关闭。 */
+        if (s_rtsp_buf_used > 0 &&
+            !rtsp_is_message_start(s_rtsp_buf, s_rtsp_buf_used)) {
+            int next = rtsp_find_message_start(s_rtsp_buf, s_rtsp_buf_used);
+            if (next > 0) {
+                memmove(s_rtsp_buf, s_rtsp_buf + next, s_rtsp_buf_used - (size_t)next);
+                s_rtsp_buf_used -= (size_t)next;
+                s_rtsp_buf[s_rtsp_buf_used] = 0;
+                continue;
+            }
+            if (strstr(s_rtsp_buf, "\r\n")) {
+                ESP_LOGW(TAG, "[RTSP] drop leftover non-RTSP %u bytes: %.40s",
+                         (unsigned)s_rtsp_buf_used, s_rtsp_buf);
+                s_rtsp_buf_used = 0;
+                s_rtsp_buf[0] = 0;
+                continue;
+            }
+        }
+
         /* 查找 RTSP 消息结尾 \r\n\r\n */
         char *hdr_end = strstr(s_rtsp_buf, "\r\n\r\n");
         if (!hdr_end) {
@@ -1317,8 +1674,17 @@ static int rtsp_read_msg(int sock, char *headers, size_t hdr_max,
             int n = recv(sock, s_rtsp_buf + s_rtsp_buf_used,
                          RTSP_BUF_SIZE - 1 - s_rtsp_buf_used, 0);
             if (n <= 0) {
-                ESP_LOGW(TAG, "[RTSP-recv] n=%d errno=%d used=%u",
-                         n, errno, (unsigned)s_rtsp_buf_used);
+                /* 区分三种退出原因：对端 FIN(n=0)、超时(EAGAIN)、真实错误。
+                 * 不要笼统报"手机断开"——手机不会无故关闭，多数是我们解析/时序问题。 */
+                if (n == 0) {
+                    ESP_LOGW(TAG, "[RTSP-recv] peer FIN (n=0) used=%u",
+                             (unsigned)s_rtsp_buf_used);
+                } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    ESP_LOGD(TAG, "[RTSP-recv] timeout used=%u", (unsigned)s_rtsp_buf_used);
+                } else {
+                    ESP_LOGW(TAG, "[RTSP-recv] ERR n=%d errno=%d used=%u",
+                             n, errno, (unsigned)s_rtsp_buf_used);
+                }
                 if (s_rtsp_buf_used > 0) {
                     /* 打印缓冲区内容帮助诊断 */
                     char hex[128];
@@ -1326,6 +1692,11 @@ static int rtsp_read_msg(int sock, char *headers, size_t hdr_max,
                     for (size_t i = 0; i < s_rtsp_buf_used && i < 40; i++)
                         hlen += snprintf(hex + hlen, sizeof(hex) - hlen, "%02X ", (uint8_t)s_rtsp_buf[i]);
                     ESP_LOGW(TAG, "[RTSP-recv] buf[%u]: %s", (unsigned)s_rtsp_buf_used, hex);
+                    if (s_rtsp_buf_used >= 4 && (uint8_t)s_rtsp_buf[0] == 0x24) {
+                        uint16_t rl = ((uint16_t)(uint8_t)s_rtsp_buf[2] << 8) | (uint8_t)s_rtsp_buf[3];
+                        ESP_LOGW(TAG, "[RTSP-recv] interleaved partial: need=%u have=%u",
+                                 (unsigned)(4 + rl), (unsigned)s_rtsp_buf_used);
+                    }
                 }
                 return n == 0 ? 0 : -1;
             }
@@ -1334,15 +1705,36 @@ static int rtsp_read_msg(int sock, char *headers, size_t hdr_max,
         }
 
         size_t hdr_len = (size_t)(hdr_end - s_rtsp_buf) + 4;
-        if (hdr_len >= hdr_max) hdr_len = hdr_max - 1;
+        if (hdr_len >= hdr_max) {
+            /* 对齐参考: 截断会破坏 Content-Length 查找前提，直接报错 */
+            ESP_LOGW(TAG, "[RTSP] header too large (%u)", (unsigned)hdr_len);
+            errno = EMSGSIZE;
+            return -1;
+        }
         memcpy(headers, s_rtsp_buf, hdr_len);
         headers[hdr_len] = 0;
 
-        /* 检查 Content-Length */
+        /* 检查 Content-Length（只看当前消息头，不扫 body / 下一帧）。
+         * 对齐参考: 无 Content-Length 时用下一个消息起点推断 body 长度，
+         * 否则会把下一个 RTSP 请求误当作当前消息的 body 吃掉。 */
         int content_len = 0;
-        char *cl = strstr(s_rtsp_buf, "Content-Length:");
-        if (!cl) cl = strstr(s_rtsp_buf, "content-length:");
-        if (cl) content_len = atoi(cl + 15);
+        const char *cl = rtsp_find_header_value(headers, "Content-Length");
+        if (cl) {
+            content_len = atoi(cl);
+        } else if (s_rtsp_buf_used > hdr_len) {
+            size_t rest = s_rtsp_buf_used - hdr_len;
+            if (!rtsp_is_message_start(s_rtsp_buf + hdr_len, rest)) {
+                int next = rtsp_find_message_start(s_rtsp_buf + hdr_len, rest);
+                content_len = (next > 0) ? next : (int)rest;
+                ESP_LOGD(TAG, "[RTSP] no Content-Length, take body=%d", content_len);
+            }
+        }
+        if (content_len < 0 || hdr_len + (size_t)content_len >= RTSP_BUF_SIZE) {
+            ESP_LOGW(TAG, "[RTSP] invalid Content-Length=%d (hdr=%u)",
+                     content_len, (unsigned)hdr_len);
+            errno = EMSGSIZE;
+            return -1;
+        }
 
         /* 等待完整 body — 先检查 buffer，数据够就不 recv */
         size_t body_have = s_rtsp_buf_used - hdr_len;
@@ -1364,12 +1756,13 @@ static int rtsp_read_msg(int sock, char *headers, size_t hdr_max,
         body[copy] = 0;
         *body_len = (int)copy;
 
-        /* 消费掉这条消息，保留后续数据。
-         * 当 body_have > content_len 时不消费 body — 手机的 OPTIONS200
-         * Content-Length 只覆盖自己的 body，紧跟的 GET_PARAMETER 消息
-         * 被当作 body 的一部分。保留完整数据让解析器正常处理。 */
-        size_t consumed_body = (body_have > (size_t)content_len) ? 0 : copy;
-        size_t total = hdr_len + consumed_body;
+        /* 对齐参考: 按 hdr_len + content_len 完整消费本条消息。
+         * content_len 已由 rtsp_find_message_start 精确推断（无 Content-Length 时
+         * 取到下一个消息起点为止），不会跨消息误吞下一个请求，
+         * 因此这里必须真实消费 body，不能留 0 — 否则 body 残留会让下一次
+         * 解析命中 "drop leftover" 分支，把紧随的 keepalive 请求一起丢掉。 */
+        size_t total = hdr_len + (size_t)content_len;
+        if (total > s_rtsp_buf_used) total = s_rtsp_buf_used;
         memmove(s_rtsp_buf, s_rtsp_buf + total, s_rtsp_buf_used - total);
         s_rtsp_buf_used -= total;
         s_rtsp_buf[s_rtsp_buf_used] = 0;
@@ -1485,13 +1878,33 @@ static void rtsp_get_session(const char *headers, char *out, size_t max)
 
 static void miplay_rtsp_run(const char *host, int port, int client_sock, uint32_t generation);
 
-/* RTSP 独立任务（使用 PSRAM 静态栈，避免内部 SRAM 碎片化） */
-#define RTSP_TASK_STACK_SIZE 8192
-#define MEDIA_TASK_STACK_SIZE 16384
-static StaticTask_t s_rtsp_tcb;
-static StackType_t *s_rtsp_stack = NULL; /* PSRAM 分配 */
-static StaticTask_t s_media_tcb;
-static StackType_t *s_media_stack = NULL; /* PSRAM 分配 */
+/* RTSP 独立任务（对齐参考 esp_miplay-main 栈大小） */
+#define RTSP_TASK_STACK_SIZE  (48 * 1024)   /* 参考: 48KB */
+#define MEDIA_TASK_STACK_SIZE (128 * 1024)  /* 参考: 128KB */
+
+/**
+ * @brief 创建 PSRAM 栈任务（对齐参考 miplay_create_task）。
+ *        优先 PSRAM 栈，失败则回退内部 SRAM（半栈）。
+ */
+static BaseType_t miplay_create_task(TaskFunction_t fn, const char *name,
+                                     uint32_t stack_bytes, void *arg,
+                                     UBaseType_t prio, TaskHandle_t *handle,
+                                     BaseType_t core)
+{
+    TaskHandle_t h = NULL;
+    BaseType_t ret = xTaskCreatePinnedToCoreWithCaps(
+        fn, name, stack_bytes, arg, prio, &h, core,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (ret == pdPASS) {
+        if (handle) *handle = h;
+        return pdPASS;
+    }
+    ESP_LOGW(TAG, "%s: PSRAM stack %u failed, fallback internal", name, (unsigned)stack_bytes);
+    h = NULL;
+    ret = xTaskCreatePinnedToCore(fn, name, stack_bytes / 2, arg, prio, &h, core);
+    if (ret == pdPASS && handle) *handle = h;
+    return ret;
+}
 
 static void miplay_rtsp_task_wrapper(void *arg)
 {
@@ -1627,12 +2040,27 @@ static void media_receive_task(void *arg)
         vTaskDelete(NULL); return;
     }
 
-    struct timeval tv = { .tv_sec = 10 };
+    /* 对齐参考: SO_RCVBUF 增大接收窗口 + SO_RCVTIMEO 100ms */
+    int media_rcvbuf = 32 * 1024;
+    setsockopt(media_sock, SOL_SOCKET, SO_RCVBUF, &media_rcvbuf, sizeof(media_rcvbuf));
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 100000 };  /* 对齐参考: 100ms */
     setsockopt(media_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     uint32_t pkt_count = 0, rtp_total = 0, ts_total = 0;
+    TickType_t media_start = xTaskGetTickCount();
+    TickType_t last_log = media_start;
+    uint32_t idle_ticks = 0;
 
     while (s_running && s_media_generation == generation) {
+        /* ── 定期状态日志：每秒一次，便于确认媒体流是否真的在收包 ── */
+        if (xTaskGetTickCount() - last_log >= pdMS_TO_TICKS(1000)) {
+            ESP_LOGI(TAG, "[MEDIA] alive %lus pkts=%lu rtp=%luB ts=%luB idle=%lu ringbuf=%s",
+                     (unsigned long)((xTaskGetTickCount() - media_start) / configTICK_RATE_HZ),
+                     (unsigned long)pkt_count, (unsigned long)rtp_total,
+                     (unsigned long)ts_total, (unsigned long)idle_ticks,
+                     s_ts_ringbuf ? "yes" : "NO");
+            last_log = xTaskGetTickCount();
+        }
         /* ── 读取4字节 interleaved RTP 帧头：$ + channel + len(u16 BE) ── */
         uint8_t hdr[4];
         int got = 0;
@@ -1640,9 +2068,9 @@ static void media_receive_task(void *arg)
             int n = recv(media_sock, hdr + got, 4 - got, 0);
             if (n <= 0) {
                 if (!s_running) break;
-                if (n == 0) { ESP_LOGI(TAG, "[MEDIA] Socket closed"); goto m_cleanup; }
-                if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-                ESP_LOGW(TAG, "[MEDIA] recv error: %d", errno);
+                if (n == 0) { ESP_LOGW(TAG, "[MEDIA] sock closed (n=0) pkts=%lu", (unsigned long)pkt_count); goto m_cleanup; }
+                if (errno == EAGAIN || errno == EWOULDBLOCK) { idle_ticks++; continue; }
+                ESP_LOGW(TAG, "[MEDIA] recv err errno=%d pkts=%lu", errno, (unsigned long)pkt_count);
                 goto m_cleanup;
             }
             got += n;
@@ -1665,11 +2093,17 @@ static void media_receive_task(void *arg)
         got = 0;
         while (got < rtp_len && s_running) {
             int n = recv(media_sock, rtp_buf + got, rtp_len - got, 0);
-            if (n <= 0) goto m_cleanup;
-            got += n;
+            if (n > 0) { got += n; continue; }
+            /* 对齐参考: 超时只是暂时无数据，半包仍留在内核缓冲，继续收。
+             * 旧代码把 EAGAIN 当致命错误退出，导致媒体流刚起就结束。 */
+            if (n == 0) { ESP_LOGW(TAG, "[MEDIA] body FIN pkts=%lu", (unsigned long)pkt_count); goto m_cleanup; }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) { idle_ticks++; continue; }
+            ESP_LOGW(TAG, "[MEDIA] body recv err errno=%d pkts=%lu", errno, (unsigned long)pkt_count);
+            goto m_cleanup;
         }
         rtp_total += rtp_len;
         pkt_count++;
+        s_media_pkt_total = pkt_count;
         if (pkt_count <= 3) {
             ESP_LOGI(TAG, "[MEDIA] RTP#%lu len=%u first=[%02X %02X %02X %02X]",
                      (unsigned long)pkt_count, rtp_len,
@@ -1718,10 +2152,21 @@ static void media_receive_task(void *arg)
         ESP_LOGI(TAG, "[MEDIA] Replaced by newer session (gen %lu -> %lu)",
                  (unsigned long)generation, (unsigned long)s_media_generation);
 m_cleanup:
-    if (s_media_cb) s_media_cb(false);
+    /* generation 不匹配 = 旧 session 被新 session 替代，不应停止新管线 */
+    if (s_media_generation != generation) {
+        ESP_LOGI(TAG, "[MEDIA] Stale session cleanup, skip stop callback");
+    } else {
+        if (s_media_cb) s_media_cb(false);
+    }
     free(rtp_buf);
     close(media_sock);
-    if (rtsp_sock_to_close >= 0) close(rtsp_sock_to_close);
+    /* media_sock 在 interleaved 回退路径下就是 rtsp_sock，必须避免双重关闭
+     * 同一个 fd —— 否则 RTSP 控制连接被误关，keepalive 读到 EBADF 立即断连。 */
+    if (rtsp_sock_to_close >= 0 && rtsp_sock_to_close != media_sock) {
+        ESP_LOGW(TAG, "[MEDIA] closing rtsp_sock=%d (media_sock=%d)",
+                 rtsp_sock_to_close, media_sock);
+        close(rtsp_sock_to_close);
+    }
     if (s_image_sock >= 0) { close(s_image_sock); s_image_sock = -1; }
     s_image_port = s_multi_port = 0;
     ESP_LOGI(TAG, "[MEDIA] Task ended, %lu pkts, %luKB rtp, %luKB ts",
@@ -1756,7 +2201,7 @@ static void miplay_rtsp_run(const char *host, int port, int client_sock, uint32_
         if (rtsp_sock < 0) { ESP_LOGE(TAG, "[RTSP] socket failed"); goto rtsp_cleanup; }
         int flag = 1;
         setsockopt(rtsp_sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-        struct timeval tv = { .tv_sec = 5 };
+        struct timeval tv = { .tv_sec = 2 };
         setsockopt(rtsp_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
         struct sockaddr_in dest = {
@@ -1792,10 +2237,10 @@ static void miplay_rtsp_run(const char *host, int port, int client_sock, uint32_
     rtsp_host_local[sizeof(rtsp_host_local) - 1] = 0;
     rtsp_port_local = port;
 
-    headers = malloc(RTSP_BUF_SIZE);
-    body = malloc(RTSP_BUF_SIZE);
+    headers = MIPLAY_MALLOC(RTSP_BUF_SIZE);
+    body = MIPLAY_MALLOC(RTSP_BUF_SIZE);
     if (!headers || !body) {
-        free(headers); free(body);
+        MIPLAY_FREE(headers); MIPLAY_FREE(body);
         close(rtsp_sock); rtsp_sock = -1;
         goto rtsp_cleanup;
     }
@@ -1975,7 +2420,10 @@ static void miplay_rtsp_run(const char *host, int port, int client_sock, uint32_
         }
         else if (strcmp(method, "GET_PARAMETER") == 0) {
             ESP_LOGI(TAG, "[RTSP] GET_PARAMETER body[%d]: %.80s", body_len, body);
-            if (strstr(body, "wfd_audio_codecs_v2")) {
+            if (strstr(body, "wfd_audio_codecs") ||
+                strstr(body, "wfd_client_rtp_ports") ||
+                strstr(body, "session_enable") ||
+                strstr(body, "wfd_support_secure_win")) {
                 /* Rust/Python/备份版：先建数据 socket，再发响应
                  * 手机期望数据连接在收到 GET_PARAMETER 响应前就建立 */
                 if (s_image_sock < 0) {
@@ -2000,8 +2448,10 @@ static void miplay_rtsp_run(const char *host, int port, int client_sock, uint32_
                             s_multi_port = ntohs(local_addr.sin_port);
                             ESP_LOGI(TAG, "[RTSP] Data sockets: image=%u multi=%u",
                                      (unsigned)s_image_port, (unsigned)s_multi_port);
-                            xTaskCreate(image_drain_task, "img_drain", 3072,
-                                        (void*)(intptr_t)s_image_sock, 3, NULL);
+                            /* img_drain: 对齐参考 12KB PSRAM 栈 */
+                            miplay_create_task(image_drain_task, "img_drain",
+                                               12 * 1024, (void*)(intptr_t)s_image_sock,
+                                               3, NULL, 1);
                             s_image_sock = -1;
                         } else {
                             ESP_LOGW(TAG, "[RTSP] data socket connect failed (ok, using interleaved)");
@@ -2101,15 +2551,12 @@ static void miplay_rtsp_run(const char *host, int port, int client_sock, uint32_
                      (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
                      (unsigned long)esp_get_minimum_free_heap_size());
             TaskHandle_t th = NULL;
-            /* 使用 PSRAM 静态栈（内部 SRAM 不足 16KB） */
-            if (!s_media_stack) {
-                s_media_stack = heap_caps_malloc(MEDIA_TASK_STACK_SIZE * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
-            }
-            if (s_media_stack) {
-                th = xTaskCreateStaticPinnedToCore(
-                    media_receive_task, "media_rx",
-                    MEDIA_TASK_STACK_SIZE, marg, 8,
-                    s_media_stack, &s_media_tcb, 1);
+            /* 对齐参考 128KB PSRAM 栈 */
+            if (miplay_create_task(media_receive_task, "media_rx",
+                                   MEDIA_TASK_STACK_SIZE, marg, 8, &th, 1) != pdPASS) {
+                ESP_LOGE(TAG, "[MEDIA] Task creation failed");
+                free(marg);
+                th = NULL;
             }
             if (th) {
                 ESP_LOGI(TAG, "[MEDIA] Task launched, continuing RTSP loop for keepalive");
@@ -2125,13 +2572,25 @@ static void miplay_rtsp_run(const char *host, int port, int client_sock, uint32_
     /* ── PLAY 后继续维护 RTSP 连接（响应 GET_PARAMETER / TEARDOWN）── */
     if (rtsp_state >= 2) {
         ESP_LOGI(TAG, "[RTSP] Entering keepalive loop...");
+        TickType_t loop_start = xTaskGetTickCount();
+        uint32_t keepalive_count = 0;
         while (s_running) {
             int ret = rtsp_read_msg(rtsp_sock, headers, RTSP_BUF_SIZE,
                                      body, RTSP_BUF_SIZE, &body_len);
             if (ret <= 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) continue;  /* 2秒超时，继续 */
-                if (ret == 0) ESP_LOGI(TAG, "[RTSP] Phone disconnected");
-                else ESP_LOGW(TAG, "[RTSP] Read error (errno=%d)", errno);
+                if (ret == 0) {
+                    /* 对端发 FIN：可能是手机侧超时/异常，也可能是我们长期没响应 keepalive。
+                     * 记录存活时长和已响应次数，便于判断是我们卡住还是手机侧主动退出。 */
+                    ESP_LOGW(TAG, "[RTSP] sock closed by peer after %lu ms, keepalives_acked=%lu, media_pkts=%lu",
+                             (unsigned long)((xTaskGetTickCount() - loop_start) * portTICK_PERIOD_MS),
+                             (unsigned long)keepalive_count, (unsigned long)s_media_pkt_total);
+                } else {
+                    ESP_LOGW(TAG, "[RTSP] Read error ret=%d errno=%d after %lu ms, keepalives=%lu",
+                             ret, errno,
+                             (unsigned long)((xTaskGetTickCount() - loop_start) * portTICK_PERIOD_MS),
+                             (unsigned long)keepalive_count);
+                }
                 break;
             }
             int peer_cseq = rtsp_get_cseq(headers);
@@ -2146,6 +2605,9 @@ static void miplay_rtsp_run(const char *host, int port, int client_sock, uint32_
             if (strcmp(method, "GET_PARAMETER") == 0) {
                 /* 手机发来的 keepalive — 回复空 body */
                 rtsp_send_resp(rtsp_sock, peer_cseq, NULL);
+                keepalive_count++;
+                ESP_LOGI(TAG, "[RTSP] GET_PARAMETER ack cseq=%d (count=%lu)",
+                         peer_cseq, (unsigned long)keepalive_count);
             } else if (strcmp(method, "TEARDOWN") == 0) {
                 rtsp_send_resp(rtsp_sock, peer_cseq, NULL);
                 ESP_LOGI(TAG, "[RTSP] ← TEARDOWN, stopping");
@@ -2153,13 +2615,15 @@ static void miplay_rtsp_run(const char *host, int port, int client_sock, uint32_
                 break;
             } else {
                 rtsp_send_resp(rtsp_sock, peer_cseq, NULL);
+                keepalive_count++;
+                ESP_LOGI(TAG, "[RTSP] %s ack cseq=%d", method, peer_cseq);
             }
         }
     }
     /* 任务创建失败或 RTSP 连接失败：清理资源并返回 */
 rtsp_cleanup:
-    free(headers);
-    free(body);
+    MIPLAY_FREE(headers);
+    MIPLAY_FREE(body);
     if (rtsp_sock >= 0) close(rtsp_sock);
     if (s_image_sock >= 0) { close(s_image_sock); s_image_sock = -1; }
     if (s_multi_sock >= 0) { close(s_multi_sock); s_multi_sock = -1; }
@@ -2170,12 +2634,496 @@ rtsp_cleanup:
 }
 
 /* ══════════════════════════════════════════════════════════════════════
+ * SET_MEDIA_INFO 元数据解析（0x12 / 0x18 共用）
+ *
+ * 参考 FusionPlay protocol.rs media_info_value() 三层剥壳:
+ *   {"mediaInfo":{...}} / {"mediaInfoEx":{...}} / {"metadata":"..."}
+ * ══════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief 在 JSON 字符串中查找 "key":"value" 或 "key":number
+ *        跳过嵌套层级，只匹配顶层键值对。
+ * @return value 起始位置（跳过引号），或 NULL
+ */
+static const char *json_find_value(const char *json, const char *key, size_t *vlen)
+{
+    /* 构建搜索模式 "key" */
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(json, pattern);
+    if (!p) return NULL;
+    p += strlen(pattern);
+    while (*p == ' ') p++;
+    if (*p != ':') return NULL;
+    p++;
+    while (*p == ' ') p++;
+    /* 值可能是 "string" 或 number/bool */
+    if (*p == '"') {
+        p++;  /* 跳过开引号 */
+        const char *start = p;
+        /* 找闭引号（跳过转义的 \"）*/
+        while (*p && !(*p == '"' && *(p - 1) != '\\')) p++;
+        *vlen = p - start;
+        return start;
+    } else {
+        /* 数字/布尔值 */
+        const char *start = p;
+        while (*p && *p != ',' && *p != '}' && *p != ' ') p++;
+        *vlen = p - start;
+        return start;
+    }
+}
+
+/**
+ * @brief 给定 JSON 文本，定位 key 的字符串值，并**反转义**拷贝到 out。
+ *
+ * 与 json_find_value 的区别：返回的是反转义后的干净副本（处理 \" \\ \/ \uXXXX
+ * 等），而非指向原缓冲的指针。Xiaomi mArt/data-URI 常把 URL 的 '/' 写成 '\/'，
+ * 若不反转义，base64/URL 会混入反斜杠导致下游解码失败。
+ *
+ * @param json  JSON 文本（可在原始 TCP payload 上操作，无 NUL 需 len）
+ * @param len   JSON 长度
+ * @param key   键名（不含引号）
+ * @param out   输出缓冲（PSRAM 传入更佳）
+ * @param out_size
+ * @return 反转义后字符串长度（不含结尾 NUL），未找到/失败返回 -1
+ */
+static int json_copy_unescaped(const char *json, size_t len, const char *key,
+                               char *out, size_t out_size)
+{
+    /* 在限定 len 内搜 "key" 位置 */
+    char pattern[40];
+    int pl = snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    if (pl <= 0 || (size_t)pl >= sizeof(pattern)) return -1;
+    /* 逐字节搜（避免超 len） */
+    const char *end = json + len;
+    const char *p = json;
+    while (p + pl <= end) {
+        const char *hit = strstr(p, pattern);
+        if (!hit || hit + pl > end) break;
+        bool at_key = (hit == json) || strchr("{, \t\r\n", hit[-1]) != NULL;
+        const char *after = hit + pl;
+        while (after < end && (*after == ' ' || *after == '\t')) after++;
+        if (at_key && after < end && *after == ':') {
+            after++;
+            while (after < end && (*after == ' ' || *after == '\t')) after++;
+            if (after < end && *after == '"') {
+                after++;  /* 跳过开引号 */
+                size_t n = 0;
+                while (after < end && *after != '"') {
+                    char c = *after;
+                    if (c == '\\' && after + 1 < end) {
+                        after++;
+                        char e = *after;
+                        if (e == 'u' && after + 5 <= end) {
+                            /* \uXXXX → UTF-8（仅支持 BMP 及可简单处理范围） */
+                            unsigned cp = 0;
+                            const char *hx = after + 1;
+                            for (int i = 0; i < 4; i++) {
+                                char h = hx[i];
+                                cp <<= 4;
+                                if (h >= '0' && h <= '9') cp |= (unsigned)(h - '0');
+                                else if (h >= 'a' && h <= 'f') cp |= (unsigned)(h - 'a' + 10);
+                                else if (h >= 'A' && h <= 'F') cp |= (unsigned)(h - 'A' + 10);
+                                else return -1;
+                            }
+                            if (cp < 0x80) {
+                                if (n + 1 >= out_size) return -1;
+                                out[n++] = (char)cp;
+                            } else if (cp < 0x800) {
+                                if (n + 2 >= out_size) return -1;
+                                out[n++] = (char)(0xC0 | (cp >> 6));
+                                out[n++] = (char)(0x80 | (cp & 0x3F));
+                            } else if (cp < 0x10000) {
+                                if (n + 3 >= out_size) return -1;
+                                out[n++] = (char)(0xE0 | (cp >> 12));
+                                out[n++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                                out[n++] = (char)(0x80 | (cp & 0x3F));
+                            } else {
+                                return -1;
+                            }
+                            after += 5;
+                        } else {
+                            /* \b \f \n \r \t \\ \" \/ */
+                            switch (e) {
+                                case 'b': c = '\b'; break;
+                                case 'f': c = '\f'; break;
+                                case 'n': c = '\n'; break;
+                                case 'r': c = '\r'; break;
+                                case 't': c = '\t'; break;
+                                default:  c = e;      break; /* \\ \" \/ → 原字符 */
+                            }
+                            if (n + 1 >= out_size) return -1;
+                            out[n++] = c;
+                        }
+                    } else {
+                        if (n + 1 >= out_size) return -1;
+                        out[n++] = c;
+                    }
+                    after++;
+                }
+                if (after >= end || *after != '"') return -1;  /* 未闭合 */
+                out[n] = '\0';
+                return (int)n;
+            }
+        }
+        p = hit + 1;
+    }
+    return -1;
+}
+
+/**
+ * @brief 在 JSON 里找一个数字/布尔字段（可带引号或裸数字），返回 int64。
+ */
+static bool json_find_num(const char *json, size_t len, const char *key, int64_t *out)
+{
+    char pattern[40];
+    int pl = snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    if (pl <= 0 || (size_t)pl >= sizeof(pattern)) return false;
+    const char *end = json + len;
+    for (const char *p = json; p + pl <= end; ) {
+        const char *hit = strstr(p, pattern);
+        if (!hit || hit + pl > end) return false;
+        bool at_key = (hit == json) || strchr("{, \t\r\n", hit[-1]) != NULL;
+        const char *after = hit + pl;
+        while (after < end && (*after == ' ' || *after == '\t')) after++;
+        if (at_key && after < end && *after == ':') {
+            after++;
+            while (after < end && (*after == ' ' || *after == '\t')) after++;
+            if (after < end && *after == '"') after++;  /* 引号数字 */
+            char *ep = NULL;
+            long long v = strtoll(after, &ep, 10);
+            if (ep != after) { *out = v; return true; }
+            return false;
+        }
+        p = hit + 1;
+    }
+    return false;
+}
+
+/**
+ * @brief 剥去 JSON 嵌套壳，返回实际元数据对象的起始位置。
+ *
+ * HyperOS 的 0x12/0x18 payload 可能是：
+ *   {"mediaInfo":{"mTitle":...}}           — object 壳
+ *   {"mediaInfoEx":{"mTitle":...}}         — object 壳
+ *   {"metadata":"{\"mTitle\":...}"}        — string 壳（字符串化的 JSON）
+ *   {"mTitle":...}                         — 无壳
+ *
+ * 参考 FusionPlay protocol.rs media_info_value() 的三层尝试。
+ *
+ * @param payload 原始 payload（可能 NUL 终止也可能不）
+ * @param plen    payload 长度
+ * @param buf     输出缓冲区（当需要 unescape stringified JSON 时使用）
+ * @param buf_len 缓冲区大小
+ * @return 解析起始位置（= payload 或 = buf），NULL 表示解析失败
+ */
+static const char *strip_media_info_shell(const char *payload, size_t plen,
+                                          char *buf, size_t buf_len)
+{
+    /* 确保 NUL 终止（payload 来自 TCP 帧，可能不含 NUL）*/
+    if (!payload || plen == 0) return NULL;
+
+    /* 尝试三个壳键 */
+    static const char *shell_keys[] = {"mediaInfo", "mediaInfoEx", "metadata"};
+    for (int i = 0; i < 3; i++) {
+        char pattern[40];
+        snprintf(pattern, sizeof(pattern), "\"%s\"", shell_keys[i]);
+        const char *found = strstr(payload, pattern);
+        if (!found) continue;
+        const char *p = found + strlen(pattern);
+        /* 跳到冒号后的值 */
+        const char *end = payload + plen;
+        while (p < end && *p == ' ') p++;
+        if (p >= end || *p != ':') continue;
+        p++;
+        while (p < end && *p == ' ') p++;
+        if (p >= end) continue;
+
+        if (*p == '{') {
+            /* object 壳：直接返回 { 位置 */
+            return p;
+        }
+        if (*p == '"') {
+            /* string 壳：metadata 的值是字符串化的 JSON，需要 unescape */
+            p++;  /* 跳过开引号 */
+            size_t out_pos = 0;
+            while (p < end && *p != '"') {
+                if (*p == '\\' && (p + 1) < end) {
+                    p++;
+                    if (*p == '"') {
+                        if (out_pos < buf_len - 1) buf[out_pos++] = '"';
+                    } else if (*p == '\\') {
+                        if (out_pos < buf_len - 1) buf[out_pos++] = '\\';
+                    } else if (*p == 'n') {
+                        if (out_pos < buf_len - 1) buf[out_pos++] = '\n';
+                    } else if (*p == 'r') {
+                        if (out_pos < buf_len - 1) buf[out_pos++] = '\r';
+                    } else if (*p == 't') {
+                        if (out_pos < buf_len - 1) buf[out_pos++] = '\t';
+                    } else if (*p == 'u' && (p + 4) < end) {
+                        /* \uXXXX → 简单保留 ASCII 范围 */
+                        char hex[5] = {p[1], p[2], p[3], p[4], 0};
+                        unsigned cp = (unsigned)strtoul(hex, NULL, 16);
+                        if (cp < 0x80 && out_pos < buf_len - 1) {
+                            buf[out_pos++] = (char)cp;
+                        }
+                        p += 4;
+                    } else {
+                        if (out_pos < buf_len - 1) buf[out_pos++] = *p;
+                    }
+                } else {
+                    if (out_pos < buf_len - 1) buf[out_pos++] = *p;
+                }
+                p++;
+            }
+            buf[out_pos] = '\0';
+            if (out_pos > 0) return buf;
+        }
+    }
+    /* 无壳：直接返回原 payload */
+    return payload;
+}
+
+/**
+ * @brief 解析 SET_MEDIA_INFO (0x12/0x18) 的 JSON payload，上报到 now_playing。
+ *        0x12 和 0x18 共用此函数。
+ *
+ * @param payload JSON payload
+ * @param plen    payload 长度
+ * @return pending_cover（PSRAM 分配的完整 cover base64，调用方负责 free）
+ */
+/* 解析时先把各字段反转义拷到临时缓冲，再决定是否采用。
+ * 小于返回 true 时 out 已是干净字符串。 */
+static bool parse_field_unescaped(const char *json, size_t len,
+                                  const char *const *aliases,
+                                  char *out, size_t out_size)
+{
+    for (int k = 0; aliases[k]; k++) {
+        if (json_copy_unescaped(json, len, aliases[k], out, out_size) >= 0)
+            return true;
+    }
+    return false;
+}
+
+static char *parse_media_info(const uint8_t *payload, size_t plen)
+{
+    char *pending_cover = NULL;
+    if (!payload || plen == 0) return NULL;
+
+    /* 字段名列表（对齐参考 esp_miplay-main + FusionPlay protocol.rs） */
+    static const char *title_keys[]  = {"mTitle", "title", "songName", "mSongName", NULL};
+    static const char *artist_keys[] = {"mArtist", "artist", "singer", "artistName", NULL};
+    static const char *album_keys[]  = {"mAlbum", "album", NULL};
+    static const char *cover_keys[]  = {
+        "mCoverUrl", "coverUrl", "mArt", "artwork", "artworkUrl",
+        "albumArt", "albumArtURI", "albumArtUrl", "cover_url", "cover", "art",
+        NULL
+    };
+    static const char *duration_keys[] = {"mDuration", "duration", "durationMs", "duration_ms", NULL};
+    static const char *position_keys[] = {"mPosition", "position", "positionMs", "position_ms", NULL};
+    static const char *status_keys[]   = {"status", "playStatus", "setState", "mediaState", "playState", NULL};
+
+    /* 1. PSRAM 拷贝 payload + NUL 终止（对齐参考，带回退避免元数据整块丢失） */
+    char *json = (char *)miplay_psram_prefer_alloc(plen + 1);
+    if (!json) {
+        ESP_LOGE(TAG, "parse_media_info: alloc %u failed", (unsigned)(plen + 1));
+        return NULL;
+    }
+    memcpy(json, payload, plen);
+    json[plen] = '\0';
+    ESP_LOGI(TAG, "[META] payload=%uB head=%.120s", (unsigned)plen, json);
+
+    const char *p_src = json;
+    size_t p_len = plen;
+    char *nested = NULL;
+
+    /* 2. Shell 剥壳：mediaInfo / mediaInfoEx / metadata */
+    static const char *shell_keys[] = {"mediaInfo", "mediaInfoEx", "metadata"};
+    for (int i = 0; i < 3 && !nested; i++) {
+        char pat[40];
+        int pl = snprintf(pat, sizeof(pat), "\"%s\"", shell_keys[i]);
+        if (pl <= 0 || (size_t)pl >= sizeof(pat)) continue;
+        const char *hit = NULL;
+        for (const char *q = p_src; (hit = strstr(q, pat)) && hit - p_src + pl <= (long)p_len; q = hit + 1) {
+            bool at_key = (hit == p_src) || strchr("{, \t\r\n", hit[-1]) != NULL;
+            if (!at_key) continue;
+            const char *after = hit + pl;
+            while (after < p_src + p_len && (*after == ' ' || *after == '\t')) after++;
+            if (after >= p_src + p_len || *after != ':') continue;
+            after++;
+            while (after < p_src + p_len && (*after == ' ' || *after == '\t')) after++;
+            if (after < p_src + p_len && *after == '"') {
+                char *tmp = heap_caps_malloc(p_len + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                if (tmp) {
+                    int r = json_copy_unescaped(p_src, p_len, shell_keys[i], tmp, p_len + 1);
+                    if (r > 0 && (tmp[0] == '{' || tmp[0] == '[')) {
+                        nested = tmp;
+                        p_src = nested;
+                        p_len = (size_t)r;
+                        break;
+                    }
+                    heap_caps_free(tmp);
+                }
+            }
+        }
+    }
+
+    /* 3. 各字段提取 */
+    char buf[256];  /* 仅用于短字段：title/artist/album/duration/position/status */
+
+    /* title */
+    if (parse_field_unescaped(p_src, p_len, title_keys, buf, sizeof(buf)) && buf[0]) {
+        strlcpy(s_media_title, buf, sizeof(s_media_title));
+    }
+    /* artist */
+    if (parse_field_unescaped(p_src, p_len, artist_keys, buf, sizeof(buf)) && buf[0]) {
+        strlcpy(s_media_artist, buf, sizeof(s_media_artist));
+    }
+    /* album */
+    if (parse_field_unescaped(p_src, p_len, album_keys, buf, sizeof(buf)) && buf[0]) {
+        strlcpy(s_media_album, buf, sizeof(s_media_album));
+    }
+    /* duration */
+    s_media_duration = 0;
+    for (int k = 0; duration_keys[k]; k++) {
+        int64_t num = 0;
+        char dtmp[40];
+        if (json_copy_unescaped(p_src, p_len, duration_keys[k], dtmp, sizeof(dtmp)) >= 0 && dtmp[0]) {
+            num = atoll(dtmp);
+        } else if (json_find_num(p_src, p_len, duration_keys[k], &num)) {
+        }
+        if (num > 0) { s_media_duration = (uint32_t)num; break; }
+    }
+    /* position */
+    s_media_position = 0;
+    for (int k = 0; position_keys[k]; k++) {
+        int64_t num = 0;
+        char ptmp[40];
+        if (json_copy_unescaped(p_src, p_len, position_keys[k], ptmp, sizeof(ptmp)) >= 0 && ptmp[0]) {
+            num = atoll(ptmp);
+        } else if (json_find_num(p_src, p_len, position_keys[k], &num)) {
+        }
+        if (num > 0) { s_media_position = (uint32_t)num; break; }
+    }
+    /* status */
+    for (int k = 0; status_keys[k]; k++) {
+        if (json_copy_unescaped(p_src, p_len, status_keys[k], buf, sizeof(buf)) >= 0 && buf[0]) {
+            int64_t num = 0;
+            if (buf[0] >= '0' && buf[0] <= '9') {
+                num = atoll(buf);
+            } else if (strcasecmp(buf, "playing") == 0) {
+                num = 2;
+            } else if (strcasecmp(buf, "paused") == 0) {
+                num = 3;
+            } else if (strcasecmp(buf, "stopped") == 0) {
+                num = 0;
+            }
+            if (num >= 0) { s_media_status = (int)num; break; }
+        }
+    }
+
+    /* cover — 对齐参考: 单次 PSRAM 分配（带内部 SRAM 回退），
+     * 不再先写 49KB 全局缓冲再拷一份，避免双份 49KB 导致分配失败封面静默丢失。 */
+    s_media_cover_url[0] = '\0';
+    if (parse_field_unescaped(p_src, p_len, cover_keys,
+                              s_media_cover_url, sizeof(s_media_cover_url)) && s_media_cover_url[0]) {
+        size_t bl = strlen(s_media_cover_url);
+        pending_cover = (char *)miplay_psram_prefer_alloc(bl + 1);
+        if (pending_cover) {
+            memcpy(pending_cover, s_media_cover_url, bl + 1);
+            ESP_LOGI(TAG, "[META] cover extracted len=%u head=%.60s",
+                     (unsigned)bl, pending_cover);
+        } else {
+            ESP_LOGW(TAG, "[META] cover alloc %u failed, cover dropped", (unsigned)(bl + 1));
+        }
+    } else {
+        ESP_LOGI(TAG, "[META] no cover field matched (keys tried: mCoverUrl/coverUrl/mArt/...)");
+        /* 诊断：打印 payload 所有 JSON key，确认 cover 类字段是否存在及确切名。
+         * 若手机真没发封面，key 清单里就看不到任何 cover/art 项。
+         * 注意: 读值指针要与外层 q 同步推进到该 key 值之后（逗号/} 的下一位），
+         * 否则长 UTF-8 值会让循环反复咀嚼同段字节、永远打不到后面的字段。 */
+        {
+            char keybuf[80];
+            const char *end = p_src + p_len;
+            for (const char *q = p_src; q < end && *q; ) {
+                if (*q != '"') { q++; continue; }
+                const char *eq = strchr(q + 1, '"');
+                if (!eq || eq >= end) break;                  /* 无配对引号，结束 */
+                if (eq - q - 1 > (long)sizeof(keybuf) - 1) { q = eq + 1; continue; }
+                const char *colon = eq + 1;
+                while (colon < end && (*colon == ' ' || *colon == '\t')) colon++;
+                if (colon >= end || *colon != ':') { q = eq + 1; continue; }
+                size_t klen = (size_t)(eq - q - 1);
+                memcpy(keybuf, q + 1, klen);
+                keybuf[klen] = '\0';
+                /* 读该 key 的值片段（前40字符），并把 q 推进到值之后。 */
+                const char *vs = colon + 1;
+                while (vs < end && (*vs == ' ' || *vs == '\t')) vs++;
+                char vbuf[48]; int vn = 0;
+                const char *vstop;                             /* 值结束位置 */
+                if (vs < end && *vs == '"') {                  /* 字符串值 */
+                    const char *v1 = vs + 1;
+                    const char *vq = strchr(v1, '"');
+                    vstop = (vq && vq < end) ? vq + 1 : end;
+                    while (v1 < end && *v1 != '"' && vn < (int)sizeof(vbuf) - 1) vbuf[vn++] = *v1++;
+                } else {                                       /* 数字/bool/null */
+                    vstop = vs;
+                    while (vstop < end && *vstop != ',' && *vstop != '}') vstop++;
+                    while (vs < vstop && vn < (int)sizeof(vbuf) - 1) vbuf[vn++] = *vs++;
+                }
+                vbuf[vn] = '\0';
+                ESP_LOGI(TAG, "  [key] \"%s\" = \"%.*s%s\"", keybuf,
+                         vn > 40 ? 40 : vn, vbuf, vn > 40 ? "..." : "");
+                /* 推进 q 越过当前 key:value 对（到逗号或 } 的下一位）。 */
+                const char *next = vstop;
+                while (next < end && *next != ',' && *next != '}') next++;
+                q = (next < end) ? next + 1 : end;
+            }
+        }
+    }
+
+    MIPLAY_FREE(nested);
+    MIPLAY_FREE(json);
+
+    ESP_LOGI(TAG, "Media: title=%.32s artist=%.24s album=%.24s dur=%ums pos=%ums status=%d cover=%d",
+             s_media_title, s_media_artist, s_media_album,
+             (unsigned)s_media_duration, (unsigned)s_media_position,
+             s_media_status, pending_cover ? 1 : 0);
+
+    /* 上报元数据到 UI（统一走 now_playing，与 DLNA 同路径）。
+     * 对齐参考: 只要任一字段有效就上报，不能要求 title 和 artist 同时非空。 */
+    if (s_media_title[0] || s_media_artist[0] || s_media_album[0] || s_media_duration > 0) {
+        np_meta_t m;
+        memset(&m, 0, sizeof(m));
+        strlcpy(m.title,  s_media_title,  sizeof(m.title));
+        strlcpy(m.artist, s_media_artist, sizeof(m.artist));
+        strlcpy(m.album,  s_media_album,  sizeof(m.album));
+        m.duration_ms = s_media_duration;
+        m.has_cover = (pending_cover != NULL);
+        ESP_LOGI(TAG, "[META] np_submit title=%.24s artist=%.16s dur=%ums has_cover=%d",
+                 m.title, m.artist, (unsigned)m.duration_ms, (int)m.has_cover);
+        np_submit(NP_SRC_MIPLAY, &m);
+    } else {
+        ESP_LOGW(TAG, "[META] all fields empty, skip np_submit");
+    }
+    /* cover 源在 np_submit 之后交付，避免 np_set_source 清掉 */
+    if (pending_cover) {
+        ESP_LOGI(TAG, "[META] np_set_cover_url len=%u", (unsigned)strlen(pending_cover));
+        np_set_cover_url(pending_cover);
+        /* 不在此处 free，调用方负责释放（cover_ref） */
+    }
+    return pending_cover;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
  * TCP 客户端处理
  * ══════════════════════════════════════════════════════════════════════ */
 
 static void disconnect_cleanup(int client_sock)
 {
     s_active_client_sock = -1;
+    s_connected = false;
     close(client_sock);
     s_has_session_key = false;
     s_has_stream_key = false;
@@ -2185,6 +3133,12 @@ static void disconnect_cleanup(int client_sock)
     memset(s_decrypt_iv, 0, sizeof(s_decrypt_iv));
     memset(s_auth_key, 0, sizeof(s_auth_key));
     memset(s_auth_msg, 0, sizeof(s_auth_msg));
+    /* 清除媒体元数据（防止重连后 GetMediaInfo 回读旧数据） */
+    memset(s_media_title, 0, sizeof(s_media_title));
+    memset(s_media_artist, 0, sizeof(s_media_artist));
+    memset(s_media_album, 0, sizeof(s_media_album));
+    memset(s_media_cover_url, 0, sizeof(s_media_cover_url));
+    s_media_duration = 0;
     rtsp_read_msg_reset();
     if (s_connected_cb) s_connected_cb(false);
 }
@@ -2218,7 +3172,7 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
     uint32_t local_ip = local_addr.sin_addr.s_addr;
     uint16_t local_port = ntohs(local_addr.sin_port);
 
-    uint8_t *buf = malloc(MIPLAY_RX_BUF_LEN);
+    uint8_t *buf = heap_caps_malloc(MIPLAY_RX_BUF_LEN, MALLOC_CAP_SPIRAM);
     if (!buf) { close(client_sock); return; }
     int buf_used = 0;
     char challenge[20];
@@ -2282,7 +3236,11 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
         if (!FD_ISSET(client_sock, &rfds)) continue;
 
         int space = MIPLAY_RX_BUF_LEN - buf_used;
-        if (space <= 0) { buf_used = 0; continue; }
+        if (space <= 0) {
+            ESP_LOGW(TAG, "RX buffer full (%d bytes), discarding", buf_used);
+            buf_used = 0;
+            continue;
+        }
         int n = recv(client_sock, buf + buf_used, space, 0);
         if (n <= 0) {
             if (n == 0) ESP_LOGI(TAG, "Client disconnected");
@@ -2299,20 +3257,31 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
                 int skip = 1;
                 while (skip < buf_used && buf[skip] != MIPLAY_FRAME_MAGIC) skip++;
                 if (skip > 0) {
-                    ESP_LOGW(TAG, "Bad magic, skip %d bytes", skip);
                     memmove(buf, buf + skip, buf_used - skip);
                     buf_used -= skip;
                 }
                 continue;
             }
             uint8_t outer_type = buf[1];   /* 帧外型: 0x00 普通 / 0x14 逻辑(Safety) */
+            /* 验证 outer_type 合法性：过滤加密数据中的 false positive */
+            if (outer_type != 0x00 && outer_type != 0x04 && outer_type != 0x14) {
+                /* 0x24 在加密数据中误匹配，跳过这个字节 */
+                memmove(buf, buf + 1, buf_used - 1);
+                buf_used--;
+                continue;
+            }
             uint16_t cmd = ((uint16_t)buf[1] << 8) | buf[2];
             uint16_t seq = ((uint16_t)buf[3] << 8) | buf[4];
             uint32_t plen = ((uint32_t)buf[5]<<24)|((uint32_t)buf[6]<<16)|
                             ((uint32_t)buf[7]<<8)|buf[8];
             uint32_t total = MIPLAY_FRAME_HDR_LEN + plen;
 
-            if (plen > 2048) {
+            if (plen > MIPLAY_MAX_FRAME_PAYLOAD) {
+                /* 对齐参考 esp_miplay-main: Frame too large 时只向前扫到下一个
+                 * magic 字节（skip ≤ buf_used，界内安全）。切勿用天文数字 plen/total
+                 * 做 memmove：plen 可达数十亿，(int)total 溢出为负后
+                 * buf_used>=(int)total 恒真 → memmove(buf, buf+负数, 巨大) 越界写，
+                 * 破坏 lwIP 内核内存导致 Guru Meditation panic（切歌偶发崩溃根因）。 */
                 ESP_LOGW(TAG, "Frame too large (%lu), skip to next magic", (unsigned long)plen);
                 int skip = 1;
                 while (skip < buf_used && buf[skip] != MIPLAY_FRAME_MAGIC) skip++;
@@ -2323,7 +3292,9 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
             if (buf_used < (int)total) break;  /* 等待更多数据 */
 
             const uint8_t *payload = buf + MIPLAY_FRAME_HDR_LEN;
-            ESP_LOGI(TAG, "RX cmd=0x%04X seq=%u len=%lu", cmd, seq, (unsigned long)plen);
+            ESP_LOGI(TAG, "RX cmd=0x%04X seq=%u len=%lu outer=0x%02X%s",
+                     cmd, seq, (unsigned long)plen, outer_type,
+                     (outer_type == 0x14) ? " [SAFETY]" : (outer_type == 0x04) ? " [ALONE]" : "");
             if (plen > 0 && plen <= 128) dump_hex(payload, (int)plen, "payload");
 
             rx_seq = seq;
@@ -2335,7 +3306,7 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
             if (s_has_session_key && plen >= 9 &&
                 payload[0] == 0x00 && payload[1] == 0x07 &&
                 payload[2] == 0x01 && payload[3] == 0xE0) {
-                dec_buf = malloc(1024);
+                dec_buf = heap_caps_malloc(1024, MALLOC_CAP_SPIRAM);
                 if (dec_buf) {
                     dec_len = safety_decrypt(payload, plen, s_aes_key, s_decrypt_iv,
                                              dec_buf, 1024);
@@ -2345,7 +3316,7 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
                         plen = (uint32_t)dec_len;
                     } else {
                         ESP_LOGW(TAG, "Unified decrypt failed for cmd=0x%04X", cmd);
-                        free(dec_buf); dec_buf = NULL;
+                        dec_buf = NULL;
                     }
                 }
             }
@@ -2363,8 +3334,12 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
                     /* 回复空闲状态 [0,0,0,0,0] */
                     { uint8_t st[] = {0,0,0,0,0}; send_encrypted_cmd(client_sock, cmd+1, seq, st, sizeof(st)); }
                     break;
-                case 0x18: /* ALONE_SET_MEDIA_INFO */
-                    ESP_LOGI(TAG, "AloneSetMediaInfo seq=%u", seq);
+                case 0x18: /* ALONE_SET_MEDIA_INFO — 与 0x12 同结构，复用解析 */
+                    ESP_LOGI(TAG, "AloneSetMediaInfo seq=%u len=%lu", seq, (unsigned long)plen);
+                    if (plen > 0) {
+                        char *cover_ref = parse_media_info(payload, plen);
+                        if (cover_ref) heap_caps_free(cover_ref);
+                    }
                     send_encrypted_cmd(client_sock, cmd + 1, seq, NULL, 0);
                     break;
                 default:
@@ -2476,33 +3451,36 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
                             'm', 'T', 'i', 't', 'l', 'e',
                             0x14, 0x00, 0x00, 0x00, 0x00,
                         };
-                        send_encrypted_cmd(client_sock, CMD_NOTIFY, s_notify_seq++, mi_body, sizeof(mi_body));
-                        ESP_LOGI(TAG, "-> NOTIFY mediaInfoEx (seq=%d)", s_notify_seq - 1);
+                        { uint16_t sq; send_encrypted_cmd_auto_seq(client_sock, CMD_NOTIFY,
+                                       mi_body, sizeof(mi_body), &sq);
+                          ESP_LOGI(TAG, "-> NOTIFY mediaInfoEx (seq=%u)", sq); }
                     }
                     /* 启动 RTSP 独立任务（PSRAM 静态栈，不依赖内部 SRAM） */
                     if (rtsp_port > 0) {
                         /* 递增 generation → 旧 RTSP/media task 下次读时自退出 */
                         uint32_t gen = ++s_media_generation;
                         ESP_LOGI(TAG, "[RTSP] media_generation -> %lu", (unsigned long)gen);
-                        if (!s_rtsp_stack) {
-                            s_rtsp_stack = heap_caps_malloc(RTSP_TASK_STACK_SIZE * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
-                        }
                         rtsp_task_arg_t *rtsp_arg = malloc(sizeof(rtsp_task_arg_t));
-                        if (rtsp_arg && s_rtsp_stack) {
+                        if (rtsp_arg) {
                             strncpy(rtsp_arg->host, rtsp_host, sizeof(rtsp_arg->host) - 1);
                             rtsp_arg->host[sizeof(rtsp_arg->host) - 1] = 0;
                             rtsp_arg->port = rtsp_port;
                             rtsp_arg->client_sock = client_sock;
                             rtsp_arg->generation = gen;
-                            s_rtsp_task = xTaskCreateStaticPinnedToCore(
-                                miplay_rtsp_task_wrapper, "miplay_rtsp",
-                                RTSP_TASK_STACK_SIZE, rtsp_arg, 4,
-                                s_rtsp_stack, &s_rtsp_tcb, 1);
+                            /* 等旧 RTSP task 退出后再创建 */
                             if (s_rtsp_task) {
-                                ESP_LOGI(TAG, "[RTSP] Task launched (PSRAM static), ctrl loop continues");
-                                break;  /* 退出 OPEN case，继续控制循环处理心跳 */
+                                for (int wt = 0; wt < 50 && eTaskGetState(s_rtsp_task) != eDeleted; wt++) {
+                                    vTaskDelay(pdMS_TO_TICKS(10));
+                                }
+                                s_rtsp_task = NULL;
+                            }
+                            if (miplay_create_task(miplay_rtsp_task_wrapper, "miplay_rtsp",
+                                                   RTSP_TASK_STACK_SIZE, rtsp_arg, 4,
+                                                   &s_rtsp_task, 1) == pdPASS) {
+                                ESP_LOGI(TAG, "[RTSP] Task launched (PSRAM), ctrl loop continues");
+                                break;
                             } else {
-                                ESP_LOGW(TAG, "[RTSP] xTaskCreateStatic failed");
+                                ESP_LOGW(TAG, "[RTSP] Task creation failed");
                                 free(rtsp_arg);
                             }
                         } else {
@@ -2675,6 +3653,13 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
                         pending_ack_valid = false;
                     }
                     state = STATE_ESTABLISHED;
+                    s_connected = true;
+                    /* 对齐参考 esp_miplay-main (L4476 "SafetyAuth"): SafetyAuth 互验
+                     * 成功后主动发一条加密空 mediaInfoEx NOTIFY，让 HyperOS 安装
+                     * reverse-control / skip-metadata。此后手机推送的 SetMediaInfo 才会
+                     * 携带 mCoverUrl/mArt。当前只在 GetMediaInfo 应答(3669)发一次，
+                     * 手机若不主动查询则封面引导缺失 → 封面永久为空。 */
+                    miplay_notify_empty_media_info_ex(client_sock, "SafetyAuth");
                     /* 通知上层：MiPlay 已连接，DLNA 应暂停 */
                     if (s_connected_cb) s_connected_cb(true);
                     break;
@@ -2683,7 +3668,7 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
                 /* ── 设备信息请求 (0x001E) ── */
                 if (cmd == CMD_GET_DEVICE_INFO) {
                     ESP_LOGI(TAG, "GetDeviceInfo received");
-                    uint8_t *devinfo = malloc(1024);
+                    uint8_t *devinfo = MIPLAY_MALLOC(1024);
                     if (devinfo) {
                         int di_len = build_device_info_payload(devinfo, 1024);
                         if (di_len > 0) {
@@ -2696,7 +3681,7 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
                             }
                             ESP_LOGI(TAG, "-> DeviceInfoAck (%d bytes)", di_len);
                         }
-                        free(devinfo);
+                        MIPLAY_FREE(devinfo);
                     }
                     break;
                 }
@@ -2715,8 +3700,9 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
                 /* ── GetMirrorMode (0x0034) ── */
                 if (cmd == CMD_GET_MIRROR_MODE) {
                     ESP_LOGI(TAG, "GetMirrorMode seq=%u", seq);
-                    /* PC: send_encrypted(0x35, seq, bytes([0,0,0,0,2])) */
-                    uint8_t mode_resp[] = {0x00, 0x00, 0x00, 0x00, 0x02};
+                    /* FusionPlay: mode=1 = mobile-audio-streaming（HyperOS 发 SET_MEDIA_INFO + 装反向控制）
+                     * mode=2 = 有音频但无移动流（HyperOS 不发元数据、不装控制） */
+                    uint8_t mode_resp[] = {0x00, 0x00, 0x00, 0x00, 0x01};
                     if (s_has_session_key) {
                         send_encrypted_cmd(client_sock, CMD_GET_MIRROR_MODE_ACK, seq,
                                            mode_resp, sizeof(mode_resp));
@@ -2756,34 +3742,9 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
                  * 子字段: keyLen(1B) + key + 0x14 + valLen(1B) + value */
                 if (cmd == CMD_GET_MEDIA_INFO && outer_type == 0x00) {
                     ESP_LOGI(TAG, "GetMediaInfo seq=%u (title=%.20s)", seq, s_media_title);
-                    uint8_t mi_body[256];
-                    int o = 0;
-                    /* mediaInfoEx 头 */
-                    mi_body[o++] = 0x0B;
-                    memcpy(mi_body + o, "mediaInfoEx", 11); o += 11;
-                    mi_body[o++] = 0x16;
-                    int sub_start = o;
-                    o += 4;  /* 长度占位 */
-                    /* mTitle 子字段（精确对齐 1.1.6 格式）*/
-                    int title_len = (int)strlen(s_media_title);
-                    mi_body[o++] = 0x0C;                    /* entry marker */
-                    mi_body[o++] = 0x06;                    /* key_len = 6 */
-                    memcpy(mi_body + o, "mTitle", 6); o += 6;
-                    mi_body[o++] = 0x14;                    /* value_type = string */
-                    mi_body[o + 0] = (uint8_t)((title_len >> 24) & 0xFF);
-                    mi_body[o + 1] = (uint8_t)((title_len >> 16) & 0xFF);
-                    mi_body[o + 2] = (uint8_t)((title_len >> 8) & 0xFF);
-                    mi_body[o + 3] = (uint8_t)(title_len & 0xFF);
-                    o += 4;
-                    if (title_len > 0) { memcpy(mi_body + o, s_media_title, title_len); o += title_len; }
-                    /* 回填子字段总长度 */
-                    int sub_len = o - sub_start - 4;
-                    mi_body[sub_start + 0] = (uint8_t)((sub_len >> 24) & 0xFF);
-                    mi_body[sub_start + 1] = (uint8_t)((sub_len >> 16) & 0xFF);
-                    mi_body[sub_start + 2] = (uint8_t)((sub_len >> 8) & 0xFF);
-                    mi_body[sub_start + 3] = (uint8_t)(sub_len & 0xFF);
-                    send_encrypted_cmd(client_sock, CMD_NOTIFY, s_notify_seq++,
-                                       mi_body, o);
+                    /* 与 FusionPlay 对齐：始终发 empty_media_info_notification (29字节)
+                     * 手机消费此 NOTIFY 时安装 reverse-control callback */
+                    miplay_notify_empty_media_info_ex(client_sock, "GetMediaInfo");
                     break;
                 }
 
@@ -2820,8 +3781,8 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
                         0x07,                                       /* value_type = 7 (u32 BE) */
                         0x00, 0x00, 0x00, (uint8_t)s_volume_percent /* percent BE */
                     };
-                    send_encrypted_cmd(client_sock, CMD_NOTIFY, s_notify_seq++,
-                                       vol_notify, sizeof(vol_notify));
+                    send_encrypted_cmd_auto_seq(client_sock, CMD_NOTIFY,
+                                       vol_notify, sizeof(vol_notify), NULL);
                     break;
                 }
 
@@ -2880,72 +3841,107 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
                     break;
                 }
 
+                /* ── 入站 NOTIFY (0x0022) ──
+                 * 对齐参考: mirror mode 2 下手机把媒体信息/播放状态作为 0x0022
+                 * 通知异步下发（而非 SET_MEDIA_INFO）。缺此分支则标题和封面全丢。 */
+                if (cmd == CMD_NOTIFY && plen > 0) {
+                    ESP_LOGI(TAG, "[NOTIFY-in] seq=%u len=%lu payload=%.120s",
+                             seq, (unsigned long)plen, payload);
+                    /* 入站 NOTIFY 可能是 OPack 二进制 TLV 或 JSON。
+                     * JSON 路径可直接解析；OPack 首字节是 key 长度（小值），
+                     * 不是 '{'，parse_media_info 会自然失败并告警。 */
+                    if (payload[0] == '{' || payload[0] == '[') {
+                        char *cover_ref = parse_media_info(payload, plen);
+                        if (cover_ref) heap_caps_free(cover_ref);
+                    } else {
+                        /* 诊断: dump 首 16 字节确认是否 OPack TLV(mediaInfoEx 二进制块)。
+                         * OPack mediaInfoEx = 0x0B 'mediaInfoEx' 0x16 len(4B) {...}。
+                         * 若手机经此通道发 base64 封面，首字节=len(小值)且后跟 ASCII label。 */
+                        ESP_LOGW(TAG, "[NOTIFY-in] non-JSON payload first=%02X %02X %02X %02X %02X "
+                                 "%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X (opack parser not ported)",
+                                 plen > 0 ? payload[0] : 0, plen > 1 ? payload[1] : 0,
+                                 plen > 2 ? payload[2] : 0, plen > 3 ? payload[3] : 0,
+                                 plen > 4 ? payload[4] : 0, plen > 5 ? payload[5] : 0,
+                                 plen > 6 ? payload[6] : 0, plen > 7 ? payload[7] : 0,
+                                 plen > 8 ? payload[8] : 0, plen > 9 ? payload[9] : 0,
+                                 plen > 10 ? payload[10] : 0, plen > 11 ? payload[11] : 0,
+                                 plen > 12 ? payload[12] : 0, plen > 13 ? payload[13] : 0,
+                                 plen > 14 ? payload[14] : 0, plen > 15 ? payload[15] : 0);
+                    }
+                    /* 对齐参考: NOTIFY 是事件上报，不回复同序号 ACK。 */
+                    break;
+                }
+
+                /* ── GetMediaInfo 应答 (0x0015) ──
+                 * 对齐参考: 我方查询媒体信息后的应答，携带完整元数据。 */
+                if (cmd == CMD_GET_MEDIA_INFO_ACK && plen > 0) {
+                    ESP_LOGI(TAG, "[GET_MEDIA_INFO_ACK] seq=%u len=%lu payload=%.120s",
+                             seq, (unsigned long)plen, payload);
+                    if (payload[0] == '{' || payload[0] == '[') {
+                        char *cover_ref = parse_media_info(payload, plen);
+                        if (cover_ref) heap_caps_free(cover_ref);
+                    } else {
+                        /* 诊断: 参考在 0x0015 优先用 OPack 解析 mediaInfoEx(可能含 base64 cover)。
+                         * 本地只认 JSON。dump 首 16 字节确认是否二进制块。 */
+                        ESP_LOGW(TAG, "[GET_MEDIA_INFO_ACK] non-JSON first=%02X %02X %02X %02X %02X "
+                                 "%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X (opack not ported)",
+                                 plen > 0 ? payload[0] : 0, plen > 1 ? payload[1] : 0,
+                                 plen > 2 ? payload[2] : 0, plen > 3 ? payload[3] : 0,
+                                 plen > 4 ? payload[4] : 0, plen > 5 ? payload[5] : 0,
+                                 plen > 6 ? payload[6] : 0, plen > 7 ? payload[7] : 0,
+                                 plen > 8 ? payload[8] : 0, plen > 9 ? payload[9] : 0,
+                                 plen > 10 ? payload[10] : 0, plen > 11 ? payload[11] : 0,
+                                 plen > 12 ? payload[12] : 0, plen > 13 ? payload[13] : 0,
+                                 plen > 14 ? payload[14] : 0, plen > 15 ? payload[15] : 0);
+                    }
+                    break;
+                }
+
                 /* ── Media control commands during streaming ── */
                 if (cmd == CMD_SET_MEDIA_INFO) {
                     ESP_LOGI(TAG, "[MEDIA-INFO] SetMediaInfo seq=%u payload=%.*s",
                              seq, (int)(plen > 200 ? 200 : plen), payload);
-                    /* 解析 JSON 元数据 */
+                    char *cover_ref = NULL;
                     if (plen > 0) {
-                        const char *p_str = (const char *)payload;
-                        /* 尝试多个可能的字段名（1.1.3 用 mTitle，1.1.6 用 title）*/
-                        static const char *title_keys[] = {"\"mTitle\"", "\"title\"", NULL};
-                        static const char *artist_keys[] = {"\"mArtist\"", "\"artist\"", NULL};
-                        static const char *album_keys[] = {"\"mAlbum\"", "\"album\"", NULL};
-                        static const char *cover_keys[] = {"\"mCoverUrl\"", "\"mArt\"", "\"artwork\"", "\"cover\"", NULL};
-                        for (int k = 0; title_keys[k]; k++) {
-                            const char *t = strstr(p_str, title_keys[k]);
-                            if (t) { t = strchr(t, ':'); if (t) { t++;
-                                while (*t == ' ' || *t == '"') t++;
-                                const char *end = t; while (*end && *end != '"' && *end != ',' && *end != '}') end++;
-                                size_t len = end - t; if (len >= sizeof(s_media_title)) len = sizeof(s_media_title) - 1;
-                                memcpy(s_media_title, t, len); s_media_title[len] = 0; break; }
-                        }}
-                        for (int k = 0; artist_keys[k]; k++) {
-                            const char *t = strstr(p_str, artist_keys[k]);
-                            if (t) { t = strchr(t, ':'); if (t) { t++;
-                                while (*t == ' ' || *t == '"') t++;
-                                const char *end = t; while (*end && *end != '"' && *end != ',' && *end != '}') end++;
-                                size_t len = end - t; if (len >= sizeof(s_media_artist)) len = sizeof(s_media_artist) - 1;
-                                memcpy(s_media_artist, t, len); s_media_artist[len] = 0; break; }
-                        }}
-                        for (int k = 0; album_keys[k]; k++) {
-                            const char *t = strstr(p_str, album_keys[k]);
-                            if (t) { t = strchr(t, ':'); if (t) { t++;
-                                while (*t == ' ' || *t == '"') t++;
-                                const char *end = t; while (*end && *end != '"' && *end != ',' && *end != '}') end++;
-                                size_t len = end - t; if (len >= sizeof(s_media_album)) len = sizeof(s_media_album) - 1;
-                                memcpy(s_media_album, t, len); s_media_album[len] = 0; break; }
-                        }}
-                        for (int k = 0; cover_keys[k]; k++) {
-                            const char *t = strstr(p_str, cover_keys[k]);
-                            if (t) { t = strchr(t, ':'); if (t) { t++;
-                                while (*t == ' ' || *t == '"') t++;
-                                const char *end = t; while (*end && *end != '"' && *end != ',' && *end != '}') end++;
-                                size_t len = end - t; if (len >= sizeof(s_media_cover_url)) len = sizeof(s_media_cover_url) - 1;
-                                memcpy(s_media_cover_url, t, len); s_media_cover_url[len] = 0; break; }
-                        }}
-                        /* duration — 数字字段 */
-                        const char *d = strstr(p_str, "\"mDuration\"");
-                        if (!d) d = strstr(p_str, "\"duration\"");
-                        if (!d) d = strstr(p_str, "\"duration_ms\"");
-                        if (d) { d = strchr(d, ':'); if (d) { d++; while (*d == ' ') d++;
-                            s_media_duration = (uint32_t)atol(d); }}
-                        ESP_LOGI(TAG, "Media: title=%.32s artist=%.24s dur=%ums",
-                                 s_media_title, s_media_artist, (unsigned)s_media_duration);
+                        cover_ref = parse_media_info(payload, plen);
                     }
+                    if (cover_ref) heap_caps_free(cover_ref);
                     send_encrypted_cmd(client_sock, CMD_SET_MEDIA_INFO_ACK, seq, NULL, 0);
                     break;
                 }
+                /* ── SetPlaySource (0x0040) ──
+                 * 对齐参考: 除了 ACK 还要解析 payload，它可能携带媒体信息。 */
+                if (cmd == CMD_SET_PLAY_SOURCE) {
+                    ESP_LOGI(TAG, "[SET_PLAY_SOURCE] seq=%u len=%lu payload=%.120s",
+                             seq, (unsigned long)plen, payload);
+                    if (plen > 0) {
+                        char *cover_ref = parse_media_info(payload, plen);
+                        if (cover_ref) heap_caps_free(cover_ref);
+                    }
+                    send_encrypted_cmd(client_sock, cmd + 1, seq, NULL, 0);
+                    break;
+                }
                 if (cmd == CMD_SET_MEDIA_STATE || cmd == CMD_SET_POSITION ||
-                    cmd == CMD_SET_PLAY_SOURCE ||
                     cmd == CMD_PAUSE || cmd == CMD_RESUME || cmd == CMD_SET_VOLUME) {
                     send_encrypted_cmd(client_sock, cmd + 1, seq, NULL, 0);
                     ESP_LOGI(TAG, "[MEDIA-ctrl] cmd=0x%04X → ACK", cmd);
                     break;
                 }
 
-                ESP_LOGW(TAG, "Unhandled cmd=0x%04X seq=%u len=%lu",
-                         cmd, seq, (unsigned long)plen);
+                ESP_LOGW(TAG, "Unhandled cmd=0x%04X seq=%u len=%lu outer=0x%02X",
+                         cmd, seq, (unsigned long)plen, outer_type);
+                /* 尝试提取安全帧内命令（0x14XX → 内层0x00XX）*/
+                if ((cmd & 0xFF00) == 0x1400 && dec_buf && dec_len > 0) {
+                    uint16_t inner_cmd = cmd & 0x00FF;
+                    ESP_LOGW(TAG, "Safety frame inner_cmd=0x%04X, trying dispatch", inner_cmd);
+                    if (inner_cmd == CMD_SET_MEDIA_INFO) {
+                        ESP_LOGI(TAG, "[MEDIA-INFO via safety] seq=%u payload=%.*s",
+                                 seq, (int)(dec_len > 200 ? 200 : dec_len), dec_buf);
+                        char *cover_ref = parse_media_info(dec_buf, dec_len);
+                        if (cover_ref) heap_caps_free(cover_ref);
+                        send_encrypted_cmd(client_sock, CMD_SET_MEDIA_INFO_ACK, seq, NULL, 0);
+                    }
+                }
                 break;
             }
             } /* switch */
@@ -2954,7 +3950,8 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
             /* 移除已处理帧 */
             if ((int)total < buf_used)
                 memmove(buf, buf + total, buf_used - total);
-            if (dec_buf) free(dec_buf);
+            heap_caps_free(dec_buf);
+            dec_buf = NULL;
             buf_used -= total;
         } /* while buf_used >= 9 */
     } /* while s_running */
@@ -3244,32 +4241,27 @@ uint32_t miplay_get_volume(void)
 void miplay_send_receiver_control(const char *action, int64_t value)
 {
     int sock = s_active_client_sock;
-    if (sock < 0 || !s_has_session_key) return;
+    ESP_LOGI(TAG, "[CTRL] send_receiver_control(%s) sock=%d has_key=%d", action, sock, (int)s_has_session_key);
+    if (sock < 0 || !s_has_session_key) {
+        ESP_LOGW(TAG, "[CTRL] BLOCKED: sock=%d has_key=%d", sock, (int)s_has_session_key);
+        return;
+    }
 
-    /* 二进制 TLV 格式: [key_len(1)] [key_bytes] [value_type(1)] [value_data]
-     * 布尔: value_type=0x00, value=0x01
-     * u64:  value_type=0x09, value=8字节 BE */
+    /* 对齐 FusionPlay receiver_control_boolean 格式：
+     * [key_len(1B)] [key_bytes] [0x00] [0x01]
+     * key: "key-pause" / "key-resume" / "key-prev" / "key-next" */
     uint8_t body[20];
     int o = 0;
-    if (strcmp(action, "seek") == 0) {
-        /* key-seek (8 bytes) + type 0x09 + u64 BE */
-        body[o++] = 8;
-        memcpy(body + o, "key-seek", 8); o += 8;
-        body[o++] = 0x09;
-        for (int i = 7; i >= 0; i--)
-            body[o++] = (uint8_t)((value >> (i * 8)) & 0xFF);
-    } else {
-        /* key-pause / key-resume / key-prev / key-next */
-        char key[16];
-        int klen = snprintf(key, sizeof(key), "key-%s", action);
-        if (klen <= 0 || klen > 15) return;
-        body[o++] = (uint8_t)klen;
-        memcpy(body + o, key, klen); o += klen;
-        body[o++] = 0x00;  /* boolean */
-        body[o++] = 0x01;
-    }
-    send_encrypted_cmd(sock, CMD_NOTIFY, s_notify_seq++, body, o);
-    ESP_LOGI(TAG, "-> receiver-control: %s", action);
+    char key[16];
+    int klen = snprintf(key, sizeof(key), "key-%s", action);
+    if (klen <= 0 || klen > 15) return;
+    body[o++] = (uint8_t)klen;
+    memcpy(body + o, key, klen); o += klen;
+    body[o++] = 0x00;  /* boolean type */
+    body[o++] = 0x01;  /* true */
+
+    { uint16_t sq; send_encrypted_cmd_auto_seq(sock, CMD_NOTIFY, body, o, &sq);
+      ESP_LOGI(TAG, "[CTRL] -> NOTIFY %s (seq=%u len=%d)", key, sq, o); }
 }
 
 /* ── 公共 API ── */
@@ -3277,6 +4269,8 @@ esp_err_t miplay_init(void)
 {
     if (s_running) return ESP_OK;
     ESP_LOGI(TAG, "Initializing MiPlay (MiPlayForWindows compatible)");
+    if (!s_send_mux) s_send_mux = xSemaphoreCreateRecursiveMutex();
+    if (!s_send_mux) { ESP_LOGE(TAG, "s_send_mux create failed"); return ESP_ERR_NO_MEM; }
     init_device_identity();
 
     esp_err_t err = register_mdns_services();
@@ -3284,14 +4278,14 @@ esp_err_t miplay_init(void)
 
     s_running = true;
     build_miplay_lan_response();
-    s_tcp_stack = heap_caps_malloc(6144, MALLOC_CAP_SPIRAM);
-    if (!s_tcp_stack) { ESP_LOGE(TAG, "TCP stack alloc failed"); s_running = false; return ESP_FAIL; }
-    s_tcp_task = xTaskCreateStaticPinnedToCore(miplay_tcp_task, "miplay_tcp", 6144,
-                                                NULL, 5, s_tcp_stack, &s_tcp_tcb, 1);
-    if (!s_tcp_task) { ESP_LOGE(TAG, "TCP task failed"); s_running = false; return ESP_FAIL; }
-    xTaskCreatePinnedToCore(miplay_scan_task, "miplay_scan", 3072, NULL, 3, &s_scan_task, 1);
-    xTaskCreatePinnedToCore(miplay_lan_task, "miplay_lan", 4096, NULL, 3, &s_lan_task, 0);
-    xTaskCreatePinnedToCore(mdns_announce_task, "mdns_ann", 4096, NULL, 3, &s_announce_task, 0);
+    /* 对齐参考: TCP 16KB, scan/lan/ann 12KB, 全部 PSRAM 栈 */
+    if (miplay_create_task(miplay_tcp_task, "miplay_tcp", 16 * 1024,
+                           NULL, 5, &s_tcp_task, 1) != pdPASS) {
+        ESP_LOGE(TAG, "TCP task failed"); s_running = false; return ESP_FAIL;
+    }
+    miplay_create_task(miplay_scan_task, "miplay_scan", 12 * 1024, NULL, 3, &s_scan_task, 1);
+    miplay_create_task(miplay_lan_task,  "miplay_lan",  12 * 1024, NULL, 3, &s_lan_task, 0);
+    miplay_create_task(mdns_announce_task, "mdns_ann", 12 * 1024, NULL, 3, &s_announce_task, 0);
     ESP_LOGI(TAG, "MiPlay initialized (TCP+LAN+Scan)");
     ESP_LOGI(TAG, "TCP 8899 listening for MiPlay");
     return ESP_OK;
@@ -3306,8 +4300,7 @@ void miplay_stop(void)
     for (int i = 0; i < 50 && (s_tcp_task != NULL || s_lan_task != NULL); i++) vTaskDelay(pdMS_TO_TICKS(100));
     mdns_service_remove(MIPLAY_MICON_SERVICE, MIPLAY_MICON_PROTO);
     mdns_service_remove(MIPLAY_LYRA_SERVICE, MIPLAY_LYRA_PROTO);
+    if (s_send_mux) { vSemaphoreDelete(s_send_mux); s_send_mux = NULL; }
     rtsp_read_msg_reset();  /* 释放持久缓冲区 */
-    if (s_rtsp_stack) { free(s_rtsp_stack); s_rtsp_stack = NULL; }
-    if (s_media_stack) { free(s_media_stack); s_media_stack = NULL; }
     ESP_LOGI(TAG, "MiPlay stopped");
 }

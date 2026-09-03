@@ -195,9 +195,20 @@ esp_err_t rotary_encoder_init(const rotary_encoder_config_t *config)
     gpio_isr_handler_add(config->dt_gpio, enc_rot_isr, NULL);
     gpio_isr_handler_add(config->sw_gpio, btn_isr, NULL);
 
-    /* ── 启动处理任务 ── */
-    xTaskCreate(rotary_task, "rotary_enc", 4096, NULL, 8, NULL);
-
-    ESP_LOGI(TAG, "Init OK (CLK=%d, DT=%d, SW=%d, lookup-table)", config->clk_gpio, config->dt_gpio, config->sw_gpio);
+    /* ── 启动处理任务：PSRAM 静态栈（内部 SRAM 不够 8KB） ── */
+    static StackType_t *s_rotary_stack = NULL;
+    static StaticTask_t s_rotary_tcb;
+    if (!s_rotary_stack) {
+        s_rotary_stack = heap_caps_malloc(8192 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+    }
+    if (!s_rotary_stack) {
+        ESP_LOGE(TAG, "PSRAM alloc for rotary stack failed!");
+        return ESP_ERR_NO_MEM;
+    }
+    memset(&s_rotary_tcb, 0, sizeof(s_rotary_tcb));
+    TaskHandle_t th = xTaskCreateStaticPinnedToCore(
+        rotary_task, "rotary_enc", 8192, NULL, 9,
+        s_rotary_stack, &s_rotary_tcb, 0);
+    ESP_LOGI(TAG, "Init OK (CLK=%d, DT=%d, SW=%d, PSRAM-lookup)", config->clk_gpio, config->dt_gpio, config->sw_gpio);
     return ESP_OK;
 }

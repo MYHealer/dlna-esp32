@@ -52,7 +52,9 @@ static lvgl_btn_cb_t s_cb_btn_next = NULL;
 static void _btn_action_task(void *arg)
 {
     lvgl_btn_cb_t cb = (lvgl_btn_cb_t)arg;
+    ESP_LOGI("LVGL_UI", "btn_action_task START cb=%p core=%d", cb, xPortGetCoreID());
     if (cb) cb();
+    ESP_LOGI("LVGL_UI", "btn_action_task END");
     vTaskDelete(NULL);
 }
 
@@ -61,13 +63,15 @@ static void _btn_click_cb(lv_event_t *e)
 {
     lv_obj_t *btn = lv_event_get_target(e);
     lvgl_btn_cb_t cb = NULL;
-    if (btn == s_btn_prev) cb = s_cb_btn_prev;
-    else if (btn == s_btn_play) cb = s_cb_btn_play;
-    else if (btn == s_btn_next) cb = s_cb_btn_next;
+    const char *name = "?";
+    if (btn == s_btn_prev) { cb = s_cb_btn_prev; name = "prev"; }
+    else if (btn == s_btn_play) { cb = s_cb_btn_play; name = "play"; }
+    else if (btn == s_btn_next) { cb = s_cb_btn_next; name = "next"; }
+    ESP_LOGI("LVGL_UI", "CLICKED [%s] cb=%p", name, cb);
 
     /* 在独立任务中执行回调，不阻塞 LVGL 任务 */
     if (cb) {
-        xTaskCreatePinnedToCore(_btn_action_task, "btn_act", 3072, (void*)cb, 6, NULL, 1);
+        xTaskCreatePinnedToCore(_btn_action_task, "btn_act", 3072, (void*)cb, 10, NULL, 0);
     }
 
     /* 退出 editing 模式，恢复旋钮焦点导航 */
