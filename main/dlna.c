@@ -968,6 +968,19 @@ static void np_on_meta_changed(const np_meta_t *meta)
              (unsigned long)meta->epoch, meta->title, meta->artist,
              (unsigned long)meta->duration_ms, (int)meta->has_cover);
 
+    /* 对齐参考 esp_miplay-main consume_miplay_media_events_locked 的 new_track 分支:
+     * 换曲(title 变化)时 position 清零 + 锚点重置。MiPlay 同一 RTSP 会话内切歌
+     * 音频管线不重启，on_miplay_media_start 不会再触发，s_accumulated_ms 无人
+     * 清零会导致"当前播放时长"继续累计旧曲值。同曲重复上报(title 相同)不重置。 */
+    static char s_np_miplay_last_title[128] = "";
+    if (meta->source == NP_SRC_MIPLAY && meta->title[0] &&
+        strcmp(meta->title, s_np_miplay_last_title) != 0) {
+        strlcpy(s_np_miplay_last_title, meta->title, sizeof(s_np_miplay_last_title));
+        s_accumulated_ms = 0;
+        if (s_play_start_us > 0) s_play_start_us = esp_timer_get_time();
+        ESP_LOGI(TAG, "NP new track -> position reset to 0");
+    }
+
     /* MiPlay 时长 → 驱动 UI 进度条总长(s_dur_cache_sec)。DLNA 用 DIDL-Lite 独立解析，
      * 此处只填 MiPlay 源，避免覆盖 DLNA 的时长缓存。 */
     if (meta->source == NP_SRC_MIPLAY && meta->duration_ms > 0) {

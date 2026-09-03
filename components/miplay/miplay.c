@@ -114,8 +114,13 @@ static volatile bool s_running = false;
 static volatile bool s_connected = false;  /* SafetyAuth 握手完成后 true，全部断开后 false */
 static int s_listen_sock = -1;
 
-/* 接收缓冲区 */
-#define MIPLAY_MAX_FRAME_PAYLOAD    2048
+/* 接收缓冲区
+ * MIPLAY_MAX_FRAME_PAYLOAD 对齐参考 esp_miplay-main:128 (64KB)：
+ * HyperOS 换曲时会推送整帧内嵌 base64 WebP 封面的 SetMediaInfo（实测 ~27KB），
+ * 上限 2048 会把它整帧丢弃("Frame too large")并引发帧同步错乱、封面永远缺失。
+ * 注意：上限放开不等于常驻缓冲扩大——RX 常驻仍 4KB，大帧临时走 PSRAM 缓冲
+ * （见 handle_client 大帧搬运逻辑），用完即释放，避免历史教训"扩缓冲断联"。 */
+#define MIPLAY_MAX_FRAME_PAYLOAD    (64U * 1024U)
 #define MIPLAY_RX_BUF_LEN          4096
 #define MIPLAY_MEDIA_INFO_BUFFER_SIZE 8192
 #define MIPLAY_COVER_SOURCE_MAX     49152   /* 48KB, 足够 data:URI base64 封面 */
@@ -2900,7 +2905,11 @@ static bool parse_field_unescaped(const char *json, size_t len,
                                   char *out, size_t out_size)
 {
     for (int k = 0; aliases[k]; k++) {
-        if (json_copy_unescaped(json, len, aliases[k], out, out_size) >= 0)
+        /* 必须取到非空值才算命中：实测 HyperOS 大帧 SetMediaInfo 里
+         * "mCoverUrl":"" 在前、"mArt":"UklGR..."(base64 WebP 封面) 在后，
+         * 若空值短路返回 true，多别名 fallback 永远轮不到 mArt。
+         * 调用方本就判 out[0]，此处收紧语义不改任何调用方行为。 */
+        if (json_copy_unescaped(json, len, aliases[k], out, out_size) >= 0 && out[0])
             return true;
     }
     return false;
@@ -3174,6 +3183,7 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
 
     uint8_t *buf = heap_caps_malloc(MIPLAY_RX_BUF_LEN, MALLOC_CAP_SPIRAM);
     if (!buf) { close(client_sock); return; }
+    int buf_cap = MIPLAY_RX_BUF_LEN;   /* 当前缓冲容量（大帧时临时扩容） */
     int buf_used = 0;
     char challenge[20];
     generate_challenge(challenge, sizeof(challenge));
@@ -3235,7 +3245,7 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
         }
         if (!FD_ISSET(client_sock, &rfds)) continue;
 
-        int space = MIPLAY_RX_BUF_LEN - buf_used;
+        int space = buf_cap - buf_used;
         if (space <= 0) {
             ESP_LOGW(TAG, "RX buffer full (%d bytes), discarding", buf_used);
             buf_used = 0;
@@ -3289,7 +3299,31 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
                 buf_used -= skip;
                 continue;
             }
-            if (buf_used < (int)total) break;  /* 等待更多数据 */
+            if (buf_used < (int)total) {
+                /* 大帧（如 27KB 封面 SetMediaInfo）超过常驻缓冲：临时扩容 PSRAM
+                 * 缓冲继续收齐整帧。堆分配用完即释放，不常驻，规避历史教训
+                 * "永久扩 RX 缓冲导致断联"。上限已在 plen 检查处卡死 64KB。 */
+                if ((int)total > buf_cap) {
+                    int new_cap = (int)total;
+                    if (new_cap > (int)(MIPLAY_MAX_FRAME_PAYLOAD + MIPLAY_FRAME_HDR_LEN))
+                        new_cap = (int)(MIPLAY_MAX_FRAME_PAYLOAD + MIPLAY_FRAME_HDR_LEN);
+                    uint8_t *big = heap_caps_malloc(new_cap, MALLOC_CAP_SPIRAM);
+                    if (!big) {
+                        /* PSRAM 暂时不足：丢弃已收部分，按 skip-to-magic 自恢复 */
+                        ESP_LOGW(TAG, "Big-frame alloc %d failed, resync", new_cap);
+                        memmove(buf, buf + 1, buf_used - 1);
+                        buf_used--;
+                        continue;
+                    }
+                    memcpy(big, buf, buf_used);
+                    heap_caps_free(buf);
+                    buf = big;
+                    buf_cap = new_cap;
+                    ESP_LOGI(TAG, "RX buffer grown to %d for frame len=%lu", new_cap,
+                             (unsigned long)plen);
+                }
+                break;  /* 等待更多数据 */
+            }
 
             const uint8_t *payload = buf + MIPLAY_FRAME_HDR_LEN;
             ESP_LOGI(TAG, "RX cmd=0x%04X seq=%u len=%lu outer=0x%02X%s",
@@ -3306,10 +3340,12 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
             if (s_has_session_key && plen >= 9 &&
                 payload[0] == 0x00 && payload[1] == 0x07 &&
                 payload[2] == 0x01 && payload[3] == 0xE0) {
-                dec_buf = heap_caps_malloc(1024, MALLOC_CAP_SPIRAM);
+                /* 输出缓冲按密文长度动态分配（9B 头 + AES 块余量）：
+                 * 27KB 封面帧解密后 pt ~27KB，固定 1024 会被 safety_decrypt 拒收。 */
+                dec_buf = heap_caps_malloc(plen + AES_BLOCK_LEN, MALLOC_CAP_SPIRAM);
                 if (dec_buf) {
                     dec_len = safety_decrypt(payload, plen, s_aes_key, s_decrypt_iv,
-                                             dec_buf, 1024);
+                                             dec_buf, plen + AES_BLOCK_LEN);
                     if (dec_len >= 0) {
                         was_encrypted = true;
                         payload = dec_buf;
