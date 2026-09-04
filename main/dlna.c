@@ -1053,12 +1053,15 @@ static void np_on_meta_changed(const np_meta_t *meta)
         lvgl_port_unlock();
     }
 
-    /* 歌词：仅 DLNA + 网易云源（歌词源是网易云 API，MiPlay 无对应来源） */
-    if (meta->source == NP_SRC_DLNA && custom_dlna_get_music_source() == MUSIC_SRC_NETEASE) {
-        if (meta->title[0] && s_music_id) {
+    /* 歌词：DLNA 与 MiPlay 源均触发（多源回退已支持任意歌曲）
+     * MiPlay 源强制 songId=0：s_music_id 是 DLNA metadata 的网易云 ID，
+     * 不随 MiPlay 接管清零，直接传会导致拉到上次 DLNA 歌曲的歌词 */
+    if (meta->source == NP_SRC_DLNA || meta->source == NP_SRC_MIPLAY) {
+        if (meta->title[0]) {
+            unsigned long lyric_id = (meta->source == NP_SRC_DLNA) ? s_music_id : 0;
             ESP_LOGI(TAG, "NP lyrics_fetch: %s - %s (songId=%lu)",
-                     meta->title, meta->artist, s_music_id);
-            lyrics_fetch_async(meta->title, meta->artist, (int)s_music_id);
+                     meta->title, meta->artist, lyric_id);
+            lyrics_fetch_async(meta->title, meta->artist, lyric_id);
         }
     }
 }
@@ -1423,16 +1426,18 @@ static void album_art_task(void *arg)
 
     if (img_data[0] == 0xFF && img_data[1] == 0xD8) {
         /* ====== JPEG 解码（esp_new_jpeg，支持 progressive） ====== */
+        /* scale 限制解码输出 ≤ 384×384（= 48×8），避免大图全尺寸解码耗尽 PSRAM。
+         * esp_new_jpeg 要求 scale 值为 8 的倍数，最大缩放比 1/8。 */
         jpeg_dec_config_t dec_cfg = DEFAULT_JPEG_DEC_CONFIG();
         dec_cfg.output_type = JPEG_PIXEL_FORMAT_RGB565_LE;  /* 小端序，CPU 直接读 */
+        dec_cfg.scale.width  = 384;
+        dec_cfg.scale.height = 384;
         jpeg_dec_handle_t jpeg_dec = NULL;
         jpeg_error_t jerr = jpeg_dec_open(&dec_cfg, &jpeg_dec);
         if (jerr != JPEG_ERR_OK) {
             ESP_LOGW(TAG, "JPEG open failed: %d", jerr);
             heap_caps_free(img_data); heap_caps_free(url); continue;
         }
-
-        /* 直接解码全尺寸（DEFAULT_JPEG_DEC_CONFIG 已禁用 scale） */
 
         jpeg_dec_io_t io = { .inbuf = img_data, .inbuf_len = img_len };
         jpeg_dec_header_info_t info;
@@ -1517,6 +1522,18 @@ static void album_art_task(void *arg)
     } else if (img_data[0] == 0x89 && img_data[1] == 0x50) {
         /* ====== PNG 解码（lodepng） ====== */
         unsigned png_w = 0, png_h = 0;
+        /* 尺寸预检：lodepng_decode24 分配 w*h*3 字节，大图会耗尽 PSRAM */
+        {
+            unsigned insp_err = lodepng_inspect(&png_w, &png_h, NULL, img_data, img_len);
+            if (insp_err || png_w <= 1 || png_h <= 1) {
+                ESP_LOGW(TAG, "PNG header invalid: %u", insp_err);
+                heap_caps_free(img_data); heap_caps_free(url); continue;
+            }
+        }
+        if (png_w > 512 || png_h > 512) {
+            ESP_LOGW(TAG, "PNG too large: %ux%u, skip (max 512)", png_w, png_h);
+            heap_caps_free(img_data); heap_caps_free(url); continue;
+        }
         uint8_t *png_rgb = NULL;
         /* 用 RGB（3 字节/像素）而非 RGBA，省 25% 内存 */
         unsigned err = lodepng_decode24(&png_rgb, &png_w, &png_h, img_data, img_len);
@@ -1574,11 +1591,20 @@ static void album_art_task(void *arg)
                img_len >= 12 &&
                img_data[8] == 'W' && img_data[9] == 'E' && img_data[10] == 'B' && img_data[11] == 'P') {
         /* ====== WebP 解码（libwebp WebPDecodeRGB → RGB888，对齐 dlna-esp32-master） ====== */
+        /* 尺寸预检：WebPDecodeRGB 分配 w*h*3 字节 PSRAM，大图会耗尽内存 */
         int webp_w = 0, webp_h = 0;
+        if (!WebPGetInfo(img_data, (size_t)img_len, &webp_w, &webp_h) ||
+            webp_w <= 1 || webp_h <= 1) {
+            ESP_LOGW(TAG, "WebP header invalid");
+            heap_caps_free(img_data); heap_caps_free(url); continue;
+        }
+        if (webp_w > 512 || webp_h > 512) {
+            ESP_LOGW(TAG, "WebP too large: %dx%d, skip (max 512)", webp_w, webp_h);
+            heap_caps_free(img_data); heap_caps_free(url); continue;
+        }
         uint8_t *webp_rgb = WebPDecodeRGB(img_data, (size_t)img_len, &webp_w, &webp_h);
-        if (!webp_rgb || webp_w <= 1 || webp_h <= 1) {
+        if (!webp_rgb) {
             ESP_LOGW(TAG, "WebP decode failed: %dx%d bytes=%d", webp_w, webp_h, img_len);
-            if (webp_rgb) WebPFree(webp_rgb);
             heap_caps_free(img_data);
             heap_caps_free(url);
             continue;

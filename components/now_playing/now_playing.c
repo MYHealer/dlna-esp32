@@ -19,7 +19,7 @@ static const char *TAG = "NP";
 /* ── 存储 ── */
 static np_meta_t        s_meta;
 /* cover 源缓冲：动态 PSRAM 分配（base64 封面可达几十 KB，不占内部 SRAM 挤爆 I2S DMA） */
-#define NP_COVER_MAX 49152
+#define NP_COVER_MAX 65536
 static char            *s_cover_url = NULL;
 static np_source_t      s_source = NP_SRC_NONE;
 static uint32_t         s_epoch  = 0;

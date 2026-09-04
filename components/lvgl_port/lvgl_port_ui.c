@@ -437,7 +437,9 @@ void lvgl_port_ui_set_state(int state) {
 }
 void lvgl_port_ui_set_volume(int vol) { (void)vol; }
 
-/* ====== 生成预抖动渐变背景（Bayer 4×4 有序抖动，消除 RGB565 色阶） ====== */
+/* ====== 生成预抖动渐变背景（8×8 Bayer 有序抖动，消除 RGB565 色阶） ======
+ * 4×4 Bayer 在深色渐变上产生规则十字网格纹理（视觉"灰阶感"）；
+ * 8×8 周期更长、图案更细腻，深色区过渡明显更平滑。 */
 static void _generate_dithered_bg(uint8_t r_top, uint8_t g_top, uint8_t b_top,
                                    uint8_t r_bot, uint8_t g_bot, uint8_t b_bot)
 {
@@ -464,12 +466,16 @@ static void _generate_dithered_bg(uint8_t r_top, uint8_t g_top, uint8_t b_top,
 
     uint16_t *buf = (uint16_t *)s_bg_dsc->data;
 
-    /* 4x4 Bayer 矩阵 */
-    static const uint8_t bayer[16] = {
-         0,  8,  2, 10,
-        12,  4, 14,  6,
-         3, 11,  1,  9,
-        15,  7, 13,  5
+    /* 8x8 Bayer 矩阵（递归构造，值域 0-63） */
+    static const uint8_t bayer[64] = {
+         0, 32,  8, 40,  2, 34, 10, 42,
+        48, 16, 56, 24, 50, 18, 58, 26,
+        12, 44,  4, 36, 14, 46,  6, 38,
+        60, 28, 52, 20, 62, 30, 54, 22,
+         3, 35, 11, 43,  1, 33,  9, 41,
+        51, 19, 59, 27, 49, 17, 57, 25,
+        15, 47,  7, 39, 13, 45,  5, 37,
+        63, 31, 55, 23, 61, 29, 53, 21
     };
 
     for (int y = 0; y < H; y++) {
@@ -478,12 +484,14 @@ static void _generate_dithered_bg(uint8_t r_top, uint8_t g_top, uint8_t b_top,
         int b8 = b_top + ((int)b_bot - b_top) * y / (H - 1);
 
         for (int x = 0; x < W; x++) {
-            int t = bayer[(y & 3) * 4 + (x & 3)];
+            int t = bayer[(y & 7) * 8 + (x & 7)];   /* t ∈ [0,63] */
 
-            /* 有序抖动量化到 RGB565 */
-            int r5 = (r8 * 31 + t * 2 + 128) / 256;
-            int g6 = (g8 * 63 + t * 4 + 128) / 256;
-            int b5 = (b8 * 31 + t * 2 + 128) / 256;
+            /* 标准有序抖动: out = floor(value + t/64)
+             * 整数化: r5 = floor(r8*31/256 + t/64) = (r8*31*64 + t*256) / (256*64)
+             * 效果: 量化值在 floor/ceil 两级间按小数比例切换，8×8 阈值铺开消除色阶 */
+            int r5 = (r8 * 31 * 64 + t * 256) / (256 * 64);
+            int g6 = (g8 * 63 * 64 + t * 256) / (256 * 64);
+            int b5 = (b8 * 31 * 64 + t * 256) / (256 * 64);
 
             if (r5 < 0) r5 = 0; else if (r5 > 31) r5 = 31;
             if (g6 < 0) g6 = 0; else if (g6 > 63) g6 = 63;

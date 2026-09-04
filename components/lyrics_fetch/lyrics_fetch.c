@@ -1,8 +1,8 @@
 /*
- * 网易云歌词获取 — ESP32 直接调网易云音乐 API
+ * 多源歌词获取 — 网易云 → QQ 音乐 → 酷我 回退链
  *
- * 流程：歌名+歌手 → 搜索拿 songId → 获取 LRC 歌词 → 解析时间戳
- * 使用 esp_http_client + jsmn JSON 解析
+ * 流程：歌名+歌手 → 依次尝试三源 → LRC 可用性校验 → 解析时间戳
+ * 网易云: jsmn JSON 解析; QQ/酷我: 轻量字符串提取
  */
 
 #include "lyrics_fetch.h"
@@ -11,6 +11,7 @@
 #include "esp_tls.h"
 #include "esp_heap_caps.h"
 #include "jsmn.h"
+#include "mbedtls/base64.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -39,6 +40,7 @@ static int  s_lrc_to_klyric[LYRIC_MAX_LINES];   /* LRC行 → klyric行 映射�
 #define LYRIC_TASK_STACK_SIZE  8192
 static StackType_t *s_task_stack;
 static StaticTask_t s_task_tcb;
+static TaskHandle_t s_dead_task;   /* 上一轮已退出待回收的 task，判 eDeleted 用 */
 
 /* ── klyric 解析前向声明 ── */
 static void parse_klyric(const char *klyric_text);
@@ -93,9 +95,10 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
-/* ── HTTP GET/POST，返回响应体（调用方 free）── */
+/* ── HTTP GET/POST，返回响应体（调用方 free）；referer 可为 NULL ── */
 static char *http_request(const char *url, const char *post_data,
-                          const char *content_type, int buf_size)
+                          const char *content_type, int buf_size,
+                          const char *referer)
 {
     char *buf = malloc(buf_size);
     if (!buf) return NULL;
@@ -116,7 +119,8 @@ static char *http_request(const char *url, const char *post_data,
 
     esp_http_client_set_header(client, "User-Agent",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120");
-    esp_http_client_set_header(client, "Referer", "https://music.163.com");
+    esp_http_client_set_header(client, "Referer",
+        referer ? referer : "https://music.163.com");
 
     esp_err_t err;
     if (post_data) {
@@ -217,7 +221,7 @@ static unsigned long search_song(const char *title, const char *artist)
 
     char *resp = http_request("http://music.163.com/api/search/get",
                               post_data, "application/x-www-form-urlencoded",
-                              HTTP_SEARCH_BUF);
+                              HTTP_SEARCH_BUF, NULL);
     if (!resp) {
         ESP_LOGW(TAG, "search_song: HTTP request failed");
         return 0;
@@ -368,7 +372,7 @@ static char *fetch_lrc(unsigned long song_id)
     snprintf(url, sizeof(url),
              "http://music.163.com/api/song/lyric?id=%lu&lv=-1&kv=-1&tv=-1&yv=-1", song_id);
 
-    char *resp = http_request(url, NULL, NULL, HTTP_LYRIC_BUF);
+    char *resp = http_request(url, NULL, NULL, HTTP_LYRIC_BUF, NULL);
     if (!resp) {
         ESP_LOGW(TAG, "fetch_lrc: HTTP request failed for song_id=%lu", song_id);
         return NULL;
@@ -680,6 +684,407 @@ static void parse_klyric(const char *klyric_text)
 }
 
 /* ── 后台获取任务 ── */
+
+/* ══════════ 多源回退：通用辅助 ══════════ */
+
+/* ── 标题清洗：截掉括号后缀，提高搜索命中率 ──
+ * 手机推送的标题常带翻译/说明: "君の笑顔... (你的笑颜是最爱)"、"歌名 (Live)"。
+ * 后缀噪音会让搜索 miss；截掉括号保留主标题。 */
+static void clean_title_for_search(const char *src, char *dst, int dst_size)
+{
+    int cut = -1;
+    for (int i = 0; src[i]; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (c == '(') { cut = i; break; }
+        /* 全角左括号 （ = U+FF08 = EF BC 88 */
+        if (c == 0xEF && (unsigned char)src[i + 1] == 0xBC &&
+            (unsigned char)src[i + 2] == 0x88) {
+            cut = i; break;
+        }
+    }
+    if (cut < 0) {
+        snprintf(dst, dst_size, "%s", src);
+        return;
+    }
+    while (cut > 0 && src[cut - 1] == ' ') cut--;   /* 去尾随空格 */
+    if (cut > dst_size - 1) cut = dst_size - 1;
+    memcpy(dst, src, cut);
+    dst[cut] = '\0';
+}
+
+static int hex_val(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* ── 轻量 JSON 字符串提取 + 标准转义还原（调用方 free；找不到返回 NULL）──
+ * QQ/酷我接口字段浅且无嵌套同名 key，字符串扫描足够；比 jsmn 省 token 数组 */
+static char *json_extract_string_alloc(const char *json, const char *key)
+{
+    if (!json || !key) return NULL;
+    char pat[48];
+    snprintf(pat, sizeof(pat), "\"%s\":\"", key);
+    const char *p = strstr(json, pat);
+    if (!p) {
+        /* 宽松匹配: "key": " "（带空格） */
+        snprintf(pat, sizeof(pat), "\"%s\": \"", key);
+        p = strstr(json, pat);
+    }
+    if (!p) return NULL;
+    p += strlen(pat);
+
+    /* 计算值长度（处理 \" 转义） */
+    int len = 0;
+    while (p[len] && p[len] != '"') {
+        if (p[len] == '\\' && p[len + 1]) len++;
+        len++;
+    }
+    if (len == 0) return NULL;
+
+    char *out = malloc(len + 1);
+    if (!out) return NULL;
+    int j = 0;
+    for (int i = 0; i < len; i++) {
+        if (p[i] == '\\' && i + 1 < len) {
+            char c = p[i + 1];
+            if (c == 'n') { out[j++] = '\n'; i++; }
+            else if (c == 'r') { out[j++] = '\r'; i++; }
+            else if (c == 't') { out[j++] = '\t'; i++; }
+            else if (c == '"') { out[j++] = '"'; i++; }
+            else if (c == '\\') { out[j++] = '\\'; i++; }
+            else if (c == '/') { out[j++] = '/'; i++; }
+            else if (c == 'u' && i + 4 < len) {
+                int cp = 0;
+                bool ok = true;
+                for (int k = 1; k <= 4; k++) {
+                    int hv = hex_val(p[i + 1 + k]);
+                    if (hv < 0) { ok = false; break; }
+                    cp = cp * 16 + hv;
+                }
+                if (ok) {
+                    i += 5;
+                    /* BMP → UTF-8（代理对/非BMP 歌词场景极少，忽略） */
+                    if (cp < 0x80) out[j++] = (char)cp;
+                    else if (cp < 0x800) {
+                        out[j++] = (char)(0xC0 | (cp >> 6));
+                        out[j++] = (char)(0x80 | (cp & 0x3F));
+                    } else {
+                        out[j++] = (char)(0xE0 | (cp >> 12));
+                        out[j++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                        out[j++] = (char)(0x80 | (cp & 0x3F));
+                    }
+                } else {
+                    out[j++] = p[i];
+                }
+            } else {
+                out[j++] = p[i];
+            }
+        } else {
+            out[j++] = p[i];
+        }
+    }
+    out[j] = '\0';
+    return out;
+}
+
+/* ── base64 解码（调用方 free，结果以 NUL 结尾）── */
+static char *base64_decode_alloc(const char *src)
+{
+    if (!src) return NULL;
+    size_t slen = strlen(src);
+    if (slen == 0) return NULL;
+
+    size_t dlen = 0;
+    /* 尺寸查询：dst=NULL 时返回所需长度（非法字符时 dlen 保持 0） */
+    mbedtls_base64_decode(NULL, 0, &dlen, (const unsigned char *)src, slen);
+    if (dlen == 0) return NULL;
+
+    unsigned char *out = malloc(dlen + 1);
+    if (!out) return NULL;
+
+    size_t olen = 0;
+    int ret = mbedtls_base64_decode(out, dlen, &olen,
+                                    (const unsigned char *)src, slen);
+    if (ret != 0 || olen == 0) {
+        free(out);
+        return NULL;
+    }
+    out[olen] = '\0';
+    return (char *)out;
+}
+
+/* ── LRC 可用性校验：≥2 个时间戳 + 排除占位文本 ── */
+static bool lrc_usable(const char *lrc)
+{
+    if (!lrc) return false;
+
+    int stamps = 0;
+    for (const char *p = lrc; *p; p++) {
+        if (*p == '[' && p[1] >= '0' && p[1] <= '9') {
+            int mm = 0, ss = 0;
+            if (sscanf(p, "[%d:%d]", &mm, &ss) == 2) {
+                stamps++;
+                p += 2;
+            }
+        }
+    }
+    if (stamps < 2) return false;
+
+    static const char *placeholders[] = {
+        "纯音乐", "暂无歌词", "暂无歌词!", "没有填词", "没有歌词",
+        "nolyric", "No lyrics", "此歌曲为没有填词的纯音乐", NULL
+    };
+    for (int i = 0; placeholders[i]; i++) {
+        if (strstr(lrc, placeholders[i])) return false;
+    }
+    return true;
+}
+
+/* ── 歌词载荷归一化：已是 LRC 直接返回，否则尝试 base64 解码（调用方 free）── */
+static char *normalize_lyric_payload(char *raw)
+{
+    if (!raw) return NULL;
+    if (lrc_usable(raw)) return raw;
+
+    char *dec = base64_decode_alloc(raw);
+    free(raw);
+    if (dec && lrc_usable(dec)) return dec;
+    free(dec);
+    return NULL;
+}
+
+/* ══════════ QQ 音乐源 ══════════ */
+
+/* ── QQ 音乐搜索+获取歌词（返回 LRC，调用方 free）──
+ * 注：用 HTTP 而非 HTTPS — MiPlay 播放中内部 RAM 紧张，mbedtls TLS 上下文
+ * 分配失败（esp-aes: Failed to allocate memory）；HTTP 可绕开。 */
+static char *fetch_lrc_qq(const char *title, const char *artist)
+{
+    char clean[64];
+    clean_title_for_search(title, clean, sizeof(clean));
+
+    char keyword[128];
+    snprintf(keyword, sizeof(keyword), "%s %s", clean, artist);
+    char encoded[256];
+    url_encode(keyword, encoded, sizeof(encoded));
+
+    /* 1. 搜索拿 songmid */
+    char url[384];
+    snprintf(url, sizeof(url),
+             "http://c.y.qq.com/soso/fcgi-bin/client_search_cp?w=%s&format=json&n=1",
+             encoded);
+    char *resp = http_request(url, NULL, NULL, HTTP_SEARCH_BUF, "https://y.qq.com");
+    if (!resp) {
+        ESP_LOGW(TAG, "qq search: HTTP failed");
+        return NULL;
+    }
+
+    char *songmid = json_extract_string_alloc(resp, "songmid");
+    free(resp);
+    if (!songmid || !songmid[0]) {
+        ESP_LOGW(TAG, "qq search: no songmid");
+        free(songmid);
+        return NULL;
+    }
+    ESP_LOGI(TAG, "qq: songmid=%s", songmid);
+
+    /* 2. 获取歌词 */
+    snprintf(url, sizeof(url),
+             "http://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg?songmid=%s&format=json&nobase64=1",
+             songmid);
+    free(songmid);
+
+    resp = http_request(url, NULL, NULL, HTTP_LYRIC_BUF, "https://y.qq.com");
+    if (!resp) {
+        ESP_LOGW(TAG, "qq lyric: HTTP failed");
+        return NULL;
+    }
+
+    char *raw = json_extract_string_alloc(resp, "lyric");
+    free(resp);
+    if (!raw) {
+        ESP_LOGW(TAG, "qq lyric: no lyric field");
+        return NULL;
+    }
+
+    /* nobase64=1 有时仍返回 base64，normalize 兜底 */
+    char *lrc = normalize_lyric_payload(raw);
+    if (lrc) {
+        ESP_LOGI(TAG, "qq: LRC ok (%d bytes)", (int)strlen(lrc));
+    } else {
+        ESP_LOGW(TAG, "qq: LRC unusable");
+    }
+    return lrc;
+}
+
+/* ══════════ 酷我源 ══════════ */
+
+/* ── 酷我 lrclist JSON → LRC 文本（调用方 free）──
+ * 输入形如: {"lrclist":[{"timeA":"00:20.53","lineTxt":"..."},...]} */
+static char *kuwo_lrclist_to_lrc(const char *json)
+{
+    const char *arr = strstr(json, "\"lrclist\"");
+    if (!arr) return NULL;
+
+    /* 粗略容量：每行预留 96 字节 */
+    int cap = 96 * LYRIC_MAX_LINES;
+    char *out = malloc(cap);
+    if (!out) return NULL;
+    int oi = 0;
+
+    const char *p = arr;
+    while ((p = strstr(p, "\"timeA\"")) != NULL && oi < cap - 128) {
+        const char *ta = strstr(p, ":");
+        if (!ta) break;
+        ta++;
+        while (*ta == ' ' || *ta == '"') ta++;
+        char time_str[16] = {0};
+        int ti = 0;
+        while (*ta && *ta != '"' && ti < 15) time_str[ti++] = *ta++;
+        time_str[ti] = '\0';
+
+        const char *lt = strstr(ta, "\"lineTxt\"");
+        const char *next_time = strstr(ta, "\"timeA\"");
+        if (!lt || (next_time && lt > next_time)) { p = ta; continue; }
+        lt = strstr(lt, ":");
+        if (!lt) break;
+        lt++;
+        while (*lt == ' ' || *lt == '"') lt++;
+
+        oi += snprintf(out + oi, cap - oi, "[%s]", time_str);
+        while (*lt && *lt != '"' && oi < cap - 4) {
+            if (*lt == '\\' && lt[1]) { lt++; }
+            out[oi++] = *lt++;
+        }
+        out[oi++] = '\n';
+        p = lt;
+    }
+
+    if (oi == 0) { free(out); return NULL; }
+    out[oi] = '\0';
+    return out;
+}
+
+/* ── 酷我搜索+获取歌词（返回 LRC，调用方 free）── */
+static char *fetch_lrc_kuwo(const char *title, const char *artist)
+{
+    char clean[64];
+    clean_title_for_search(title, clean, sizeof(clean));
+
+    char keyword[128];
+    snprintf(keyword, sizeof(keyword), "%s %s", clean, artist);
+    char encoded[256];
+    url_encode(keyword, encoded, sizeof(encoded));
+
+    /* 1. 搜索拿 MUSICRID（形如 "MUSIC_123456"） */
+    char url[384];
+    snprintf(url, sizeof(url),
+             "http://search.kuwo.cn/r.s?all=%s&ft=music&rformat=json&encoding=utf8&rn=1",
+             encoded);
+    char *resp = http_request(url, NULL, NULL, HTTP_SEARCH_BUF, NULL);
+    if (!resp) {
+        ESP_LOGW(TAG, "kuwo search: HTTP failed");
+        return NULL;
+    }
+
+    const char *mp = strstr(resp, "MUSIC_");
+    unsigned long music_id = 0;
+    if (mp) {
+        music_id = strtoul(mp + 6, NULL, 10);
+    }
+    free(resp);
+    if (music_id == 0) {
+        ESP_LOGW(TAG, "kuwo search: no MUSICRID");
+        return NULL;
+    }
+    ESP_LOGI(TAG, "kuwo: musicId=%lu", music_id);
+
+    /* 2. 获取歌词 */
+    snprintf(url, sizeof(url),
+             "http://m.kuwo.cn/newh5/singles/songinfoandlrc?musicId=%lu",
+             music_id);
+    resp = http_request(url, NULL, NULL, HTTP_LYRIC_BUF, NULL);
+    if (!resp) {
+        ESP_LOGW(TAG, "kuwo lyric: HTTP failed");
+        return NULL;
+    }
+
+    char *lrc = kuwo_lrclist_to_lrc(resp);
+    if (!lrc) {
+        /* 诊断：lrclist 缺失时打出响应头部，区分"无歌词"与"接口变了" */
+        ESP_LOGW(TAG, "kuwo: no lrclist, resp head: %.120s", resp);
+    }
+    free(resp);
+    if (lrc && lrc_usable(lrc)) {
+        ESP_LOGI(TAG, "kuwo: LRC ok (%d bytes)", (int)strlen(lrc));
+        return lrc;
+    }
+    free(lrc);
+    ESP_LOGW(TAG, "kuwo: LRC unusable");
+    return NULL;
+}
+
+/* ══════════ 应用歌词（解析 + klyric 映射）══════════ */
+
+/* ── 校验通过的 LRC 应用到数据区（锁内）── */
+static void apply_lrc(const char *lrc, lyric_data_t *data)
+{
+    parse_lrc(lrc, data);
+    if (s_klyric_count == 0 && data->count > 0) {
+        generate_pseudo_klyric(data);
+    }
+    /* 构建 LRC行 → klyric行 映射 */
+    memset(s_lrc_to_klyric, -1, sizeof(s_lrc_to_klyric));
+    if (s_klyric_line_count > 0 && data->count > 0) {
+        int ki = 0;
+        for (int li = 0; li < data->count; li++) {
+            int lrc_time = data->lines[li].time_ms;
+            while (ki < s_klyric_line_count - 1 &&
+                   abs(s_klyric_line_time[ki + 1] - lrc_time) < abs(s_klyric_line_time[ki] - lrc_time)) {
+                ki++;
+            }
+            if (ki < s_klyric_line_count && abs(s_klyric_line_time[ki] - lrc_time) <= 100) {
+                s_lrc_to_klyric[li] = ki;
+            }
+        }
+    }
+}
+
+/* ══════════ 后台获取任务 ══════════ */
+
+/* ── 三源回退获取（网易云 → QQ → 酷我），返回可用 LRC（调用方 free）── */
+static char *fetch_lrc_multisource(const char *title, const char *artist,
+                                   unsigned long known_id)
+{
+    /* 网易云（有 known_id 时免搜索）；搜索时用清洗后标题 */
+    unsigned long netease_id = known_id;
+    if (netease_id == 0) {
+        char clean[64];
+        clean_title_for_search(title, clean, sizeof(clean));
+        netease_id = search_song(clean, artist);
+    }
+    if (netease_id > 0) {
+        char *lrc = fetch_lrc(netease_id);
+        if (lrc && lrc_usable(lrc)) return lrc;
+        free(lrc);
+        ESP_LOGW(TAG, "netease unusable, falling back to QQ");
+    } else {
+        ESP_LOGW(TAG, "netease search miss, falling back to QQ");
+    }
+
+    /* 源2: QQ 音乐 */
+    char *lrc = fetch_lrc_qq(title, artist);
+    if (lrc) return lrc;
+
+    /* 源3: 酷我 */
+    ESP_LOGW(TAG, "qq unusable, falling back to kuwo");
+    return fetch_lrc_kuwo(title, artist);
+}
+
+/* ── 后台获取任务 ── */
 static void fetch_task(void *arg)
 {
     lyric_data_t *data = &s_lyric_data;
@@ -698,48 +1103,25 @@ static void fetch_task(void *arg)
         ESP_LOGI(TAG, "Using known songId=%lu for: %s - %s", song_id, title, artist);
     } else {
         ESP_LOGI(TAG, "Searching lyrics: %s - %s", title, artist);
-        song_id = search_song(title, artist);
-        if (song_id == 0) {
-            ESP_LOGW(TAG, "Song not found");
-            goto done;
-        }
     }
 
-    /* 步骤2：获取 LRC */
-    char *lrc = fetch_lrc(song_id);
+    /* 步骤1-2：三源回退获取可用 LRC（网易云→QQ→酷我） */
+    char *lrc = fetch_lrc_multisource(title, artist, known_id);
     if (!lrc) {
-        ESP_LOGW(TAG, "No lyrics available");
+        ESP_LOGW(TAG, "No lyrics available from any source");
         goto done;
     }
 
-    /* 步骤3：解析 LRC */
+    /* 步骤3：解析 LRC（含伪逐字生成 + 行映射） */
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    parse_lrc(lrc, data);
-    /* 步骤3.5：无逐字数据时，从 LRC 生成近似逐字时间戳 */
-    if (s_klyric_count == 0 && data->count > 0) {
-        generate_pseudo_klyric(data);
-    }
-    /* 步骤3.6：构建 LRC行 → klyric行 映射 */
-    memset(s_lrc_to_klyric, -1, sizeof(s_lrc_to_klyric));
-    if (s_klyric_line_count > 0 && data->count > 0) {
-        int ki = 0;
-        for (int li = 0; li < data->count; li++) {
-            int lrc_time = data->lines[li].time_ms;
-            /* 找最匹配的 klyric 行 */
-            while (ki < s_klyric_line_count - 1 &&
-                   abs(s_klyric_line_time[ki + 1] - lrc_time) < abs(s_klyric_line_time[ki] - lrc_time)) {
-                ki++;
-            }
-            if (ki < s_klyric_line_count && abs(s_klyric_line_time[ki] - lrc_time) <= 100) {
-                s_lrc_to_klyric[li] = ki;
-            }
-        }
-    }
+    apply_lrc(lrc, data);
     xSemaphoreGive(s_mutex);
 
     free(lrc);
 
 done:
+    /* 保存句柄供下一轮判活（s_fetch_task 置 NULL 是允许新请求的信号） */
+    s_dead_task = s_fetch_task;
     s_fetch_task = NULL;
     vTaskDelete(NULL);
 }
@@ -794,6 +1176,18 @@ void lyrics_fetch_async(const char *title, const char *artist, unsigned long son
             return;
         }
         ESP_LOGI(TAG, "Task stack allocated from PSRAM: %u bytes", (unsigned)LYRIC_TASK_STACK_SIZE);
+    }
+
+    /* 关键：等待旧 fetch task 真正被回收后再复用静态栈/TCB。
+     * vTaskDelete(NULL) 是异步的——task 要等 idle task 跑回收后才变 eDeleted。
+     * 若立即重建，新 task 与旧 task 残骸共用同一块栈 → 栈内容被踩 →
+     * 堆元数据损坏 → tlsf assert 随机崩溃（实测切歌后第二次投歌触发）。
+     * 判据同 miplay.c:3522：eTaskGetState(old) == eDeleted。 */
+    if (s_dead_task) {
+        for (int wt = 0; wt < 200 && eTaskGetState(s_dead_task) != eDeleted; wt++) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        s_dead_task = NULL;
     }
 
     s_fetch_task = xTaskCreateStaticPinnedToCore(

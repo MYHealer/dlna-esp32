@@ -12,6 +12,9 @@
 #include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"  /* vTaskDeleteWithCaps — WithCaps 任务自删除必须用这个,
+                                      * 普通 vTaskDelete(NULL) 会永久泄漏 PSRAM 栈+TCB
+                                      * (每次投歌 ~188KB, N 次后 PSRAM 耗尽随机崩溃) */
 #include "freertos/ringbuf.h"
 #include "esp_log.h"
 #include "esp_attr.h"
@@ -667,7 +670,7 @@ static void miplay_lan_task(void *arg)
     if (s_lan_sock < 0) {
         ESP_LOGE(TAG, "LAN UDP socket failed: %d", errno);
         s_lan_task = NULL;
-        vTaskDelete(NULL);
+        vTaskDeleteWithCaps(NULL);
         return;
     }
     int reuse = 1;
@@ -682,7 +685,7 @@ static void miplay_lan_task(void *arg)
         ESP_LOGE(TAG, "LAN bind failed: %d", errno);
         close(s_lan_sock); s_lan_sock = -1;
         s_lan_task = NULL;
-        vTaskDelete(NULL);
+        vTaskDeleteWithCaps(NULL);
         return;
     }
 
@@ -759,7 +762,7 @@ static void miplay_lan_task(void *arg)
     close(s_lan_sock);
     s_lan_sock = -1;
     s_lan_task = NULL;
-    vTaskDelete(NULL);
+    vTaskDeleteWithCaps(NULL);
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -1555,7 +1558,7 @@ static void image_drain_task(void *arg)
     close(sock);
     ESP_LOGI(TAG, "[RTSP] image_drain done (drained=%lu, idle=%lus)",
              (unsigned long)drained, (unsigned long)idle);
-    vTaskDelete(NULL);
+    vTaskDeleteWithCaps(NULL);
 }
 
 /* 读取一个完整的 RTSP 消息（请求或响应）
@@ -1940,7 +1943,7 @@ static void miplay_rtsp_task_wrapper(void *arg)
     free(a);
     s_rtsp_task = NULL;
     ESP_LOGI(TAG, "[RTSP-task] Done");
-    vTaskDelete(NULL);
+    vTaskDeleteWithCaps(NULL);
 }
 
 /* ── TS demux + PES 解密辅助 ── */
@@ -2056,7 +2059,7 @@ static void media_receive_task(void *arg)
     if (!rtp_buf) {
         ESP_LOGE(TAG, "[MEDIA] alloc failed");
         close(media_sock);
-        vTaskDelete(NULL); return;
+        vTaskDeleteWithCaps(NULL); return;
     }
 
     /* 对齐参考: SO_RCVBUF 增大接收窗口 + SO_RCVTIMEO 100ms */
@@ -2191,7 +2194,7 @@ m_cleanup:
     ESP_LOGI(TAG, "[MEDIA] Task ended, %lu pkts, %luKB rtp, %luKB ts",
              (unsigned long)pkt_count, (unsigned long)(rtp_total / 1024),
              (unsigned long)(ts_total / 1024));
-    vTaskDelete(NULL);
+    vTaskDeleteWithCaps(NULL);
 }
 
 /* 统一事件循环：控制通道 + RTSP + 媒体
@@ -3046,63 +3049,70 @@ static char *parse_media_info(const uint8_t *payload, size_t plen)
         }
     }
 
-    /* cover — 对齐参考: 单次 PSRAM 分配（带内部 SRAM 回退），
-     * 不再先写 49KB 全局缓冲再拷一份，避免双份 49KB 导致分配失败封面静默丢失。 */
+    /* cover — PSRAM 动态分配提取缓冲，避免静态 48KB 缓冲截断大 base64 封面。
+     * 实测 "英雄之诗" mArt base64 ≈ 55KB，溢出 s_media_cover_url[48KB] 导致
+     * json_copy_unescaped 丢失闭合引号、返回 -1、封面静默丢失。 */
     s_media_cover_url[0] = '\0';
-    if (parse_field_unescaped(p_src, p_len, cover_keys,
-                              s_media_cover_url, sizeof(s_media_cover_url)) && s_media_cover_url[0]) {
-        size_t bl = strlen(s_media_cover_url);
-        pending_cover = (char *)miplay_psram_prefer_alloc(bl + 1);
-        if (pending_cover) {
-            memcpy(pending_cover, s_media_cover_url, bl + 1);
-            ESP_LOGI(TAG, "[META] cover extracted len=%u head=%.60s",
-                     (unsigned)bl, pending_cover);
-        } else {
-            ESP_LOGW(TAG, "[META] cover alloc %u failed, cover dropped", (unsigned)(bl + 1));
-        }
-    } else {
-        ESP_LOGI(TAG, "[META] no cover field matched (keys tried: mCoverUrl/coverUrl/mArt/...)");
-        /* 诊断：打印 payload 所有 JSON key，确认 cover 类字段是否存在及确切名。
-         * 若手机真没发封面，key 清单里就看不到任何 cover/art 项。
-         * 注意: 读值指针要与外层 q 同步推进到该 key 值之后（逗号/} 的下一位），
-         * 否则长 UTF-8 值会让循环反复咀嚼同段字节、永远打不到后面的字段。 */
-        {
-            char keybuf[80];
-            const char *end = p_src + p_len;
-            for (const char *q = p_src; q < end && *q; ) {
-                if (*q != '"') { q++; continue; }
-                const char *eq = strchr(q + 1, '"');
-                if (!eq || eq >= end) break;                  /* 无配对引号，结束 */
-                if (eq - q - 1 > (long)sizeof(keybuf) - 1) { q = eq + 1; continue; }
-                const char *colon = eq + 1;
-                while (colon < end && (*colon == ' ' || *colon == '\t')) colon++;
-                if (colon >= end || *colon != ':') { q = eq + 1; continue; }
-                size_t klen = (size_t)(eq - q - 1);
-                memcpy(keybuf, q + 1, klen);
-                keybuf[klen] = '\0';
-                /* 读该 key 的值片段（前40字符），并把 q 推进到值之后。 */
-                const char *vs = colon + 1;
-                while (vs < end && (*vs == ' ' || *vs == '\t')) vs++;
-                char vbuf[48]; int vn = 0;
-                const char *vstop;                             /* 值结束位置 */
-                if (vs < end && *vs == '"') {                  /* 字符串值 */
-                    const char *v1 = vs + 1;
-                    const char *vq = strchr(v1, '"');
-                    vstop = (vq && vq < end) ? vq + 1 : end;
-                    while (v1 < end && *v1 != '"' && vn < (int)sizeof(vbuf) - 1) vbuf[vn++] = *v1++;
-                } else {                                       /* 数字/bool/null */
-                    vstop = vs;
-                    while (vstop < end && *vstop != ',' && *vstop != '}') vstop++;
-                    while (vs < vstop && vn < (int)sizeof(vbuf) - 1) vbuf[vn++] = *vs++;
+    {
+        char *cover_tmp = (char *)miplay_psram_prefer_alloc(p_len + 1);
+        if (cover_tmp) {
+            if (parse_field_unescaped(p_src, p_len, cover_keys,
+                                      cover_tmp, p_len + 1) && cover_tmp[0]) {
+                size_t bl = strlen(cover_tmp);
+                pending_cover = (char *)miplay_psram_prefer_alloc(bl + 1);
+                if (pending_cover) {
+                    memcpy(pending_cover, cover_tmp, bl + 1);
+                    ESP_LOGI(TAG, "[META] cover extracted len=%u head=%.60s",
+                             (unsigned)bl, pending_cover);
+                } else {
+                    ESP_LOGW(TAG, "[META] cover alloc %u failed, cover dropped", (unsigned)(bl + 1));
                 }
-                vbuf[vn] = '\0';
-                ESP_LOGI(TAG, "  [key] \"%s\" = \"%.*s%s\"", keybuf,
-                         vn > 40 ? 40 : vn, vbuf, vn > 40 ? "..." : "");
-                /* 推进 q 越过当前 key:value 对（到逗号或 } 的下一位）。 */
-                const char *next = vstop;
-                while (next < end && *next != ',' && *next != '}') next++;
-                q = (next < end) ? next + 1 : end;
+                /* GetMediaInfo 回读：截断存入静态缓冲 */
+                strlcpy(s_media_cover_url, cover_tmp, sizeof(s_media_cover_url));
+            } else {
+                ESP_LOGI(TAG, "[META] no cover field matched (keys tried: mCoverUrl/coverUrl/mArt/...)");
+                /* 诊断：打印 payload 所有 JSON key，确认 cover 类字段是否存在及确切名。
+                 * 若手机真没发封面，key 清单里就看不到任何 cover/art 项。 */
+                {
+                    char keybuf[80];
+                    const char *end = p_src + p_len;
+                    for (const char *q = p_src; q < end && *q; ) {
+                        if (*q != '"') { q++; continue; }
+                        const char *eq = strchr(q + 1, '"');
+                        if (!eq || eq >= end) break;
+                        if (eq - q - 1 > (long)sizeof(keybuf) - 1) { q = eq + 1; continue; }
+                        const char *colon = eq + 1;
+                        while (colon < end && (*colon == ' ' || *colon == '\t')) colon++;
+                        if (colon >= end || *colon != ':') { q = eq + 1; continue; }
+                        size_t klen = (size_t)(eq - q - 1);
+                        memcpy(keybuf, q + 1, klen);
+                        keybuf[klen] = '\0';
+                        const char *vs = colon + 1;
+                        while (vs < end && (*vs == ' ' || *vs == '\t')) vs++;
+                        char vbuf[48]; int vn = 0;
+                        const char *vstop;
+                        if (vs < end && *vs == '"') {
+                            const char *v1 = vs + 1;
+                            const char *vq = strchr(v1, '"');
+                            vstop = (vq && vq < end) ? vq + 1 : end;
+                            while (v1 < end && *v1 != '"' && vn < (int)sizeof(vbuf) - 1) vbuf[vn++] = *v1++;
+                        } else {
+                            vstop = vs;
+                            while (vstop < end && *vstop != ',' && *vstop != '}') vstop++;
+                            while (vs < vstop && vn < (int)sizeof(vbuf) - 1) vbuf[vn++] = *vs++;
+                        }
+                        vbuf[vn] = '\0';
+                        ESP_LOGI(TAG, "  [key] \"%s\" = \"%.*s%s\"", keybuf,
+                                 vn > 40 ? 40 : vn, vbuf, vn > 40 ? "..." : "");
+                        const char *next = vstop;
+                        while (next < end && *next != ',' && *next != '}') next++;
+                        q = (next < end) ? next + 1 : end;
+                    }
+                }
+                heap_caps_free(cover_tmp);
             }
+        } else {
+            ESP_LOGW(TAG, "[META] cover tmp alloc %u failed", (unsigned)(p_len + 1));
         }
     }
 
@@ -4041,19 +4051,19 @@ static void miplay_tcp_task(void *arg)
     s_listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
     if (s_listen_sock < 0) {
         ESP_LOGE(TAG, "Socket failed: %d", errno);
-        s_tcp_task = NULL; vTaskDelete(NULL); return;
+        s_tcp_task = NULL; vTaskDeleteWithCaps(NULL); return;
     }
     int opt = 1;
     setsockopt(s_listen_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     if (bind(s_listen_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         ESP_LOGE(TAG, "Bind failed: %d", errno);
         close(s_listen_sock); s_listen_sock = -1;
-        s_tcp_task = NULL; vTaskDelete(NULL); return;
+        s_tcp_task = NULL; vTaskDeleteWithCaps(NULL); return;
     }
     if (listen(s_listen_sock, 5) < 0) {
         ESP_LOGE(TAG, "Listen failed: %d", errno);
         close(s_listen_sock); s_listen_sock = -1;
-        s_tcp_task = NULL; vTaskDelete(NULL); return;
+        s_tcp_task = NULL; vTaskDeleteWithCaps(NULL); return;
     }
     ESP_LOGI(TAG, "TCP %d listening for MiPlay", MIPLAY_CONTROL_PORT);
     while (s_running) {
@@ -4067,7 +4077,7 @@ static void miplay_tcp_task(void *arg)
         handle_client(client_sock, &client_addr);
     }
     close(s_listen_sock); s_listen_sock = -1;
-    s_tcp_task = NULL; vTaskDelete(NULL);
+    s_tcp_task = NULL; vTaskDeleteWithCaps(NULL);
 }
 
 /* ── mDNS 扫描任务 ── */
@@ -4114,7 +4124,7 @@ static void miplay_scan_task(void *arg)
         }
         mdns_query_results_free(results);
     }
-    s_scan_task = NULL; vTaskDelete(NULL);
+    s_scan_task = NULL; vTaskDeleteWithCaps(NULL);
 }
 
 /* ── mDNS unsolicited announcement（startup_burst + periodic cache_refresh）
@@ -4214,7 +4224,7 @@ static void mdns_announce_task(void *arg)
     vTaskDelay(pdMS_TO_TICKS(2000));
 
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-    if (sock < 0) { ESP_LOGE(TAG, "announce socket failed: %d", errno); s_announce_task = NULL; vTaskDelete(NULL); return; }
+    if (sock < 0) { ESP_LOGE(TAG, "announce socket failed: %d", errno); s_announce_task = NULL; vTaskDeleteWithCaps(NULL); return; }
     int ttl = 255;
     setsockopt(sock, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
 
@@ -4292,7 +4302,7 @@ static void mdns_announce_task(void *arg)
     }
     close(sock);
     s_announce_task = NULL;
-    vTaskDelete(NULL);
+    vTaskDeleteWithCaps(NULL);
 }
 
 /* ── 连接状态回调 ── */
