@@ -413,11 +413,20 @@ static void gena_notify(const char *xml_body, const char *service_type)
             close(sock); continue;
         }
 
-        /* 构建 HTTP NOTIFY 请求 */
+        /* 构建 HTTP NOTIFY 请求
+         * 动态分配：QQ 音乐扩展 GENA LastChange（15 字段含 metadata）可达 4-6KB，
+         * 固定 4096 栈缓冲会静默丢弃整个通知 → 控制点状态永久脱节 */
         char seq_str[16];
         snprintf(seq_str, sizeof(seq_str), "%d", s_subs[i].seq++);
-        char req[4096];
-        int req_len = snprintf(req, sizeof(req),
+        size_t body_len = strlen(xml_body);
+        size_t req_cap = body_len + 1024;
+        char *req = malloc(req_cap);
+        if (!req) {
+            ESP_LOGW(TAG, "GENA notify alloc %u failed", (unsigned)req_cap);
+            close(sock);
+            continue;
+        }
+        int req_len = snprintf(req, req_cap,
             "NOTIFY %s HTTP/1.1\r\n"
             "HOST: %s:%d\r\n"
             "CONTENT-TYPE: text/xml; charset=\"utf-8\"\r\n"
@@ -429,9 +438,9 @@ static void gena_notify(const char *xml_body, const char *service_type)
             "\r\n"
             "%s",
             path, host, port, s_subs[i].sid, seq_str,
-            (int)strlen(xml_body), xml_body);
+            (int)body_len, xml_body);
 
-        if (req_len > 0 && req_len < (int)sizeof(req)) {
+        if (req_len > 0 && (size_t)req_len < req_cap) {
             int sent = send(sock, req, req_len, 0);
             if (sent < 0) {
                 ESP_LOGW(TAG, "GENA send to %s:%d failed: %d", host, port, errno);
@@ -449,6 +458,7 @@ static void gena_notify(const char *xml_body, const char *service_type)
                 ESP_LOGW(TAG, "GENA recv from %s:%d failed: %d", host, port, errno);
             }
         }
+        free(req);
         close(sock);
     }
     if (s_gena_mutex) xSemaphoreGive(s_gena_mutex);
@@ -922,6 +932,9 @@ static esp_err_t xml_handler(httpd_req_t *req)
     xi *info = (xi *)req->user_ctx;
     int len = info->end - info->start;
     httpd_resp_set_type(req, "text/xml; charset=utf-8");
+    /* 与 SSDP alive 的 CACHE-CONTROL max-age=1800 对齐，
+     * 避免控制点每次重连都重新拉取 2-3KB 描述符 */
+    httpd_resp_set_hdr(req, "Cache-Control", "max-age=1800");
     httpd_resp_send(req, (const char *)info->start, len);
     return ESP_OK;
 }
@@ -1336,6 +1349,31 @@ static void ssdp_task(void *arg)
                     "SERVER: ESP32-DLNA/1.0 UPnP/1.0\r\n"
                     "ST: urn:schemas-upnp-org:service:AVTransport:1\r\n"
                     "USN: uuid:%s::urn:schemas-upnp-org:service:AVTransport:1\r\n\r\n",
+                    get_local_ip(), s_cfg->port, s_cfg->uuid);
+                sendto(sock, resp, len, 0, (struct sockaddr *)&from, sizeof(from));
+            }
+            /* 补全 RenderingControl / ConnectionManager 响应：
+             * ssdp_alive 广播 5 种 NT，M-SEARCH 原先只回 3 种 ST，
+             * BubbleUPnP 等控制点定向搜索 RC/CM 时会漏发现本设备 */
+            if (all || strstr(stv, "RenderingControl")) {
+                char resp[512];
+                int len = snprintf(resp, sizeof(resp),
+                    "HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=1800\r\nEXT:\r\n"
+                    "LOCATION: http://%s:%d/device.xml\r\n"
+                    "SERVER: ESP32-DLNA/1.0 UPnP/1.0\r\n"
+                    "ST: urn:schemas-upnp-org:service:RenderingControl:1\r\n"
+                    "USN: uuid:%s::urn:schemas-upnp-org:service:RenderingControl:1\r\n\r\n",
+                    get_local_ip(), s_cfg->port, s_cfg->uuid);
+                sendto(sock, resp, len, 0, (struct sockaddr *)&from, sizeof(from));
+            }
+            if (all || strstr(stv, "ConnectionManager")) {
+                char resp[512];
+                int len = snprintf(resp, sizeof(resp),
+                    "HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=1800\r\nEXT:\r\n"
+                    "LOCATION: http://%s:%d/device.xml\r\n"
+                    "SERVER: ESP32-DLNA/1.0 UPnP/1.0\r\n"
+                    "ST: urn:schemas-upnp-org:service:ConnectionManager:1\r\n"
+                    "USN: uuid:%s::urn:schemas-upnp-org:service:ConnectionManager:1\r\n\r\n",
                     get_local_ip(), s_cfg->port, s_cfg->uuid);
                 sendto(sock, resp, len, 0, (struct sockaddr *)&from, sizeof(from));
             }

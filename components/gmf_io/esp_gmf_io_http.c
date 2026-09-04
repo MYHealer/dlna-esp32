@@ -19,7 +19,11 @@
 #include "esp_gmf_io_http.h"
 #include "esp_gmf_oal_mem.h"
 
-#define HTTP_MAX_CONNECT_TIMES  (5)
+/* DLNA 流中断不重试: 设备端重连 5 次(退避~15s)会错过手机端切歌时序,
+ * 导致"能继续播放但不能自动切下一首"。对齐参考 miair-next renderer.py:
+ * play 失败 → 立即 STOPPED → notify_state_change() 由手机决定下一步。
+ * 注: 首次连接失败(open 阶段)不走此计数, 只有流中断(read 失败)才计。 */
+#define HTTP_MAX_CONNECT_TIMES  (0)
 
 /**
  * @brief  Http io context in GMF
@@ -360,6 +364,7 @@ static esp_gmf_err_io_t _http_acquire_read(esp_gmf_io_handle_t handle, void *pay
     } else {
         pload->valid_size = 0;
         ESP_LOGE(TAG, "The error is happened in reading data, return value: %d, error msg: %s", rlen, strerror(http->_errno));
+#if HTTP_MAX_CONNECT_TIMES > 0
         if (http->connect_times > HTTP_MAX_CONNECT_TIMES) {
             ESP_LOGE(TAG, "Reconnect times more than %d, disconnect http stream", http->connect_times);
             return ESP_GMF_IO_FAIL;
@@ -378,6 +383,11 @@ static esp_gmf_err_io_t _http_acquire_read(esp_gmf_io_handle_t handle, void *pay
         } else {
             ESP_LOGW(TAG, "Reconnect to peer successful");
         }
+#else
+        /* 重试已禁用: 流中断立即失败, 管线走 ERROR → STOPPED → GENA 通知,
+         * 让手机端控制切歌节奏 (对齐 miair-next: 播放失败不重试)。 */
+        return ESP_GMF_IO_FAIL;
+#endif
     }
     return ESP_GMF_IO_OK;
 }

@@ -28,8 +28,10 @@
 #include "custom_dlna.h"
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "freertos/event_groups.h"
+#include "esp_heap_caps.h"
 #include "driver/gpio.h"
 #include "rotary_encoder.h"
 #include "tft_display.h"
@@ -51,6 +53,33 @@
 static const char *TAG = "DLNA_APP";
 
 #define DLNA_DEVICE_UUID "8db0797a-f01a-4949-8f59-51188b18180b"
+
+/**
+ * @brief 创建 PSRAM 栈任务（对齐 miplay_create_task / 参考项目 dlna_create_task）。
+ *        优先 PSRAM 栈（释放内部 SRAM），失败则回退内部 SRAM 全栈。
+ *        注意：回退时不减半栈——调用点的栈大小已按调用链需求确定，
+ *        减半会重新引入 stop_dly 栈溢出问题。
+ */
+static BaseType_t dlna_create_task(TaskFunction_t fn, const char *name,
+                                   uint32_t stack_bytes, void *arg,
+                                   UBaseType_t prio, TaskHandle_t *handle,
+                                   BaseType_t core)
+{
+    TaskHandle_t h = NULL;
+    BaseType_t ret = xTaskCreatePinnedToCoreWithCaps(
+        fn, name, stack_bytes, arg, prio, &h, core,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (ret == pdPASS) {
+        if (handle) *handle = h;
+        return pdPASS;
+    }
+    ESP_LOGW(TAG, "%s: PSRAM stack %u failed, fallback internal", name, (unsigned)stack_bytes);
+    h = NULL;
+    ret = xTaskCreatePinnedToCore(fn, name, stack_bytes, arg, prio, &h, core);
+    if (ret == pdPASS && handle) *handle = h;
+    return ret;
+}
+
 
 /* ─────────────────────── 播放状态机 ─────────────────────── */
 typedef enum {
@@ -211,7 +240,7 @@ static esp_gmf_err_t pipeline_event_cb(esp_gmf_event_pkt_t *event, void *ctx)
                 if (get_state() == PS_PAUSED) break;
                 finish_arg_t *fa = malloc(sizeof(finish_arg_t));
                 if (fa) { fa->generation = s_media_generation; }
-                xTaskCreatePinnedToCore(delayed_stop_notify, "stop_dly", 3072, fa, 5, NULL, 1);
+                dlna_create_task(delayed_stop_notify, "stop_dly", 8192, fa, 5, NULL, 1);
                 break;
             case ESP_GMF_EVENT_STATE_ERROR:
                 if (esp_timer_get_time() < s_grace_until) {
@@ -1085,14 +1114,22 @@ static void cb_set_metadata(const char *metadata)
             }
         }
 
-        /* ── 经 Now Playing 统一层交付 UI（标题/歌手/封面/歌词）── */
+        /* 封面: 对齐 v4.1 直通路径（不进 now_playing 层）。
+         * 回归根因: v4.9 起封面经 np_submit→np_on_cover_url 中转,
+         * MiPlay 会话残留的 np source/48KB 封面缓冲使 DLNA 下载
+         * 256KB 缓冲时败时成("有时有有时没有")。v4.1 证明
+         * URL 封面直通 fetch_album_art_async 稳定可靠;
+         * np 层仅保留 MiPlay base64 大载荷路径。 */
+        if (album_art[0]) {
+            fetch_album_art_async(album_art);
+        }
+
+        /* 标题/歌手/时长仍走 now_playing 统一显示（cover_url 置空避免 np 层重复触发下载） */
         np_meta_t m;
         memset(&m, 0, sizeof(m));
         strlcpy(m.title,  s_cur_title,  sizeof(m.title));
         strlcpy(m.artist, s_cur_artist, sizeof(m.artist));
         m.duration_ms = s_dur_cache_sec * 1000;
-        m.has_cover   = (album_art[0] != 0);
-        strlcpy(m.cover_url, album_art, sizeof(m.cover_url));
         /* 歌词仅网易云源拉取（歌词源是网易云 API），随 np 回调内判断源触发 */
         np_submit(NP_SRC_DLNA, &m);
     }
@@ -1610,11 +1647,13 @@ static void album_art_task(void *arg)
 
 static void fetch_album_art_async(const char *url)
 {
-    /* url 可能是 http URL，或 data:...;base64,... 完整串（来自 now_playing 缓冲）。对齐 dlna-esp32-master：
-     * 队列传 source 字符串副本，worker 内用 is_http_cover_source/decode_base64_cover 分流。 */
+    /* 统一 PSRAM 拷贝（配 album_art_task 的 heap_caps_free）：
+     * - DLNA URL 几百字节，PSRAM 无压力
+     * - MiPlay base64 十几 KB（实测 15699B），必须 PSRAM
+     * 真正的内存回归不在 strdup/PSRAM 之别，而在 np 层 48KB 常驻缓冲
+     * 残留 + 256KB 下载缓冲竞争——DLNA 封面已改回 v4.1 直通路径。 */
     if (!url || !url[0] || !s_album_art_queue) return;
-    /* base64 WebP 封面可达十几 KB(实测 15699B)，必须搬到 PSRAM 再交给 worker，
-     * 避免一次性把整个 source 字符串压进内部 SRAM。配 heap_caps_free 释放。 */
+    s_album_art_gen++;  /* 递增代次，worker 检测到 gen 变化会放弃旧请求 */
     size_t src_len = strlen(url);
     char *source = (char *)heap_caps_malloc(src_len + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!source) {
@@ -1622,7 +1661,6 @@ static void fetch_album_art_async(const char *url)
         return;
     }
     memcpy(source, url, src_len + 1);
-    s_album_art_gen++;  /* 递增代次，worker 检测到 gen 变化会放弃旧请求 */
     /* 覆盖式发送：队列长度 1，新请求直接替换旧请求 */
     xQueueOverwrite(s_album_art_queue, &source);
 }
@@ -1834,6 +1872,11 @@ static void miplay_pipeline_start(void)
     while ((item = xRingbufferReceive(s_ts_ringbuf, &dummy, 0)) != NULL) {
         vRingbufferReturnItem(s_ts_ringbuf, item);
     }
+    /* 重连后元素状态残留 STOPPED（上一次 pipeline_stop 关闭了 aud_dec/aud_alc），
+     * loading_jobs 要求元素为 INITIALIZED 才注册 job，否则静默跳过 →
+     * pipeline_run 等不到 job 20s 超时(-3) → 无声。
+     * 与 DLNA _do_play 的 esp_gmf_pipeline_reset 同理（esp_gmf_pipeline.c:55）。 */
+    esp_gmf_pipeline_reset(s_miplay_pipe);
     esp_gmf_err_t r1 = esp_gmf_pipeline_loading_jobs(s_miplay_pipe);
     ESP_LOGI(TAG, "[MiPlay] loading_jobs returned %d", r1);
     esp_gmf_err_t r2 = esp_gmf_pipeline_run(s_miplay_pipe);
@@ -2210,7 +2253,7 @@ static void ui_update_task(void *arg)
                     ESP_LOGI(TAG, "Software near-end detected (remain=%d), forcing completion", remain_ms);
                     finish_arg_t *fa = malloc(sizeof(finish_arg_t));
                     if (fa) { fa->generation = s_media_generation; }
-                    xTaskCreatePinnedToCore(delayed_stop_notify, "stop_dly", 3072, fa, 5, NULL, 1);
+                    dlna_create_task(delayed_stop_notify, "stop_dly", 8192, fa, 5, NULL, 1);
                 }
             } else {
                 s_near_end_count = 0;
@@ -2419,5 +2462,7 @@ void app_main(void)
     lvgl_port_ui_register_btn_next_cb(cb_next);
 
     lyrics_init();
-    xTaskCreatePinnedToCore(ui_update_task, "ui_update", 4096, NULL, 3, NULL, 0);
+    /* PSRAM 栈 + 12KB：LVGL 渲染/歌词/卡拉OK深调用链，4KB 内部 SRAM 栈过险
+     * （对齐参考项目 DLNA_UI_UPDATE_STACK_BYTES=24KB，取保守 12KB） */
+    dlna_create_task(ui_update_task, "ui_update", 12 * 1024, NULL, 3, NULL, 0);
 }
