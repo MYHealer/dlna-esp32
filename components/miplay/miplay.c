@@ -1941,7 +1941,11 @@ static void miplay_rtsp_task_wrapper(void *arg)
                  (unsigned long)a->generation, (unsigned long)s_media_generation);
     /* 不关闭 client_sock — 主控制循环需要它处理心跳 */
     free(a);
-    s_rtsp_task = NULL;
+    /* 仅当登记句柄仍是自己时才清 NULL：handle_client 在新会话会摘走旧句柄
+     * 并等待 eDeleted，若此处无条件清 NULL 会把新任务的句柄误清（竞态：
+     * eTaskGetState(NULL) 断言崩溃，coredump 2026-09-04 实录） */
+    if (s_rtsp_task == xTaskGetCurrentTaskHandle())
+        s_rtsp_task = NULL;
     ESP_LOGI(TAG, "[RTSP-task] Done");
     vTaskDeleteWithCaps(NULL);
 }
@@ -2058,7 +2062,9 @@ static void media_receive_task(void *arg)
     uint8_t *rtp_buf = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
     if (!rtp_buf) {
         ESP_LOGE(TAG, "[MEDIA] alloc failed");
-        close(media_sock);
+        /* interleaved 回退时 media_sock == rtsp_sock，由 rtsp_run 尾部统一关闭；
+         * 此处只关非共享 fd，否则双重 close 同一 fd 会破坏 lwIP socket 表 */
+        if (media_sock != rtsp_sock_to_close) close(media_sock);
         vTaskDeleteWithCaps(NULL); return;
     }
 
@@ -2596,7 +2602,10 @@ static void miplay_rtsp_run(const char *host, int port, int client_sock, uint32_
         ESP_LOGI(TAG, "[RTSP] Entering keepalive loop...");
         TickType_t loop_start = xTaskGetTickCount();
         uint32_t keepalive_count = 0;
-        while (s_running) {
+        /* generation 守卫：与信令循环/media 循环一致。缺此守卫时旧 RTSP 任务
+         * 在新会话（CMD_OPEN_DEVICE 提升 generation）后仍存活，与新任务并发
+         * 读写共享 s_rtsp_buf → memmove 越界 → 堆损坏 → 重投时随机重启 */
+        while (s_running && s_media_generation == generation) {
             int ret = rtsp_read_msg(rtsp_sock, headers, RTSP_BUF_SIZE,
                                      body, RTSP_BUF_SIZE, &body_len);
             if (ret <= 0) {
@@ -3173,6 +3182,10 @@ static void disconnect_cleanup(int client_sock)
     memset(s_media_cover_url, 0, sizeof(s_media_cover_url));
     s_media_duration = 0;
     rtsp_read_msg_reset();
+    /* 提升 generation：立即失效断联后残留的 media/RTSP 任务。
+     * 此前只靠下次 CMD_OPEN_DEVICE 提升，导致残留任务存活整个空闲期，
+     * 与重投时的新任务并发冲突（socket 双关/共享缓冲踩踏）→ 重启 */
+    s_media_generation++;
     if (s_connected_cb) s_connected_cb(false);
 }
 
@@ -3527,12 +3540,16 @@ static void handle_client(int client_sock, struct sockaddr_in *client_addr)
                             rtsp_arg->port = rtsp_port;
                             rtsp_arg->client_sock = client_sock;
                             rtsp_arg->generation = gen;
-                            /* 等旧 RTSP task 退出后再创建 */
-                            if (s_rtsp_task) {
-                                for (int wt = 0; wt < 50 && eTaskGetState(s_rtsp_task) != eDeleted; wt++) {
+                            /* 等旧 RTSP task 退出后再创建。
+                             * 先摘走句柄再判空：s_rtsp_task 可能被退出的旧任务
+                             * 并发置 NULL，check-then-use 间隙 eTaskGetState(NULL)
+                             * 触发 pxTCB 断言崩溃（coredump 2026-09-04 实录） */
+                            TaskHandle_t old_rtsp = s_rtsp_task;
+                            s_rtsp_task = NULL;
+                            if (old_rtsp) {
+                                for (int wt = 0; wt < 50 && eTaskGetState(old_rtsp) != eDeleted; wt++) {
                                     vTaskDelay(pdMS_TO_TICKS(10));
                                 }
-                                s_rtsp_task = NULL;
                             }
                             if (miplay_create_task(miplay_rtsp_task_wrapper, "miplay_rtsp",
                                                    RTSP_TASK_STACK_SIZE, rtsp_arg, 4,

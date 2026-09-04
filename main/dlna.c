@@ -307,6 +307,30 @@ static int s_dur_cache_sec = 0;  /* 最近一次有效时长（秒） */
 static char s_cur_title[128]  = "";
 static char s_cur_artist[128] = "";
 
+/* ── 同歌封面复用：记录当前屏幕上封面所属的歌 ──
+ * URI 带时间戳/随机参数不可靠，用"歌名+歌手"判同一首。
+ * 跨 DLNA/MiPlay 统一生效（用户确认 miplay 和 dlna 的同一首也算同一首）。 */
+static char s_cover_song_key[160] = "";  /* "title - artist"，与屏幕封面绑定 */
+
+static bool cover_song_is_same(const char *title, const char *artist)
+{
+    if (!title || !title[0]) return false;
+    char key[160];
+    snprintf(key, sizeof(key), "%.100s - %.50s", title, artist ? artist : "");
+    return s_cover_song_key[0] && strcmp(key, s_cover_song_key) == 0;
+}
+
+static void cover_song_set(const char *title, const char *artist)
+{
+    snprintf(s_cover_song_key, sizeof(s_cover_song_key), "%.100s - %.50s",
+             title ? title : "", artist ? artist : "");
+}
+
+static void cover_song_clear(void)
+{
+    s_cover_song_key[0] = '\0';
+}
+
 /* ── HTML 转义还原（DIDL-Lite 经过 HTML 编码）── */
 static void html_unescape(char *dst, int dst_size, const char *src, int src_len)
 {
@@ -1042,10 +1066,12 @@ static void np_on_meta_changed(const np_meta_t *meta)
         if (dur_sec > 0) s_dur_cache_sec = dur_sec;
     }
 
-    /* UI 显示（DLNA 原有行为：先清旧封面，再设标题/歌手） */
+    /* UI 显示（DLNA 原有行为：先清旧封面，再设标题/歌手）
+     * 同歌重投：封面保持不刷新（避免割裂感），只有换歌才清 */
     if (meta->title[0] || meta->artist[0]) {
+        bool same_song = cover_song_is_same(meta->title, meta->artist);
         lvgl_port_lock();
-        if (meta->has_cover) {
+        if (meta->has_cover && !same_song) {
             lvgl_port_ui_clear_cover();
         }
         if (meta->title[0])  lvgl_port_ui_set_title(meta->title);
@@ -1069,6 +1095,11 @@ static void np_on_meta_changed(const np_meta_t *meta)
 static void np_on_cover_url(const char *url)
 {
     if (!url || !url[0]) return;
+    /* 同歌重投：封面 URL/base64 重复到达时不重新下载解码，保持当前封面 */
+    if (cover_song_is_same(s_cur_title, s_cur_artist)) {
+        ESP_LOGI(TAG, "NP cover skipped (same song)");
+        return;
+    }
     ESP_LOGI(TAG, "NP cover: %.80s...", url);
     /* 触发统一封面 worker 下载/解码（DLNA URL 或 MiPlay base64，worker 自行识别） */
     fetch_album_art_async(url);
@@ -1077,7 +1108,11 @@ static void np_on_cover_url(const char *url)
 static void np_on_source_changed(np_source_t src)
 {
     ESP_LOGI(TAG, "NP source → %d", (int)src);
-    /* 源切换：清掉上一源残留的封面/歌词 UI（标题等由新源 meta 覆盖） */
+    /* 源切换：封面绑定关系失效（DLNA↔MiPlay 换源视为新歌场景，
+     * 用户确认同歌跨源也算同一首——但源切换时 title 尚未恢复，
+     * 无法判同歌，保守清除绑定让新源重新走一遍封面流程） */
+    cover_song_clear();
+    /* 清掉上一源残留的封面/歌词 UI（标题等由新源 meta 覆盖） */
     lvgl_port_lock();
     lvgl_port_ui_clear_cover();
     lvgl_port_unlock();
@@ -1122,8 +1157,9 @@ static void cb_set_metadata(const char *metadata)
          * MiPlay 会话残留的 np source/48KB 封面缓冲使 DLNA 下载
          * 256KB 缓冲时败时成("有时有有时没有")。v4.1 证明
          * URL 封面直通 fetch_album_art_async 稳定可靠;
-         * np 层仅保留 MiPlay base64 大载荷路径。 */
-        if (album_art[0]) {
+         * np 层仅保留 MiPlay base64 大载荷路径。
+         * 同歌重投：URL 带时间戳参数，按歌名判断跳过重新下载。 */
+        if (album_art[0] && !cover_song_is_same(s_cur_title, s_cur_artist)) {
             fetch_album_art_async(album_art);
         }
 
@@ -1662,6 +1698,10 @@ static void album_art_task(void *arg)
     lvgl_port_lock();
     lvgl_port_ui_set_cover(out_buf, out_w, out_h);
     lvgl_port_unlock();
+
+    /* 封面成功上屏后登记 song_key：此后同歌重投（DLNA/MiPlay）均复用此封面 */
+    cover_song_set(s_cur_title, s_cur_artist);
+    ESP_LOGI(TAG, "Cover bound to song: %.60s", s_cover_song_key);
 
     /* 清理 */
     if (jpeg_aligned) jpeg_free_align(out_buf);

@@ -36,8 +36,12 @@ static int  s_klyric_line_time[LYRIC_MAX_LINES];  /* 每行的起始时间（ms�
 static int  s_klyric_line_count;                 /* 有 klyric 数据的行数 */
 static int  s_lrc_to_klyric[LYRIC_MAX_LINES];   /* LRC行 → klyric行 映射，-1=无 */
 
-/* 任务栈静态缓冲区（PSRAM），避免内部 RAM 分配失败 */
-#define LYRIC_TASK_STACK_SIZE  8192
+/* 任务栈静态缓冲区（PSRAM），避免内部 RAM 分配失败
+ * 24KB：HTTPS/TLS 握手调用链极深（esp-tls → mbedtls → esp_http_client），
+ * 8KB 实测栈溢出污染相邻 PSRAM 堆头 —— coredump 证实 tiT 在
+ * lwip_netconn_do_dns_found 写野指针（dns_api_msg 活在调用者栈上，
+ * msg->err 被溢出数据覆盖）。参考项目用 48KB，此处取保守 24KB。 */
+#define LYRIC_TASK_STACK_SIZE  24576
 static StackType_t *s_task_stack;
 static StaticTask_t s_task_tcb;
 static TaskHandle_t s_dead_task;   /* 上一轮已退出待回收的 task，判 eDeleted 用 */

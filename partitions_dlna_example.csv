@@ -3,3 +3,7 @@
 nvs,      data, nvs,     0x9000,  0x6000,
 phy_init, data, phy,     0xf000,  0x1000,
 factory,  app,  factory, 0x10000, 7M,
+# 崩溃现场抓取：断联重启根因排查。
+# 放在 7M app 之后（0x710000），16MB flash 尾部空间充足，无需缩小 app。
+# 64K 足够存 ELF 格式 coredump（16 任务 + 栈回溯）。
+coredump, data, coredump,0x710000, 64K,
