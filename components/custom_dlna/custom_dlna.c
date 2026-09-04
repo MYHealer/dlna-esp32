@@ -6,6 +6,7 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_attr.h"
 #include "esp_http_server.h"
 #include "esp_http_client.h"
 #include "esp_netif.h"
@@ -46,12 +47,14 @@ static const char *TAG = "CUSTOM_DLNA";
     "http-get:*:audio/*:*"
 
 /* ── Internal state ── */
+/* 大静态缓冲放 PSRAM BSS（EXT_RAM_BSS_ATTR），释放 ~22KB 内部 SRAM 给 WiFi/DMA。
+ * 前置: CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y（对齐 esp_miplay custom_dlna.c） */
 static const custom_dlna_config_t *s_cfg = NULL;
 static httpd_handle_t s_server = NULL;
-static char s_uri[2048] = {0};
-static char s_metadata[16384] = {0};  /* 当前曲目 DIDL-Lite 元数据（网易云可能 >4KB） */
-static char s_next_uri[2048] = {0};   /* 下一曲 URI（SetNextAVTransportURI 设置） */
-static char s_next_metadata[2048] = {0};
+static EXT_RAM_BSS_ATTR char s_uri[2048];
+static EXT_RAM_BSS_ATTR char s_metadata[16384];  /* 当前曲目 DIDL-Lite 元数据（网易云可能 >4KB） */
+static EXT_RAM_BSS_ATTR char s_next_uri[2048];   /* 下一曲 URI（SetNextAVTransportURI 设置） */
+static EXT_RAM_BSS_ATTR char s_next_metadata[2048];
 
 /* ── 按模式切配置 ── */
 static music_source_t s_music_source = MUSIC_SRC_NETEASE;  /* 默认网易云配置 */

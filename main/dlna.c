@@ -240,7 +240,7 @@ static esp_gmf_err_t pipeline_event_cb(esp_gmf_event_pkt_t *event, void *ctx)
                 if (get_state() == PS_PAUSED) break;
                 finish_arg_t *fa = malloc(sizeof(finish_arg_t));
                 if (fa) { fa->generation = s_media_generation; }
-                dlna_create_task(delayed_stop_notify, "stop_dly", 8192, fa, 5, NULL, 1);
+                dlna_create_task(delayed_stop_notify, "stop_dly", 12 * 1024, fa, 5, NULL, 1);
                 break;
             case ESP_GMF_EVENT_STATE_ERROR:
                 if (esp_timer_get_time() < s_grace_until) {
@@ -538,7 +538,7 @@ static void delayed_stop_notify(void *arg)
 
     if (gen != s_media_generation) {
         ESP_LOGI(TAG, "Finish notify stale (gen=%d, current=%d)", gen, s_media_generation);
-        vTaskDelete(NULL); return;
+        vTaskDeleteWithCaps(NULL); return;
     }
 
     /* 冻结最终位置 */
@@ -548,7 +548,7 @@ static void delayed_stop_notify(void *arg)
     }
 
     cb_next();
-    vTaskDelete(NULL);
+    vTaskDeleteWithCaps(NULL);
 }
 
 static void _do_play(const char *uri, int seek_sec)
@@ -1695,13 +1695,13 @@ static void fetch_album_art_async(const char *url)
 static void album_art_worker_init(void)
 {
     s_album_art_queue = xQueueCreate(ALBUM_ART_QUEUE_LEN, sizeof(char *));
-    s_album_art_stack = heap_caps_malloc(8 * 1024, MALLOC_CAP_SPIRAM);
+    s_album_art_stack = heap_caps_malloc(24 * 1024, MALLOC_CAP_SPIRAM);
     if (!s_album_art_queue || !s_album_art_stack) {
         ESP_LOGW(TAG, "album_art worker init failed");
         return;
     }
     TaskHandle_t handle = xTaskCreateStaticPinnedToCore(
-        album_art_task, "album_art", 8 * 1024 / sizeof(StackType_t),
+        album_art_task, "album_art", 24 * 1024 / sizeof(StackType_t),
         NULL, 1, s_album_art_stack, &s_album_art_tcb, 1);
     if (!handle) {
         ESP_LOGW(TAG, "album_art worker create failed");
@@ -1748,7 +1748,7 @@ static void audio_player_init(void)
     /* ── 6. 创建 GMF 任务并绑定到管线 ── */
     esp_gmf_task_cfg_t task_cfg = DEFAULT_ESP_GMF_TASK_CONFIG();
     task_cfg.name = "dlna_audio";
-    task_cfg.thread.stack = 16 * 1024;
+    task_cfg.thread.stack = 24 * 1024;
     task_cfg.thread.prio = 8;
     task_cfg.thread.stack_in_ext = true;
     ret = esp_gmf_task_init(&task_cfg, &s_work_task);
@@ -1868,7 +1868,7 @@ static void miplay_pipeline_init(void)
     /* 创建 GMF 任务 */
     esp_gmf_task_cfg_t task_cfg = DEFAULT_ESP_GMF_TASK_CONFIG();
     task_cfg.name = "miplay_audio";
-    task_cfg.thread.stack = 16 * 1024;
+    task_cfg.thread.stack = 24 * 1024;
     task_cfg.thread.prio = 8;
     task_cfg.thread.stack_in_ext = true;
     ret = esp_gmf_task_init(&task_cfg, &s_miplay_task);
@@ -2279,7 +2279,7 @@ static void ui_update_task(void *arg)
                     ESP_LOGI(TAG, "Software near-end detected (remain=%d), forcing completion", remain_ms);
                     finish_arg_t *fa = malloc(sizeof(finish_arg_t));
                     if (fa) { fa->generation = s_media_generation; }
-                    dlna_create_task(delayed_stop_notify, "stop_dly", 8192, fa, 5, NULL, 1);
+                    dlna_create_task(delayed_stop_notify, "stop_dly", 12 * 1024, fa, 5, NULL, 1);
                 }
             } else {
                 s_near_end_count = 0;
@@ -2503,5 +2503,5 @@ void app_main(void)
     lyrics_init();
     /* PSRAM 栈 + 12KB：LVGL 渲染/歌词/卡拉OK深调用链，4KB 内部 SRAM 栈过险
      * （对齐参考项目 DLNA_UI_UPDATE_STACK_BYTES=24KB，取保守 12KB） */
-    dlna_create_task(ui_update_task, "ui_update", 12 * 1024, NULL, 3, NULL, 0);
+    dlna_create_task(ui_update_task, "ui_update", 24 * 1024, NULL, 3, NULL, 0);
 }
