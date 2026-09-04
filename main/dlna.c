@@ -315,15 +315,24 @@ static char s_cover_song_key[160] = "";  /* "title - artist"，与屏幕封面�
 static bool cover_song_is_same(const char *title, const char *artist)
 {
     if (!title || !title[0]) return false;
+    /* 跳过首尾空白后比较：MiPlay/DLNA 元数据偶带前后空格，严格 strcmp 会误判换歌 */
+    while (*title == ' ' || *title == '\t') title++;
+    const char *t_end = title + strlen(title);
+    while (t_end > title && (t_end[-1] == ' ' || t_end[-1] == '\t')) t_end--;
+    const char *a = artist;
+    while (a && (*a == ' ' || *a == '\t')) a++;
     char key[160];
-    snprintf(key, sizeof(key), "%.100s - %.50s", title, artist ? artist : "");
+    snprintf(key, sizeof(key), "%.*s - %s", (int)(t_end - title), title, a ? a : "");
     return s_cover_song_key[0] && strcmp(key, s_cover_song_key) == 0;
 }
 
 static void cover_song_set(const char *title, const char *artist)
 {
-    snprintf(s_cover_song_key, sizeof(s_cover_song_key), "%.100s - %.50s",
-             title ? title : "", artist ? artist : "");
+    const char *t = title ? title : "";
+    while (*t == ' ' || *t == '\t') t++;
+    const char *a = artist ? artist : "";
+    while (*a == ' ' || *a == '\t') a++;
+    snprintf(s_cover_song_key, sizeof(s_cover_song_key), "%.100s - %.50s", t, a);
 }
 
 static void cover_song_clear(void)
@@ -528,7 +537,9 @@ static void cb_set_uri(const char *uri)
     s_saved_pos_sec = 0;
     free(s_track_uri);
     s_track_uri = uri ? strdup(uri) : NULL;
-    /* 新 URI → 重置时长缓存 + 歌词 */
+    /* 新 URI → 重置时长缓存 + 歌词
+     * 注意：s_cur_title/artist 清空前值已被 cover_song_key 记录（封面上屏时登记），
+     * 同歌判断走 song_key，不依赖 s_cur_title，此处照常清空 */
     s_dur_cache_sec = 0;
     s_cur_title[0] = '\0';
     s_cur_artist[0] = '\0';
@@ -1067,7 +1078,9 @@ static void np_on_meta_changed(const np_meta_t *meta)
     }
 
     /* UI 显示（DLNA 原有行为：先清旧封面，再设标题/歌手）
-     * 同歌重投：封面保持不刷新（避免割裂感），只有换歌才清 */
+     * 同歌重投：封面保持不刷新（避免割裂感），只有换歌才清。
+     * 判同用 meta->title（本次回调数据），不用 s_cur_title —— DLNA 重投时
+     * cb_set_uri 已把 s_cur_title 清空，MiPlay 路径 s_cur_title 根本不填充 */
     if (meta->title[0] || meta->artist[0]) {
         bool same_song = cover_song_is_same(meta->title, meta->artist);
         lvgl_port_lock();
@@ -1077,6 +1090,11 @@ static void np_on_meta_changed(const np_meta_t *meta)
         if (meta->title[0])  lvgl_port_ui_set_title(meta->title);
         if (meta->artist[0]) lvgl_port_ui_set_artist(meta->artist);
         lvgl_port_unlock();
+        /* MiPlay 路径同步 s_cur_title：封面 worker 上屏登记 song_key 用 */
+        if (meta->source == NP_SRC_MIPLAY && meta->title[0]) {
+            strlcpy(s_cur_title, meta->title, sizeof(s_cur_title));
+            strlcpy(s_cur_artist, meta->artist, sizeof(s_cur_artist));
+        }
     }
 
     /* 歌词：DLNA 与 MiPlay 源均触发（多源回退已支持任意歌曲）
@@ -1095,8 +1113,13 @@ static void np_on_meta_changed(const np_meta_t *meta)
 static void np_on_cover_url(const char *url)
 {
     if (!url || !url[0]) return;
-    /* 同歌重投：封面 URL/base64 重复到达时不重新下载解码，保持当前封面 */
-    if (cover_song_is_same(s_cur_title, s_cur_artist)) {
+    /* 同歌重投：封面 URL/base64 重复到达时不重新下载解码，保持当前封面。
+     * 用 np 层 meta 判断（cover 回调在 np_submit 之后触发，np meta 即本次数据），
+     * 不用 s_cur_title —— MiPlay 路径该变量不经 cb_set_metadata 填充 */
+    const np_meta_t *cur = np_get_meta();
+    const char *t = (cur && cur->title[0]) ? cur->title : s_cur_title;
+    const char *a = (cur && cur->artist[0]) ? cur->artist : s_cur_artist;
+    if (cover_song_is_same(t, a)) {
         ESP_LOGI(TAG, "NP cover skipped (same song)");
         return;
     }
@@ -1140,7 +1163,7 @@ static void cb_set_metadata(const char *metadata)
     }
     if (music_id) s_music_id = music_id;
 
-    if (title[0] && (strcmp(title, s_cur_title) != 0 || strcmp(artist, s_cur_artist) != 0)) {
+    if (title[0]) {
         decode_html_entities(s_cur_title, sizeof(s_cur_title), title);
         decode_html_entities(s_cur_artist, sizeof(s_cur_artist), artist);
         ESP_LOGI(TAG, "Song: %s - %s", s_cur_title, s_cur_artist);
@@ -1158,7 +1181,9 @@ static void cb_set_metadata(const char *metadata)
          * 256KB 缓冲时败时成("有时有有时没有")。v4.1 证明
          * URL 封面直通 fetch_album_art_async 稳定可靠;
          * np 层仅保留 MiPlay base64 大载荷路径。
-         * 同歌重投：URL 带时间戳参数，按歌名判断跳过重新下载。 */
+         * 同歌重投：URL 带时间戳参数，按歌名判断跳过重新下载。
+         * 判同用本次解析出的 title/artist（song_key 是上次上屏登记的歌），
+         * s_cur_title 已在 cb_set_uri 被清空，但上面刚重新填回本次值，可用。 */
         if (album_art[0] && !cover_song_is_same(s_cur_title, s_cur_artist)) {
             fetch_album_art_async(album_art);
         }
@@ -1968,8 +1993,12 @@ static void on_miplay_media_start(bool start)
     if (start) {
         ESP_LOGW(TAG, "=== MiPlay media started → starting GMF pipeline ===");
         s_miplay_active = true;    /* MiPlay 开播即进入反控模式 */
-        /* 新歌从 0 累计：清旧曲残留位置，避免切歌后进度续算旧值 */
-        s_accumulated_ms = 0;
+        /* 新歌从 0 累计：清旧曲残留位置，避免切歌后进度续算旧值。
+         * 同歌重投例外：保留 s_accumulated_ms（断开时过继的进度），
+         * 手机 0x0056 SetPosition 到达前 UI 显示继承值，视觉连续不闪 0:00 */
+        if (!cover_song_is_same(s_cur_title, s_cur_artist)) {
+            s_accumulated_ms = 0;
+        }
         s_play_start_us = 0;
         miplay_pipeline_start();
     } else {
@@ -1979,6 +2008,16 @@ static void on_miplay_media_start(bool start)
         if (s_play_start_us > 0) {
             s_accumulated_ms += (int)((esp_timer_get_time() - s_play_start_us) / 1000LL);
             s_play_start_us = 0;
+        }
+        /* 断开/停止过继进度：把 MiPlay 当前位置写入 DLNA 显示位。
+         * 不做的话 UI task 下一帧切回 DLNA 分支显示 s_accumulated_ms 旧值，
+         * 进度条从 MiPlay 位置（如 1:32）跳回残留值（如 0:00），视觉割裂。
+         * MiPlay 投回来时 0x0056 SetPosition 会重新校准，不会被污染。 */
+        int inherit_ms = get_miplay_display_pos_ms();
+        if (inherit_ms > 0) {
+            s_accumulated_ms = inherit_ms;
+            s_play_start_us = 0;   /* 非播放态，位置冻结在过继值 */
+            ESP_LOGI(TAG, "[MiPlay] stop: inherit pos %dms to DLNA display", inherit_ms);
         }
         miplay_pipeline_stop();
     }
