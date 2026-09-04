@@ -2338,6 +2338,19 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "WiFi connected, IP: " IPSTR, IP2STR(&event->ip_info.ip));
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        /* 设置 fallback DNS（校园网 DHCP 可能不返回 DNS 服务器） */
+        esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        if (netif) {
+            esp_netif_dns_info_t dns_main = {};
+            dns_main.ip.type = ESP_IPADDR_TYPE_V4;
+            dns_main.ip.u_addr.ip4.addr = ipaddr_addr("8.8.8.8");
+            esp_netif_dns_info_t dns_backup = {};
+            dns_backup.ip.type = ESP_IPADDR_TYPE_V4;
+            dns_backup.ip.u_addr.ip4.addr = ipaddr_addr("114.114.114.114");
+            esp_netif_set_dns_info(netif, ESP_NETIF_DNS_MAIN, &dns_main);
+            esp_netif_set_dns_info(netif, ESP_NETIF_DNS_BACKUP, &dns_backup);
+            ESP_LOGI(TAG, "DNS set: 8.8.8.8 (main), 114.114.114.114 (backup)");
+        }
         /* WiFi 恢复后自动恢复播放 */
         if (s_pipe && get_state() == PS_PAUSED && !s_user_stopped) {
             ESP_LOGI(TAG, "WiFi restored, resuming playback");
